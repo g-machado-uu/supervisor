@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Supervisor
+GenericName=Student Tracker
+Comment=Track FYP, placement and studies-advisee students
+Exec=supervisor
+Icon=accessories-text-editor
+Terminal=false
+Categories=Office;Education;
+StartupWMClass=supervisor
