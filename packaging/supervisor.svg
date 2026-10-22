@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4f82e6"/>
+      <stop offset="1" stop-color="#2f5cc0"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="url(#bg)"/>
+  <!-- clipboard -->
+  <rect x="70" y="92" width="116" height="124" rx="12" fill="#ffffff"/>
+  <path d="M92 132h72M92 160h72M92 188h48" stroke="#c9d6f2" stroke-width="10" stroke-linecap="round"/>
+  <!-- mortarboard -->
+  <path d="M128 40 206 74 128 108 50 74Z" fill="#1d2f5c"/>
+  <path d="M86 90v22c0 10 19 18 42 18s42-8 42-18V90l-42 18Z" fill="#1d2f5c"/>
+  <path d="M206 74v34" stroke="#f2b84b" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="206" cy="112" r="7" fill="#f2b84b"/>
+  <!-- check badge -->
+  <circle cx="184" cy="190" r="30" fill="#2e9e5b" stroke="#ffffff" stroke-width="6"/>
+  <path d="M170 190l10 10 19-20" fill="none" stroke="#ffffff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

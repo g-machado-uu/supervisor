@@ -53,9 +53,20 @@ cargo test                     # unit tests + headless end-to-end UI test
 SUPERVISOR_SHOTS=/some/dir cargo test end_to_end   # also write UI screenshots
 ```
 
-- **Linux**: works on Wayland and X11. Debian/Ubuntu need `libxkbcommon-dev libwayland-dev` to build. On Linux you can install `packaging/supervisor.desktop` to `~/.local/share/applications/` and copy the binary into your `PATH`.
+- **Linux**: works on Wayland and X11. Debian/Ubuntu need `libxkbcommon-dev libwayland-dev` to build.
 - **Windows / macOS**: run `cargo build --release` on that OS. The release build on Windows doesn't open a console window.
 - **CI**: `.github/workflows/build.yml` builds all three platforms when a `v*` tag is pushed (or when run manually).
+
+## Installing on Linux
+
+```sh
+./install.sh                         # build and install for the current user
+./install.sh --path=~/Documents/     # keep the data file at ~/Documents/data.svt
+./install.sh --path=~/sync/work.svt  # ...or at a specific file
+./install.sh --uninstall             # remove binary, launcher and icon (data is kept)
+```
+
+This installs `~/.local/bin/supervisor`, a launcher in `~/.local/share/applications/` (shows up in Rofi `drun`, with its icon) and the icon in `~/.local/share/icons/hicolor/`. At the end it prints where the encrypted data file is and, if `~/.local/bin` isn't on your `PATH`, how to add it for bash, zsh and fish. `--path` sets the file the app opens by default (from the launcher or the terminal); you can still switch files from the unlock screen.
 
 ## Code layout
 
