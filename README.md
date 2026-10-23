@@ -67,7 +67,8 @@ SUPERVISOR_SHOTS=/some/dir cargo test end_to_end   # also write UI screenshots
 ```
 
 - **Linux**: works on Wayland and X11. Debian/Ubuntu need `libxkbcommon-dev libwayland-dev` to build.
-- **Windows / macOS**: run `cargo build --release` on that OS. The release build on Windows doesn't open a console window.
+- **Windows**: see [Windows](#windows) below. The release build doesn't open a console window.
+- **macOS**: run `cargo build --release` on a Mac.
 - **CI**: `.github/workflows/build.yml` builds all three platforms when a `v*` tag is pushed (or when run manually).
 
 ## Installing on Linux
@@ -80,6 +81,29 @@ SUPERVISOR_SHOTS=/some/dir cargo test end_to_end   # also write UI screenshots
 ```
 
 This installs `~/.local/bin/supervisor`, a launcher in `~/.local/share/applications/` (shows up in Rofi `drun`, with its icon) and the icon in `~/.local/share/icons/hicolor/`. At the end it prints where the encrypted data file is and, if `~/.local/bin` isn't on your `PATH`, how to add it for bash, zsh and fish. `--path` sets the file the app opens by default (from the launcher or the terminal); you can still switch files from the unlock screen.
+
+## Windows
+
+### Building
+
+You need Rust (from [rustup.rs](https://rustup.rs)) and the Visual Studio Build Tools with the **Desktop development with C++** workload, which rustup offers to install. Then:
+
+```powershell
+cargo build --release
+```
+
+This builds `target\release\supervisor.exe` with the app icon embedded; `build.rs` uses `rc.exe` from the Windows SDK, which comes with the Build Tools. Nothing is installed system-wide, so copy the exe somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\Supervisor\supervisor.exe`. Then right-click it → *Show more options* → *Pin to Start*, or *Send to → Desktop (create shortcut)*. To update, build again and copy the new exe over the old one.
+
+The data file lives in `%APPDATA%\Supervisor\data\data.svt`, not next to the exe, so moving or replacing the exe doesn't touch your data.
+
+### Running on another PC
+
+Only `supervisor.exe` is needed. Rust and the Build Tools are not.
+
+- **Visual C++ Redistributable.** The exe needs the Microsoft Visual C++ runtime (v14, the "2015–2022" / "2017–2026" package). Most PCs already have it. If the app fails with *"VCRUNTIME140.dll was not found"*, install the x64 version from [aka.ms/vc14/vc_redist.x64.exe](https://aka.ms/vc14/vc_redist.x64.exe) (see Microsoft's [latest supported downloads](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) page).
+- **SmartScreen.** The exe isn't signed, so Windows may show *"Windows protected your PC"*. Click *More info* → *Run anyway*. Sending it inside a `.zip` helps it get past email filters.
+- **Graphics.** The UI draws with OpenGL, which normal graphics drivers provide. It may not start in some virtual machines or Remote Desktop sessions.
+- **Separate data.** Each user starts with an empty data file and sets their own password. No data travels with the exe.
 
 ## Code layout
 
