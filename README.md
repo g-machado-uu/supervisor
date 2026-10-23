@@ -2,10 +2,13 @@
 
 A desktop app for keeping track of supervision work:
 
-- **Final Year Project students**, in three groups:
+- **Project students**, by course. The defaults are:
   - **BEng** (MEC526 + MEC528)
   - **MEng** (EEE840, or EEE802 for the semester-in-Germany route)
   - **SUST** (China, co-supervised)
+  - **MSc** Electronics and MSc Mechatronics
+
+  Courses can be added or renamed in Settings, e.g. for an MSc student from another school.
 - **Placement students**: two visits, with requests, replies and line-manager attendance tracked.
 - **Studies advisees**: contact, reply and meetings for each semester, with as many follow-on meetings as you need.
 
@@ -25,7 +28,7 @@ It's written in Rust with [egui](https://github.com/emilk/egui) and runs as a na
 - Changes **autosave** about a second after you stop typing, and again on exit. Each save is written atomically, and the previous version is kept as `data.svt.bak`.
 - **There is no password recovery.** Keep a backup of the file and remember the password.
 - **Lock** (button or `Ctrl+L`) wipes the key and the decrypted data from memory and returns to the unlock screen.
-- The `.ics` calendar export is **not** encrypted.
+- The `.ics` calendar export and invite files are **not** encrypted.
 
 ## Using it
 
@@ -36,12 +39,22 @@ It's written in Rust with [egui](https://github.com/emilk/egui) and runs as a na
   - unknown line-manager attendance
 
   Click any item to open that student.
+- **Calendar**: meetings, visits and deadlines as a **list** grouped by week or a **month** grid, both labelled with teaching weeks. Filter by semester (list) or month, and by type. Tick items in the list (or a whole week), or click them in the month grid (double-click opens the student), then **Export selected** to an `.ics`. Selections are kept across months and views.
+  - **Repeating meetings as one series**: ticking any week exports the whole series as a repeating event that ends when the series ends, with cancelled weeks left out and moved weeks moved.
+  - **Students as guests** (on by default, remembered): adds you as organiser and the students (and line managers for visits) as guests, to send from Outlook. The export message says if any student has no email.
+- **Meetings** can be one-off or **🔁 repeat** every 1–4 weeks, until the end of teaching for that semester or a date you choose. Under **Weeks**, each week can be marked held, cancelled or moved, and has its own notes. Each meeting is either **💻 Teams** or has a **📍 room / location**.
 - **Lists**: one per category, with search (name, B number, email, course or company) and status chips. Click a row to edit it in the side panel. A student can hold several roles, e.g. an FYP student who is also your advisee.
+- **Settings → Academic year**: week 1 of each semester, and when **teaching ends** (Friday of week 12 unless you set it). Repeating meetings stop there, not at the end of exams.
+- **Settings → Courses**: name, short name and the sidebar list each course appears in. Courses that still have students can't be removed.
 - **Settings → Modules & coursework**:
   - Every module and coursework is editable. Week-based deadlines (e.g. MEC526 Week 8 / Week 12) are worked out from the semester start dates you enter. Give a coursework a fixed date to override that.
   - The SUST modules are separate entries, so their courseworks and dates can be filled in later without affecting the BEng cohort.
   - Per-student extensions are set in the student's coursework grid.
-- **Export calendar (.ics)** on the Dashboard or in Settings. Re-importing updates events rather than duplicating them.
+- **Export calendar (.ics)** on the Dashboard or in Settings exports everything. Re-importing updates events rather than duplicating them.
+- **Invite files**: each meeting and visit has a **📨 Invite file…** button that saves an `.ics` with you as organiser and the student as attendee (plus the line manager for visits, unless they're marked as not attending). For a repeating meeting it's the whole series.
+  - Set your name, email and an optional reusable Teams link in **Settings → Invitations**. They're stored in the encrypted data file.
+  - In Outlook on the web: **Add calendar → Upload from file**, then open the event and **Send**. For a meeting ticked **💻 Teams** with no saved link, turn on **Teams meeting** in Outlook before sending.
+  - Rooms are included; meeting notes never are. The invite file itself is not encrypted and contains the email addresses.
 
 ## Building
 

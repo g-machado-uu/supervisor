@@ -15,7 +15,7 @@ pub enum Role {
 impl Role {
     pub fn label(self) -> &'static str {
         match self {
-            Role::Fyp => "Final Year Project",
+            Role::Fyp => "Project supervision",
             Role::Placement => "Placement",
             Role::Advisee => "Studies Advisee",
         }
@@ -27,6 +27,8 @@ pub enum FormAction {
     Close,
     Delete,
     RemoveRole(Role),
+    /// Save an invite file for the meeting or visit with this UID.
+    Invite(String),
 }
 
 pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool) -> FormAction {
@@ -74,7 +76,7 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             ui.label("Add role:");
-            if s.fyp.is_none() && ui.button("➕ Final Year Project").clicked() {
+            if s.fyp.is_none() && ui.button("➕ Project supervision").clicked() {
                 s.fyp = Some(FypRecord::default());
             }
             if s.placement.is_none() && ui.button("➕ Placement").clicked() {
@@ -85,14 +87,32 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
             }
         });
 
+        // At most one invite button is clicked per frame.
+        let mut invite = None;
+        let id = s.id;
         if let Some(f) = &mut s.fyp {
-            role_section(ui, Role::Fyp, &mut action, |ui| fyp::show(ui, f, settings));
+            role_section(ui, Role::Fyp, &mut action, |ui| {
+                if let Some(uid) = fyp::show(ui, f, settings) {
+                    invite = Some(uid);
+                }
+            });
         }
         if let Some(p) = &mut s.placement {
-            role_section(ui, Role::Placement, &mut action, |ui| placement::show(ui, p));
+            role_section(ui, Role::Placement, &mut action, |ui| {
+                if let Some(uid) = placement::show(ui, p, id) {
+                    invite = Some(uid);
+                }
+            });
         }
         if let Some(a) = &mut s.advisee {
-            role_section(ui, Role::Advisee, &mut action, |ui| advisee::show(ui, a));
+            role_section(ui, Role::Advisee, &mut action, |ui| {
+                if let Some(uid) = advisee::show(ui, a, settings) {
+                    invite = Some(uid);
+                }
+            });
+        }
+        if let Some(uid) = invite {
+            action = FormAction::Invite(uid);
         }
 
         ui.add_space(16.0);

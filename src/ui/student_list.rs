@@ -6,48 +6,46 @@ use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
 
 use crate::model::{
-    Database, FypKind, FypRecord, ReplyStatus, SemesterContact, Settings, Student, Visit,
+    Database, FypRecord, Meeting, ReplyStatus, SemesterContact, Settings, Student, Visit,
 };
 use crate::ui::{theme, widgets};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Category {
-    FypBeng,
-    FypMeng,
-    FypSust,
+    /// Project students on the courses shown in this sidebar list.
+    Projects(String),
     Placement,
     Advisee,
     All,
 }
 
 impl Category {
-    pub fn title(self) -> &'static str {
+    pub fn title(&self) -> String {
         match self {
-            Category::FypBeng => "Final Year Project – BEng",
-            Category::FypMeng => "Final Year Project – MEng",
-            Category::FypSust => "Final Year Project – SUST",
-            Category::Placement => "Placement Students",
-            Category::Advisee => "Studies Advisees",
-            Category::All => "All Students",
+            Category::Projects(list) => format!("Project students – {list}"),
+            Category::Placement => "Placement Students".into(),
+            Category::Advisee => "Studies Advisees".into(),
+            Category::All => "All Students".into(),
         }
     }
 
-    pub fn includes(self, s: &Student) -> bool {
-        let fyp_kind = s.fyp.as_ref().map(|f| f.kind);
+    pub fn includes(&self, s: &Student, settings: &Settings) -> bool {
         match self {
-            Category::FypBeng => fyp_kind == Some(FypKind::BEng),
-            Category::FypMeng => matches!(fyp_kind, Some(FypKind::MEng | FypKind::MEngGermany)),
-            Category::FypSust => fyp_kind == Some(FypKind::Sust),
+            Category::Projects(list) => s.fyp.as_ref().is_some_and(|f| {
+                settings
+                    .programme(&f.programme)
+                    .is_some_and(|p| p.list_name() == list)
+            }),
             Category::Placement => s.placement.is_some(),
             Category::Advisee => s.advisee.is_some(),
             Category::All => true,
         }
     }
 
-    pub fn count(self, db: &Database) -> usize {
+    pub fn count(&self, db: &Database) -> usize {
         db.students
             .iter()
-            .filter(|s| !s.archived && self.includes(s))
+            .filter(|s| !s.archived && self.includes(s, &db.settings))
             .count()
     }
 }
@@ -59,7 +57,7 @@ pub struct ListState<'a> {
 }
 
 /// Returns true when "Add student" was clicked.
-pub fn show(ui: &mut Ui, db: &Database, cat: Category, st: ListState<'_>) -> bool {
+pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bool {
     let mut add = false;
     ui.horizontal(|ui| {
         ui.heading(cat.title());
@@ -85,7 +83,11 @@ pub fn show(ui: &mut Ui, db: &Database, cat: Category, st: ListState<'_>) -> boo
     let rows: Vec<&Student> = db
         .students
         .iter()
-        .filter(|s| (*st.show_archived || !s.archived) && cat.includes(s) && s.matches(st.search))
+        .filter(|s| {
+            (*st.show_archived || !s.archived)
+                && cat.includes(s, &db.settings)
+                && s.matches(st.search)
+        })
         .collect();
     let mut rows = rows;
     rows.sort_by_key(|s| s.name.to_lowercase());
@@ -93,16 +95,37 @@ pub fn show(ui: &mut Ui, db: &Database, cat: Category, st: ListState<'_>) -> boo
     if rows.is_empty() {
         ui.add_space(30.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("No students here yet.").color(theme::GREY).size(16.0));
+            ui.label(
+                RichText::new("No students here yet.")
+                    .color(theme::GREY)
+                    .size(16.0),
+            );
         });
         return add;
     }
 
     let today = widgets::today();
-    let headers: &[&str] = match cat {
-        Category::FypBeng | Category::FypMeng | Category::FypSust => {
-            &["Name", "B Number", "Course", "Initial contact", "Meetings", "Coursework"]
+    // Show which course when a list holds several.
+    let mixed = match cat {
+        Category::Projects(list) => {
+            db.settings
+                .programmes
+                .iter()
+                .filter(|p| p.list_name() == list)
+                .count()
+                > 1
         }
+        _ => false,
+    };
+    let headers: &[&str] = match cat {
+        Category::Projects(_) => &[
+            "Name",
+            "B Number",
+            "Course",
+            "Initial contact",
+            "Meetings",
+            "Coursework",
+        ],
         Category::Placement => &["Name", "B Number", "Company", "Visit 1", "Visit 2"],
         Category::Advisee => &["Name", "B Number", "Course", "Semester 1", "Semester 2"],
         Category::All => &["Name", "B Number", "Email", "Course", "Roles"],
@@ -142,12 +165,16 @@ pub fn show(ui: &mut Ui, db: &Database, cat: Category, st: ListState<'_>) -> boo
                     ui.label(&s.b_number);
                 });
                 match cat {
-                    Category::FypBeng | Category::FypMeng | Category::FypSust => {
+                    Category::Projects(_) => {
                         let f = s.fyp.as_ref().expect("filtered");
                         row.col(|ui| {
                             ui.label(&s.course);
-                            if cat == Category::FypMeng {
-                                theme::chip(ui, f.kind.short(), theme::ACCENT);
+                            if mixed {
+                                theme::chip(
+                                    ui,
+                                    db.settings.programme_short(&f.programme),
+                                    theme::ACCENT,
+                                );
                             }
                         });
                         row.col(|ui| {
@@ -157,7 +184,7 @@ pub fn show(ui: &mut Ui, db: &Database, cat: Category, st: ListState<'_>) -> boo
                                 theme::chip(ui, "✖ not yet", theme::AMBER);
                             }
                         });
-                        row.col(|ui| meetings_chip(ui, &f.meetings, today));
+                        row.col(|ui| meetings_chip(ui, &f.meetings, &db.settings, today));
                         row.col(|ui| coursework_chip(ui, f, &db.settings, today));
                     }
                     Category::Placement => {
@@ -179,7 +206,7 @@ pub fn show(ui: &mut Ui, db: &Database, cat: Category, st: ListState<'_>) -> boo
                         });
                         for c in [&a.s1, &a.s2] {
                             row.col(|ui| {
-                                let (text, color) = semester_status(c, today);
+                                let (text, color) = semester_status(c, &db.settings, today);
                                 theme::chip(ui, text, color);
                             });
                         }
@@ -193,7 +220,11 @@ pub fn show(ui: &mut Ui, db: &Database, cat: Category, st: ListState<'_>) -> boo
                         });
                         row.col(|ui| {
                             if let Some(f) = &s.fyp {
-                                theme::chip(ui, format!("FYP {}", f.kind.short()), theme::ACCENT);
+                                theme::chip(
+                                    ui,
+                                    db.settings.programme_short(&f.programme),
+                                    theme::ACCENT,
+                                );
                             }
                             if s.placement.is_some() {
                                 theme::chip(ui, "Placement", theme::GREEN);
@@ -212,14 +243,28 @@ pub fn show(ui: &mut Ui, db: &Database, cat: Category, st: ListState<'_>) -> boo
     add
 }
 
-fn meetings_chip(ui: &mut Ui, meetings: &[crate::model::Meeting], today: NaiveDate) {
-    let next = meetings
+/// Next planned meeting on or after `today` and how many have been held,
+/// counting each week of repeating meetings.
+fn meeting_summary(
+    meetings: &[Meeting],
+    settings: &Settings,
+    today: NaiveDate,
+) -> (Option<NaiveDate>, usize) {
+    let weeks: Vec<_> = meetings
         .iter()
-        .filter(|m| !m.held)
-        .filter_map(|m| m.date)
-        .filter(|d| *d >= today)
+        .flat_map(|m| m.occurrences(settings))
+        .filter(|o| !o.cancelled)
+        .collect();
+    let next = weeks
+        .iter()
+        .filter(|o| !o.held && o.date() >= today)
+        .map(|o| o.date())
         .min();
-    let held = meetings.iter().filter(|m| m.held).count();
+    (next, weeks.iter().filter(|o| o.held).count())
+}
+
+fn meetings_chip(ui: &mut Ui, meetings: &[Meeting], settings: &Settings, today: NaiveDate) {
+    let (next, held) = meeting_summary(meetings, settings, today);
     match next {
         Some(d) => theme::chip(ui, format!("next {}", widgets::fmt_short(d)), theme::ACCENT),
         None => theme::chip(ui, "none booked", theme::GREY),
@@ -231,7 +276,7 @@ fn coursework_chip(ui: &mut Ui, f: &FypRecord, settings: &Settings, today: Naive
     let mut total = 0;
     let mut done = 0;
     let mut overdue = 0;
-    for module in settings.modules_for(f.kind) {
+    for module in settings.modules_for(&f.programme) {
         for cw in &module.courseworks {
             total += 1;
             let status = f.coursework.get(&cw.id);
@@ -277,15 +322,12 @@ pub fn visit_status(v: &Visit) -> (String, Color32) {
     }
 }
 
-pub fn semester_status(c: &SemesterContact, today: NaiveDate) -> (String, Color32) {
-    let held = c.meetings.iter().filter(|m| m.held).count();
-    let next = c
-        .meetings
-        .iter()
-        .filter(|m| !m.held)
-        .filter_map(|m| m.date)
-        .filter(|d| *d >= today)
-        .min();
+pub fn semester_status(
+    c: &SemesterContact,
+    settings: &Settings,
+    today: NaiveDate,
+) -> (String, Color32) {
+    let (next, held) = meeting_summary(&c.meetings, settings, today);
     if let Some(d) = next {
         return (format!("meeting {}", widgets::fmt_short(d)), theme::ACCENT);
     }

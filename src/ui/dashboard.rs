@@ -36,32 +36,35 @@ pub fn show(ui: &mut Ui, db: &Database) -> DashAction {
     });
     ui.add_space(8.0);
 
-    // Summary tiles.
-    ui.horizontal_wrapped(|ui| {
-        for cat in [
-            Category::FypBeng,
-            Category::FypMeng,
-            Category::FypSust,
-            Category::Placement,
-            Category::Advisee,
-        ] {
-            let resp = egui::Frame::group(ui.style())
-                .fill(ui.visuals().window_fill)
-                .corner_radius(egui::CornerRadius::same(10))
-                .inner_margin(egui::Margin::symmetric(16, 10))
-                .show(ui, |ui| {
-                    ui.set_min_width(150.0);
-                    ui.label(RichText::new(cat.count(db).to_string()).size(28.0).strong().color(theme::ACCENT));
-                    ui.label(RichText::new(cat.title().replace("Final Year Project", "FYP")).color(theme::GREY));
-                })
-                .response
-                .interact(egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            if resp.clicked() {
-                action = DashAction::Goto(cat);
+    // Summary tiles, in as many rows as the width needs (frames don't wrap).
+    let lists = db.settings.programme_lists().into_iter().map(Category::Projects);
+    let tiles: Vec<Category> = lists.chain([Category::Placement, Category::Advisee]).collect();
+    let per_row = ((ui.available_width() + 8.0) / 178.0).floor().max(1.0) as usize;
+    for row in tiles.chunks(per_row) {
+        ui.horizontal(|ui| {
+            for cat in row {
+                let resp = egui::Frame::group(ui.style())
+                    .fill(ui.visuals().window_fill)
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                        ui.set_min_width(138.0);
+                        ui.label(RichText::new(cat.count(db).to_string()).size(28.0).strong().color(theme::ACCENT));
+                        let label = match cat {
+                            Category::Projects(list) => format!("{list} projects"),
+                            other => other.title(),
+                        };
+                        ui.label(RichText::new(label).color(theme::GREY));
+                    })
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if resp.clicked() {
+                    action = DashAction::Goto(cat.clone());
+                }
             }
-        }
-    });
+        });
+    }
     ui.add_space(10.0);
 
     let days = db.settings.upcoming_days;
@@ -93,6 +96,11 @@ pub fn show(ui: &mut Ui, db: &Database) -> DashAction {
                             .clicked()
                         {
                             action = DashAction::Open(e.student_id);
+                        }
+                        if e.online {
+                            ui.label(RichText::new("💻 Teams").small().color(theme::GREY));
+                        } else if !e.location.is_empty() {
+                            ui.label(RichText::new(format!("📍 {}", e.location)).small().color(theme::GREY));
                         }
                     });
                 }

@@ -2,16 +2,23 @@
 
 use egui::{RichText, Ui};
 
-use crate::model::{AdviseeRecord, ReplyStatus, SemesterContact};
+use crate::model::{AdviseeRecord, ReplyStatus, SemesterContact, Settings};
 use crate::ui::widgets;
 
-pub fn show(ui: &mut Ui, a: &mut AdviseeRecord) {
-    semester(ui, "Semester 1", &mut a.s1);
+/// Returns the UID of a meeting to save an invite for.
+pub fn show(ui: &mut Ui, a: &mut AdviseeRecord, settings: &Settings) -> Option<String> {
+    let s1 = semester(ui, "Semester 1", &mut a.s1, settings);
     ui.add_space(6.0);
-    semester(ui, "Semester 2", &mut a.s2);
+    let s2 = semester(ui, "Semester 2", &mut a.s2, settings);
+    s1.or(s2)
 }
 
-fn semester(ui: &mut Ui, title: &str, c: &mut SemesterContact) {
+fn semester(
+    ui: &mut Ui,
+    title: &str,
+    c: &mut SemesterContact,
+    settings: &Settings,
+) -> Option<String> {
     ui.push_id(title, |ui| {
         egui::Frame::group(ui.style())
             .corner_radius(egui::CornerRadius::same(8))
@@ -33,7 +40,15 @@ fn semester(ui: &mut Ui, title: &str, c: &mut SemesterContact) {
                         ui.end_row();
                     }
                 });
-                widgets::meetings_editor(ui, "meetings", &mut c.meetings, Some("Semester meeting"));
-            });
-    });
+                widgets::meetings_editor(
+                    ui,
+                    "meetings",
+                    &mut c.meetings,
+                    Some("Semester meeting"),
+                    settings,
+                )
+            })
+            .inner
+    })
+    .inner
 }

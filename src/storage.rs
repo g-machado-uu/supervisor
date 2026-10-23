@@ -244,6 +244,7 @@ mod tests {
 
     fn sample() -> Database {
         let mut db = Database::default();
+        db.settings.my_email = "someone@ulster.ac.uk".into();
         db.students.push(Student {
             name: "Grace".into(),
             b_number: "B00123456".into(),
@@ -263,6 +264,10 @@ mod tests {
         // Plaintext must not appear on disk.
         let raw = fs::read(&path).unwrap();
         assert!(!raw.windows(5).any(|w| w == b"Grace"));
+        assert!(
+            !raw.windows(7).any(|w| w == b"someone"),
+            "own email is encrypted too"
+        );
     }
 
     #[test]

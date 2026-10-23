@@ -1,9 +1,12 @@
-//! Settings: academic calendar, module/coursework templates and security.
+//! Settings: academic calendar, courses, module/coursework templates,
+//! invitations and security.
+
+use std::collections::HashMap;
 
 use egui::{RichText, Ui};
 use zeroize::Zeroizing;
 
-use crate::model::{CourseworkTemplate, FypKind, Module, Semester, Settings};
+use crate::model::{CourseworkTemplate, Module, Programme, Semester, Settings};
 use crate::ui::{theme, widgets};
 
 #[derive(Default)]
@@ -20,7 +23,14 @@ pub enum SettingsAction {
     ExportIcs,
 }
 
-pub fn show(ui: &mut Ui, settings: &mut Settings, data_path: &str, pw: &mut PasswordForm) -> SettingsAction {
+/// `in_use` counts the project students on each course (by id).
+pub fn show(
+    ui: &mut Ui,
+    settings: &mut Settings,
+    in_use: &HashMap<String, usize>,
+    data_path: &str,
+    pw: &mut PasswordForm,
+) -> SettingsAction {
     let mut action = SettingsAction::None;
     ui.heading("Settings");
     ui.add_space(6.0);
@@ -30,12 +40,30 @@ pub fn show(ui: &mut Ui, settings: &mut Settings, data_path: &str, pw: &mut Pass
                 ui.label("Academic year");
                 ui.add(egui::TextEdit::singleline(&mut settings.academic_year).desired_width(120.0));
                 ui.end_row();
-                ui.label("Semester 1 – week 1 starts");
-                widgets::opt_date(ui, "sem1", &mut settings.sem1_start);
-                ui.end_row();
-                ui.label("Semester 2 – week 1 starts");
-                widgets::opt_date(ui, "sem2", &mut settings.sem2_start);
-                ui.end_row();
+                for (sem, label) in [(Semester::S1, "Semester 1"), (Semester::S2, "Semester 2")] {
+                    let (start, end) = match sem {
+                        Semester::S2 => (&mut settings.sem2_start, &mut settings.sem2_teaching_end),
+                        _ => (&mut settings.sem1_start, &mut settings.sem1_teaching_end),
+                    };
+                    ui.label(format!("{label} – week 1 starts"));
+                    widgets::opt_date(ui, (label, "start"), start);
+                    ui.end_row();
+                    ui.label(format!("{label} – teaching ends"));
+                    ui.horizontal(|ui| {
+                        if end.is_some() {
+                            widgets::opt_date(ui, (label, "end"), end);
+                        } else if let Some(start) = *start {
+                            let default = Settings::default_teaching_end(start);
+                            ui.label(format!("{} (Friday of week 12)", widgets::fmt_date(Some(default))));
+                            if ui.small_button("Change…").clicked() {
+                                *end = Some(default);
+                            }
+                        } else {
+                            ui.label(RichText::new("set week 1 first").color(theme::GREY));
+                        }
+                    });
+                    ui.end_row();
+                }
                 ui.label("Dashboard look-ahead");
                 ui.add(egui::DragValue::new(&mut settings.upcoming_days).range(1..=120).suffix(" days"));
                 ui.end_row();
@@ -47,20 +75,26 @@ pub fn show(ui: &mut Ui, settings: &mut Settings, data_path: &str, pw: &mut Pass
                 ui.end_row();
             });
             ui.label(
-                RichText::new("Coursework set by teaching week is due at the start of that week (Monday if week 1 starts on a Monday). Give an explicit date to override.")
+                RichText::new("Coursework set by teaching week is due at the start of that week (Monday if week 1 starts on a Monday). Give an explicit date to override. Repeating meetings run until teaching ends, not until the end of exams.")
                     .small()
                     .color(theme::GREY),
             );
         });
 
         ui.add_space(8.0);
+        theme::card(ui, "Courses", |ui| {
+            courses_editor(ui, &mut settings.programmes, in_use);
+        });
+
+        ui.add_space(8.0);
         theme::card(ui, "Modules & coursework", |ui| {
             ui.label(
-                RichText::new("Each module applies to one or more FYP types. SUST modules are kept separate so their dates and coursework can differ.")
+                RichText::new("Each module applies to one or more courses. SUST modules are kept separate so their dates and coursework can differ.")
                     .small()
                     .color(theme::GREY),
             );
             let starts = (settings.sem1_start, settings.sem2_start);
+            let programmes = settings.programmes.clone();
             let mut remove_module = None;
             for (mi, module) in settings.modules.iter_mut().enumerate() {
                 ui.push_id(module.id, |ui| {
@@ -72,7 +106,7 @@ pub fn show(ui: &mut Ui, settings: &mut Settings, data_path: &str, pw: &mut Pass
                                 Semester::S1 | Semester::FullYear => starts.0,
                                 Semester::S2 => starts.1,
                             };
-                            if module_editor(ui, module, start) {
+                            if module_editor(ui, module, &programmes, start) {
                                 remove_module = Some(mi);
                             }
                         });
@@ -84,6 +118,37 @@ pub fn show(ui: &mut Ui, settings: &mut Settings, data_path: &str, pw: &mut Pass
             if ui.button("➕ Add module").clicked() {
                 settings.modules.push(Module::default());
             }
+        });
+
+        ui.add_space(8.0);
+        theme::card(ui, "Invitations", |ui| {
+            widgets::form_grid(ui, "invite-grid", |ui| {
+                ui.label("Your name");
+                widgets::text_field(ui, &mut settings.my_name, "Shown to students as the organiser");
+                ui.end_row();
+                ui.label("Your email");
+                ui.vertical(|ui| {
+                    widgets::text_field(ui, &mut settings.my_email, "name@ulster.ac.uk");
+                    let email = settings.my_email.trim();
+                    if !email.is_empty() && !crate::ics::valid_email(email) {
+                        ui.colored_label(theme::AMBER, "⚠ This doesn't look like an email address");
+                    }
+                });
+                ui.end_row();
+                ui.label("Teams link (optional)");
+                widgets::text_field(ui, &mut settings.teams_link, "Reusable Teams meeting link");
+                ui.end_row();
+            });
+            ui.label(
+                RichText::new("“📨 Invite file…” on a meeting or visit saves a one-event .ics: upload it in Outlook (Add calendar › Upload from file), open the event and Send. For Teams meetings the link above is included; without one, turn on “Teams meeting” in Outlook before sending.")
+                    .small()
+                    .color(theme::GREY),
+            );
+            ui.label(
+                RichText::new("These details are stored in the encrypted data file. Invite files themselves are not encrypted and contain your and the student's email addresses.")
+                    .small()
+                    .color(theme::GREY),
+            );
         });
 
         ui.add_space(8.0);
@@ -131,7 +196,12 @@ pub fn show(ui: &mut Ui, settings: &mut Settings, data_path: &str, pw: &mut Pass
 }
 
 /// Returns true if the module should be removed.
-fn module_editor(ui: &mut Ui, module: &mut Module, semester_start: Option<chrono::NaiveDate>) -> bool {
+fn module_editor(
+    ui: &mut Ui,
+    module: &mut Module,
+    programmes: &[Programme],
+    semester_start: Option<chrono::NaiveDate>,
+) -> bool {
     let mut remove = false;
     widgets::form_grid(ui, "module-grid", |ui| {
         ui.label("Code");
@@ -149,13 +219,17 @@ fn module_editor(ui: &mut Ui, module: &mut Module, semester_start: Option<chrono
         ui.end_row();
         ui.label("Applies to");
         ui.horizontal_wrapped(|ui| {
-            for kind in FypKind::ALL {
-                let mut on = module.applies_to.contains(&kind);
-                if ui.checkbox(&mut on, kind.short()).changed() {
+            for p in programmes {
+                let mut on = module.applies_to.contains(&p.id);
+                if ui
+                    .checkbox(&mut on, &p.short)
+                    .on_hover_text(&p.name)
+                    .changed()
+                {
                     if on {
-                        module.applies_to.push(kind);
+                        module.applies_to.push(p.id.clone());
                     } else {
-                        module.applies_to.retain(|k| *k != kind);
+                        module.applies_to.retain(|id| *id != p.id);
                     }
                 }
             }
@@ -219,4 +293,52 @@ fn module_editor(ui: &mut Ui, module: &mut Module, semester_start: Option<chrono
         });
     });
     remove
+}
+
+/// Courses whose project students are supervised; each list name becomes a
+/// sidebar list. Courses with students can't be removed.
+fn courses_editor(ui: &mut Ui, programmes: &mut Vec<Programme>, in_use: &HashMap<String, usize>) {
+    ui.label(
+        RichText::new("Courses sharing a list name are shown together in the sidebar. Add their modules and coursework below.")
+            .small()
+            .color(theme::GREY),
+    );
+    let mut remove = None;
+    egui::Grid::new("courses-grid")
+        .num_columns(5)
+        .spacing([10.0, 6.0])
+        .show(ui, |ui| {
+            for h in ["Name", "Short name", "Sidebar list", "Students", ""] {
+                ui.label(RichText::new(h).small().color(theme::GREY));
+            }
+            ui.end_row();
+            for (i, p) in programmes.iter_mut().enumerate() {
+                ui.push_id(&p.id, |ui| {
+                    ui.add_sized([220.0, 22.0], egui::TextEdit::singleline(&mut p.name));
+                });
+                ui.push_id((&p.id, "short"), |ui| {
+                    ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut p.short));
+                });
+                ui.push_id((&p.id, "list"), |ui| {
+                    ui.add_sized([90.0, 22.0], egui::TextEdit::singleline(&mut p.list));
+                });
+                let used = in_use.get(&p.id).copied().unwrap_or(0);
+                ui.label(used.to_string());
+                let button = ui.add_enabled(used == 0, egui::Button::new("🗑").small());
+                if button
+                    .on_hover_text("Remove course")
+                    .on_disabled_hover_text("Students are on this course – move them first")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(i) = remove {
+        programmes.remove(i);
+    }
+    if ui.button("➕ Add course").clicked() {
+        programmes.push(Programme::default());
+    }
 }

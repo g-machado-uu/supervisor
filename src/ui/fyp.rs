@@ -1,19 +1,24 @@
-//! Final Year Project section of the student detail panel.
+//! Project supervision section (FYP, MSc, …) of the student detail panel.
 
 use egui::{RichText, Ui};
 
-use crate::model::{FypKind, FypRecord, Settings};
+use crate::model::{FypRecord, Settings};
 use crate::ui::{theme, widgets};
 
-pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings) {
+/// Returns the UID of a meeting to save an invite for.
+pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings) -> Option<String> {
     widgets::form_grid(ui, "fyp-grid", |ui| {
-        ui.label("Type");
+        ui.label("Course");
+        let current = settings.programme(&fyp.programme).map_or_else(
+            || format!("{} (removed)", fyp.programme),
+            |p| p.name.clone(),
+        );
         egui::ComboBox::from_id_salt("fyp-kind")
-            .selected_text(fyp.kind.label())
+            .selected_text(current)
             .width(260.0)
             .show_ui(ui, |ui| {
-                for kind in FypKind::ALL {
-                    ui.selectable_value(&mut fyp.kind, kind, kind.label());
+                for p in &settings.programmes {
+                    ui.selectable_value(&mut fyp.programme, p.id.clone(), &p.name);
                 }
             });
         ui.end_row();
@@ -36,7 +41,7 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings) {
     ui.label(RichText::new("Coursework").strong());
     let today = widgets::today();
     let mut any_module = false;
-    for module in settings.modules_for(fyp.kind) {
+    for module in settings.modules_for(&fyp.programme) {
         any_module = true;
         ui.label(
             RichText::new(format!("{} – {} · {}", module.code, module.name, module.semester.label()))
@@ -102,7 +107,7 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings) {
     }
     if !any_module {
         ui.label(
-            RichText::new("No modules are linked to this FYP type – check Settings › Modules.")
+            RichText::new("No modules are linked to this course – add them in Settings › Modules.")
                 .italics()
                 .color(theme::GREY),
         );
@@ -110,5 +115,5 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings) {
 
     ui.add_space(6.0);
     ui.label(RichText::new("Meetings").strong());
-    widgets::meetings_editor(ui, "fyp-meetings", &mut fyp.meetings, None);
+    widgets::meetings_editor(ui, "fyp-meetings", &mut fyp.meetings, None, settings)
 }

@@ -6,8 +6,9 @@ use egui::{Id, RichText, Ui};
 use uuid::Uuid;
 
 use crate::ics;
-use crate::model::{AdviseeRecord, Database, FypKind, FypRecord, PlacementRecord, Student};
+use crate::model::{AdviseeRecord, CalItem, Database, FypRecord, PlacementRecord, Student};
 use crate::storage::{self, Vault};
+use crate::ui::calendar::{self, CalAction, CalendarState};
 use crate::ui::dashboard::{self, DashAction};
 use crate::ui::lock::LockScreen;
 use crate::ui::settings::{self, PasswordForm, SettingsAction};
@@ -67,9 +68,10 @@ impl eframe::App for SupervisorApp {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum View {
     Dashboard,
+    Calendar,
     List(Category),
     Settings,
 }
@@ -88,7 +90,7 @@ enum Confirm {
 struct NewStudent {
     student: Student,
     fyp: bool,
-    kind: FypKind,
+    programme: String,
     placement: bool,
     company: String,
     professional_email: String,
@@ -96,20 +98,28 @@ struct NewStudent {
 }
 
 impl NewStudent {
-    fn for_category(cat: Option<Category>) -> Self {
+    fn for_category(cat: Option<&Category>, settings: &crate::model::Settings) -> Self {
+        let first = settings
+            .programmes
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_default();
         let mut n = Self {
             student: Student::default(),
             fyp: false,
-            kind: FypKind::BEng,
+            programme: first,
             placement: false,
             company: String::new(),
             professional_email: String::new(),
             advisee: false,
         };
         match cat {
-            Some(Category::FypBeng) => n.fyp = true,
-            Some(Category::FypMeng) => (n.fyp, n.kind) = (true, FypKind::MEng),
-            Some(Category::FypSust) => (n.fyp, n.kind) = (true, FypKind::Sust),
+            Some(Category::Projects(list)) => {
+                n.fyp = true;
+                if let Some(p) = settings.programmes.iter().find(|p| p.list_name() == list) {
+                    n.programme = p.id.clone();
+                }
+            }
             Some(Category::Placement) => n.placement = true,
             Some(Category::Advisee) => n.advisee = true,
             _ => {}
@@ -121,7 +131,7 @@ impl NewStudent {
         let mut s = self.student;
         if self.fyp {
             s.fyp = Some(FypRecord {
-                kind: self.kind,
+                programme: self.programme,
                 ..Default::default()
             });
         }
@@ -151,6 +161,7 @@ struct Session {
     new_student: Option<NewStudent>,
     confirm: Option<Confirm>,
     password_form: PasswordForm,
+    calendar: CalendarState,
     toast: Option<(String, f64)>,
     applied_dark: Option<bool>,
 }
@@ -169,6 +180,7 @@ impl Session {
             new_student: None,
             confirm: None,
             password_form: PasswordForm::default(),
+            calendar: CalendarState::default(),
             toast: None,
             applied_dark: None,
         }
@@ -275,6 +287,7 @@ impl Session {
     fn sidebar(&mut self, ui: &mut Ui) {
         egui::Panel::left("nav").exact_size(230.0).show(ui, |ui| {
             ui.add_space(8.0);
+            let lists = self.db.settings.programme_lists();
             let mut nav = |ui: &mut Ui, view: View, label: &str, count: Option<usize>| {
                 let mut b = egui::Button::selectable(self.view == view, label).min_size(egui::vec2(ui.available_width(), 32.0));
                 if let Some(c) = count {
@@ -285,14 +298,13 @@ impl Session {
                 }
             };
             nav(ui, View::Dashboard, "🏠  Dashboard", None);
+            nav(ui, View::Calendar, "📅  Calendar", None);
             ui.add_space(6.0);
-            ui.label(RichText::new("FINAL YEAR PROJECTS").small().color(theme::GREY));
-            for (cat, label) in [
-                (Category::FypBeng, "📘  BEng"),
-                (Category::FypMeng, "📗  MEng"),
-                (Category::FypSust, "🌏  SUST"),
-            ] {
-                nav(ui, View::List(cat), label, Some(cat.count(&self.db)));
+            ui.label(RichText::new("PROJECT STUDENTS").small().color(theme::GREY));
+            for list in lists {
+                let cat = Category::Projects(list.clone());
+                let count = cat.count(&self.db);
+                nav(ui, View::List(cat), &format!("📘  {list}"), Some(count));
             }
             ui.add_space(6.0);
             ui.label(RichText::new("OTHER").small().color(theme::GREY));
@@ -330,35 +342,64 @@ impl Session {
             FormAction::Close => self.selected = None,
             FormAction::Delete => self.confirm = Some(Confirm::DeleteStudent(id)),
             FormAction::RemoveRole(role) => self.confirm = Some(Confirm::RemoveRole(id, role)),
+            FormAction::Invite(uid) => self.save_invite(ui, id, &uid),
         }
     }
 
     fn central(&mut self, ui: &mut Ui) {
-        match self.view {
+        match self.view.clone() {
             View::Dashboard => match dashboard::show(ui, &self.db) {
                 DashAction::None => {}
                 DashAction::Open(id) => self.selected = Some(id),
                 DashAction::Goto(cat) => self.view = View::List(cat),
                 DashAction::ExportIcs => self.export_ics(ui),
             },
+            View::Calendar => {
+                let mut guests = self.db.settings.export_with_guests;
+                let action = calendar::show(ui, &self.db, &mut self.calendar, &mut guests);
+                self.db.settings.export_with_guests = guests;
+                match action {
+                    CalAction::None => {}
+                    CalAction::Open(id) => self.selected = Some(id),
+                    CalAction::Export(uids) => self.export_selected(ui, &uids),
+                }
+            }
             View::List(cat) => {
                 let add = student_list::show(
                     ui,
                     &self.db,
-                    cat,
+                    &cat,
                     ListState {
                         search: &mut self.search,
                         show_archived: &mut self.show_archived,
                         selected: &mut self.selected,
                     },
                 );
-                if add || ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N))) {
-                    self.new_student = Some(NewStudent::for_category(Some(cat)));
+                if add
+                    || ui.input_mut(|i| {
+                        i.consume_shortcut(&egui::KeyboardShortcut::new(
+                            egui::Modifiers::COMMAND,
+                            egui::Key::N,
+                        ))
+                    })
+                {
+                    self.new_student =
+                        Some(NewStudent::for_category(Some(&cat), &self.db.settings));
                 }
             }
             View::Settings => {
                 let path = self.vault.path().display().to_string();
-                match settings::show(ui, &mut self.db.settings, &path, &mut self.password_form) {
+                let mut in_use = std::collections::HashMap::new();
+                for f in self.db.students.iter().filter_map(|s| s.fyp.as_ref()) {
+                    *in_use.entry(f.programme.clone()).or_insert(0) += 1;
+                }
+                match settings::show(
+                    ui,
+                    &mut self.db.settings,
+                    &in_use,
+                    &path,
+                    &mut self.password_form,
+                ) {
                     SettingsAction::None => {}
                     SettingsAction::ExportIcs => self.export_ics(ui),
                     SettingsAction::ChangePassword => self.change_password(),
@@ -367,18 +408,115 @@ impl Session {
         }
     }
 
-    fn export_ics(&mut self, ui: &Ui) {
+    /// Ask where to save, then write an .ics of `items`.
+    fn write_ics(&mut self, ui: &Ui, items: &[CalItem], invite: bool, file_name: &str) -> bool {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("iCalendar", &["ics"])
-            .set_file_name("supervisor.ics")
+            .set_file_name(file_name)
             .save_file()
         else {
+            return false;
+        };
+        let text = ics::calendar(
+            items,
+            &self.db.settings,
+            invite,
+            &jiff::tz::TimeZone::system(),
+        );
+        match std::fs::write(&path, text) {
+            Ok(()) => true,
+            Err(e) => {
+                self.notify(ui, format!("Saving {} failed: {e}", path.display()));
+                false
+            }
+        }
+    }
+
+    /// Invites need your address as the organiser; send to Settings if missing.
+    fn require_email(&mut self, ui: &Ui) -> bool {
+        if ics::valid_email(&self.db.settings.my_email) {
+            return true;
+        }
+        self.view = View::Settings;
+        self.notify(ui, "Add your email in Settings › Invitations first");
+        false
+    }
+
+    fn export_ics(&mut self, ui: &Ui) {
+        let items = self.db.cal_items(|_| true, true);
+        if self.write_ics(ui, &items, false, "supervisor.ics") {
+            self.notify(ui, format!("Exported {} items", items.len()));
+        }
+    }
+
+    fn export_selected(&mut self, ui: &Ui, uids: &std::collections::HashSet<String>) {
+        let invite = self.db.settings.export_with_guests;
+        if invite && !self.require_email(ui) {
+            return;
+        }
+        let items = self
+            .db
+            .cal_items(|e| uids.contains(&e.uid), self.calendar.as_series);
+        let name = if invite {
+            "supervisor-invites.ics"
+        } else {
+            "supervisor-selection.ics"
+        };
+        if self.write_ics(ui, &items, invite, name) {
+            let mut msg = format!("Exported {} items", items.len());
+            if invite {
+                // Deadlines never have guests; anything else without one lacks an email.
+                let missing = items
+                    .iter()
+                    .filter(|i| i.event.kind != crate::model::EventKind::Deadline && i.attendees.is_empty())
+                    .count();
+                if missing > 0 {
+                    msg.push_str(&format!(" – {missing} without a student email, add it to invite them"));
+                } else {
+                    msg.push_str(" – upload it in Outlook, then open each event and Send");
+                }
+            }
+            self.notify(ui, msg);
+        }
+    }
+
+    fn save_invite(&mut self, ui: &Ui, student_id: Uuid, uid: &str) {
+        if !self.require_email(ui) {
+            return;
+        }
+        let Some(invite) = self.db.invite(student_id, uid) else {
             return;
         };
-        let events = self.db.events();
-        match std::fs::write(&path, ics::to_ics(&events)) {
-            Ok(()) => self.notify(ui, format!("Exported {} events to {}", events.len(), path.display())),
-            Err(e) => self.notify(ui, format!("Export failed: {e}")),
+        if invite.attendees.is_empty() {
+            self.notify(ui, "This student has no email address yet");
+            return;
+        }
+        let name: String = format!(
+            "{} {}",
+            invite.event.date.format("%Y-%m-%d"),
+            invite.event.title
+        )
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || " -–_().".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+        let series = if invite.series.is_some() {
+            "repeating "
+        } else {
+            ""
+        };
+        let hint = if invite.event.online && self.db.settings.teams_link.trim().is_empty() {
+            "upload it in Outlook, open the event, turn on Teams meeting and Send"
+        } else {
+            "upload it in Outlook, open the event and Send"
+        };
+        if self.write_ics(ui, &[invite], true, &format!("{name}.ics")) {
+            self.notify(ui, format!("{series}Invite saved – {hint}"));
         }
     }
 
@@ -436,11 +574,11 @@ impl Session {
                 });
                 ui.add_space(6.0);
                 ui.label(RichText::new("Roles").strong());
-                ui.checkbox(&mut n.fyp, "Final Year Project student");
+                ui.checkbox(&mut n.fyp, "Project student (FYP / MSc)");
                 if n.fyp {
                     ui.indent("fyp-kind", |ui| {
-                        for kind in FypKind::ALL {
-                            ui.radio_value(&mut n.kind, kind, kind.label());
+                        for p in &self.db.settings.programmes {
+                            ui.radio_value(&mut n.programme, p.id.clone(), &p.name);
                         }
                     });
                 }
@@ -534,7 +672,7 @@ mod ui_tests {
     //! write screenshots of each screen.
     use super::*;
     use crate::model::*;
-    use chrono::{Duration as Days, NaiveTime};
+    use chrono::{Datelike, Duration as Days, NaiveTime};
     use egui::accesskit::Role as AkRole;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
@@ -583,11 +721,25 @@ mod ui_tests {
                 email: "khan-a@uni.ac.uk".into(),
                 course: "BEng Mechanical Engineering".into(),
                 fyp: Some(FypRecord {
-                    kind: FypKind::BEng,
+                    programme: "BEng".into(),
                     project_title: "Topology-optimised drone arm".into(),
                     initial_contact: true,
                     initial_contact_on: Some(today - Days::days(30)),
-                    meetings: vec![meeting(-14, true, "Agreed scope."), meeting(3, false, "")],
+                    meetings: vec![
+                        meeting(-14, true, "Agreed scope."),
+                        Meeting {
+                            location: "MG.201".into(),
+                            repeat: Some(Repeat {
+                                exceptions: vec![Occurrence {
+                                    planned: today + Days::days(10),
+                                    cancelled: true,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }),
+                            ..meeting(3, false, "")
+                        },
+                    ],
                     ..Default::default()
                 }),
                 advisee: Some(AdviseeRecord {
@@ -595,7 +747,13 @@ mod ui_tests {
                         contacted_on: Some(today - Days::days(20)),
                         reply: ReplyStatus::Replied,
                         replied_on: Some(today - Days::days(18)),
-                        meetings: vec![meeting(-10, true, "Settling in well."), meeting(5, false, "Follow-on requested")],
+                        meetings: vec![
+                            meeting(-10, true, "Settling in well."),
+                            Meeting {
+                                teams: true,
+                                ..meeting(5, false, "Follow-on requested")
+                            },
+                        ],
                     },
                     ..Default::default()
                 }),
@@ -606,7 +764,7 @@ mod ui_tests {
                 name: "Tom Murphy".into(),
                 course: "MEng Electrical Engineering".into(),
                 fyp: Some(FypRecord {
-                    kind: FypKind::MEngGermany,
+                    programme: "MEngGermany".into(),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -616,7 +774,7 @@ mod ui_tests {
                 name: "Li Wei".into(),
                 course: "BEng (SUST)".into(),
                 fyp: Some(FypRecord {
-                    kind: FypKind::Sust,
+                    programme: "Sust".into(),
                     initial_contact: true,
                     ..Default::default()
                 }),
@@ -735,7 +893,8 @@ mod ui_tests {
         shot(&mut h, "03_dashboard");
 
         for (view, name) in [
-            (View::List(Category::FypBeng), "04_fyp_beng"),
+            (View::Calendar, "04_calendar"),
+            (View::List(Category::Projects("BEng".into())), "04_fyp_beng"),
             (View::List(Category::Placement), "05_placement"),
             (View::List(Category::Advisee), "06_advisees"),
             (View::Settings, "07_settings"),
@@ -745,6 +904,20 @@ mod ui_tests {
             shot(&mut h, name);
         }
 
+        // Month grid: clicking an item selects it for export.
+        {
+            let s = session(&mut h);
+            s.view = View::Calendar;
+            s.calendar.layout = crate::ui::calendar::Layout::Month;
+            s.calendar.month = (today + Days::days(3)).with_day(1).unwrap();
+        }
+        h.run_steps(3);
+        shot(&mut h, "04_calendar_month");
+        h.get_all_by_label_contains("Aisha Khan").next().expect("meeting in month grid").click();
+        h.run_steps(2);
+        assert_eq!(session(&mut h).calendar.selected.len(), 1);
+        assert!(session(&mut h).db.settings.export_with_guests, "guests on by default");
+
         // Detail panels.
         let id_of = |h: &mut Harness<'_, SupervisorApp>, name: &str| {
             session(h).db.students.iter().find(|s| s.name == name).unwrap().id
@@ -752,7 +925,7 @@ mod ui_tests {
         let aisha = id_of(&mut h, "Aisha Khan");
         {
             let s = session(&mut h);
-            s.view = View::List(Category::FypBeng);
+            s.view = View::List(Category::Projects("BEng".into()));
             s.selected = Some(aisha);
         }
         h.run_steps(2);

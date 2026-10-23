@@ -1,4 +1,5 @@
 pub mod advisee;
+pub mod calendar;
 pub mod dashboard;
 pub mod fyp;
 pub mod lock;

@@ -2,10 +2,14 @@
 
 use egui::{RichText, Ui};
 
-use crate::model::{PlacementRecord, ReplyStatus, VisitMode};
+use uuid::Uuid;
+
+use crate::model::{PlacementRecord, ReplyStatus, VisitMode, visit_uid};
 use crate::ui::{theme, widgets};
 
-pub fn show(ui: &mut Ui, p: &mut PlacementRecord) {
+/// Returns the UID of a visit to save an invite for.
+pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<String> {
+    let mut invite = None;
     widgets::form_grid(ui, "placement-grid", |ui| {
         ui.label("Company");
         widgets::text_field(ui, &mut p.company, "Placement company");
@@ -33,6 +37,11 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord) {
                         if v.completed {
                             theme::chip(ui, "completed", theme::GREEN);
                         }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if widgets::invite_button(ui, v.date.is_some()) {
+                                invite = Some(visit_uid(student_id, i));
+                            }
+                        });
                     });
                     widgets::form_grid(ui, "visit-grid", |ui| {
                         ui.label("Mode");
@@ -75,4 +84,5 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord) {
                 });
         });
     }
+    invite
 }
