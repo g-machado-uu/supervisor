@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::model::Database;
 use crate::storage::{self, Vault};
-use crate::ui::theme;
+use crate::ui::{icons, theme};
 
 const MIN_PASSWORD_LEN: usize = 8;
 
@@ -89,38 +89,72 @@ impl LockScreen {
 
         let first_run = self.first_run();
         let busy = self.pending.is_some();
+        let width = ui.available_width();
+        if width > 900.0 {
+            egui::Panel::left("lock-brand")
+                .exact_size((width * 0.42).min(560.0))
+                .frame(egui::Frame::new().fill(theme::sidebar_fill(ui)).inner_margin(egui::Margin::same(48)))
+                .show_separator_line(false)
+                .resizable(false)
+                .show(ui, |ui| {
+                    ui.add_space((ui.available_height() * 0.22).max(10.0));
+                    brand(ui, Align::Min);
+                    ui.add_space(28.0);
+                    for (icon, title, text) in [
+                        (icons::BOOK_OPEN_TEXT, "Project students", "Meetings, coursework and deadlines by course"),
+                        (icons::BUILDINGS, "Placements", "Visit requests, replies and line managers"),
+                        (icons::CHAT_CIRCLE_TEXT, "Studies advisees", "Contact and meetings for each semester"),
+                        (icons::LOCK_SIMPLE, "Encrypted", "Password protected"),
+                    ] {
+                        ui.horizontal(|ui| {
+                            theme::icon_badge(ui, icon, theme::ACCENT, 38.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.label(theme::semibold(title));
+                                ui.label(RichText::new(text).small().color(theme::muted(ui)));
+                            });
+                        });
+                        ui.add_space(8.0);
+                    }
+                });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                ui.add_space((ui.available_height() * 0.18).max(20.0));
-                ui.label(RichText::new("🎓").size(48.0));
-                ui.label(RichText::new("Supervisor").size(30.0).strong());
-                ui.label(RichText::new("FYP · Placement · Studies Advisees").color(theme::GREY));
-                ui.add_space(18.0);
+                ui.add_space((ui.available_height() * 0.2).max(20.0));
+                if width <= 900.0 {
+                    brand(ui, Align::Center);
+                    ui.add_space(18.0);
+                }
 
                 ui.scope(|ui| {
-                    ui.set_max_width(380.0);
-                    theme::card(ui, "", |ui| {
+                    ui.set_max_width(400.0);
+                    theme::card_frame(ui).inner_margin(egui::Margin::same(28)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
                         ui.vertical_centered(|ui| {
+                            theme::icon_badge(ui, icons::LOCK_SIMPLE, theme::ACCENT, 48.0);
+                            ui.add_space(4.0);
                             if first_run {
-                                ui.label(RichText::new("Create a password").strong().size(17.0));
+                                ui.label(theme::serif("Create a password", 24.0));
                                 ui.label(
                                     RichText::new(
                                         "Your data will be encrypted with this password.\n\
                                          There is no way to recover it if forgotten.",
                                     )
-                                    .color(theme::AMBER),
+                                    .color(theme::fg(ui, theme::AMBER)),
                                 );
                             } else {
-                                ui.label(RichText::new("Enter your password").strong().size(17.0));
+                                ui.label(theme::serif("Welcome back", 24.0));
+                                ui.label(RichText::new("Enter your password to unlock your data.").color(theme::muted(ui)));
                             }
-                            ui.add_space(6.0);
+                            ui.add_space(10.0);
 
                             let pw = ui.add_enabled(
                                 !busy,
                                 egui::TextEdit::singleline(&mut *self.password)
                                     .password(true)
                                     .hint_text("Password")
-                                    .desired_width(280.0),
+                                    .desired_width(300.0)
+                                        .margin(egui::vec2(10.0, 8.0)),
                             );
                             if !busy && self.error.is_none() && !pw.has_focus() && self.password.is_empty() {
                                 pw.request_focus();
@@ -132,7 +166,8 @@ impl LockScreen {
                                     egui::TextEdit::singleline(&mut *self.confirm)
                                         .password(true)
                                         .hint_text("Confirm password")
-                                        .desired_width(280.0),
+                                        .desired_width(300.0)
+                                        .margin(egui::vec2(10.0, 8.0)),
                                 );
                                 if enter {
                                     c.request_focus();
@@ -141,11 +176,9 @@ impl LockScreen {
                                 enter |= c.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                             }
 
-                            ui.add_space(6.0);
+                            ui.add_space(8.0);
                             let label = if first_run { "Create & unlock" } else { "Unlock" };
-                            let button = egui::Button::new(RichText::new(label).strong())
-                                .fill(theme::ACCENT.gamma_multiply(0.85))
-                                .min_size(egui::vec2(280.0, 32.0));
+                            let button = theme::primary_button(label).min_size(egui::vec2(300.0, 38.0));
                             if busy {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
@@ -155,7 +188,7 @@ impl LockScreen {
                                 self.submit(ui.ctx());
                             }
                             if let Some(err) = &self.error {
-                                ui.colored_label(theme::RED, err);
+                                ui.colored_label(theme::fg(ui, theme::RED), err);
                             }
                         });
                     });
@@ -165,7 +198,7 @@ impl LockScreen {
                 ui.label(
                     RichText::new(format!("Data file: {}", self.path.display()))
                         .small()
-                        .color(theme::GREY),
+                        .color(theme::muted(ui)),
                 );
                 ui.horizontal(|ui| {
                     ui.add_space((ui.available_width() - 330.0).max(0.0) / 2.0);
@@ -193,4 +226,21 @@ impl LockScreen {
         });
         None
     }
+}
+
+fn brand(ui: &mut egui::Ui, align: Align) {
+    ui.with_layout(Layout::top_down(align), |ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(16), theme::ACCENT);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icons::GRADUATION_CAP,
+            egui::FontId::proportional(30.0),
+            egui::Color32::WHITE,
+        );
+        ui.add_space(6.0);
+        ui.label(theme::serif("Supervisor", 40.0));
+        ui.label(RichText::new("Projects · Placements · Studies Advisees").color(theme::muted(ui)));
+    });
 }

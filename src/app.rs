@@ -14,7 +14,7 @@ use crate::ui::lock::LockScreen;
 use crate::ui::settings::{self, PasswordForm, SettingsAction};
 use crate::ui::student_form::{self, FormAction, Role};
 use crate::ui::student_list::{self, Category, ListState};
-use crate::ui::theme;
+use crate::ui::{icons, theme};
 
 const AUTOSAVE_DELAY: f64 = 1.0;
 
@@ -213,12 +213,17 @@ impl Session {
             lock = true;
         }
 
-        self.top_bar(ui, &mut lock);
-        self.sidebar(ui);
+        self.sidebar(ui, &mut lock);
         if self.view != View::Settings && self.selected.is_some() {
             self.detail_panel(ui);
         }
-        egui::CentralPanel::default().show(ui, |ui| self.central(ui));
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(ui.style())
+                    .inner_margin(egui::Margin { left: 28, right: 28, top: 22, bottom: 12 }),
+            )
+            .show(ui, |ui| self.central(ui));
+        self.toast(ui);
         self.dialogs(ui);
 
         if self.db != before {
@@ -244,77 +249,127 @@ impl Session {
         lock
     }
 
-    fn top_bar(&mut self, ui: &mut Ui, lock: &mut bool) {
-        egui::Panel::top("top-bar").show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("🎓 Supervisor").strong().size(18.0));
-                ui.label(RichText::new(&self.db.settings.academic_year).color(theme::GREY));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🔒 Lock").on_hover_text("Lock (Ctrl+L)").clicked() {
-                        *lock = true;
-                    }
-                    let dark = &mut self.db.settings.dark_mode;
-                    if ui
-                        .button(if *dark { "☀" } else { "🌙" })
-                        .on_hover_text("Toggle light/dark")
-                        .clicked()
-                    {
-                        *dark = !*dark;
-                    }
-                    match &self.status {
-                        SaveStatus::Saved => ui.label(RichText::new("Saved ✔").small().color(theme::GREEN)),
-                        SaveStatus::Pending => ui.label(RichText::new("Saving…").small().color(theme::GREY)),
-                        SaveStatus::Error(e) => ui
-                            .label(RichText::new("⚠ Save failed").small().color(theme::RED))
-                            .on_hover_text(e),
-                    };
-                    let now = ui.input(|i| i.time);
-                    if let Some((msg, at)) = &self.toast {
-                        if now - at < 5.0 {
-                            ui.label(RichText::new(msg).small().color(theme::ACCENT));
-                            ui.ctx().request_repaint_after(Duration::from_millis(500));
-                        } else {
-                            self.toast = None;
-                        }
-                    }
-                });
+    /// The latest message, floating at the bottom of the window for a few seconds.
+    fn toast(&mut self, ui: &mut Ui) {
+        let now = ui.input(|i| i.time);
+        let Some((msg, at)) = &self.toast else { return };
+        if now - at >= 5.0 {
+            self.toast = None;
+            return;
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
+        egui::Area::new(Id::unique("toast"))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(115.0, -24.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                        ui.set_max_width(560.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(icons::BELL).size(16.0).color(theme::fg(ui, theme::ACCENT)));
+                            ui.label(msg);
+                        });
+                    });
             });
-            ui.add_space(2.0);
-        });
     }
 
-    fn sidebar(&mut self, ui: &mut Ui) {
-        egui::Panel::left("nav").exact_size(230.0).show(ui, |ui| {
-            ui.add_space(8.0);
-            let lists = self.db.settings.programme_lists();
-            let mut nav = |ui: &mut Ui, view: View, label: &str, count: Option<usize>| {
-                let mut b = egui::Button::selectable(self.view == view, label).min_size(egui::vec2(ui.available_width(), 32.0));
-                if let Some(c) = count {
-                    b = b.right_text(RichText::new(c.to_string()).color(theme::GREY));
+    fn sidebar(&mut self, ui: &mut Ui, lock: &mut bool) {
+        let frame = egui::Frame::new()
+            .fill(theme::sidebar_fill(ui))
+            .inner_margin(egui::Margin { left: 14, right: 14, top: 18, bottom: 14 });
+        egui::Panel::left("nav")
+            .exact_size(232.0)
+            .frame(frame)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, egui::CornerRadius::same(12), theme::ACCENT);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        icons::GRADUATION_CAP,
+                        egui::FontId::proportional(21.0),
+                        egui::Color32::WHITE,
+                    );
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(theme::serif("Supervisor", 21.0));
+                        ui.label(RichText::new(&self.db.settings.academic_year).small().color(theme::muted(ui)));
+                    });
+                });
+                ui.add_space(18.0);
+
+                ui.spacing_mut().item_spacing.y = 3.0;
+                let section = |ui: &mut Ui, text: &str| {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(
+                            theme::semibold(text)
+                                .size(10.5)
+                                .extra_letter_spacing(1.0)
+                                .color(theme::muted(ui)),
+                        );
+                    });
+                    ui.add_space(2.0);
+                };
+                let lists = self.db.settings.programme_lists();
+                let mut nav = |ui: &mut Ui, view: View, icon: &str, label: &str, count: Option<usize>| {
+                    if theme::nav_item(ui, icon, label, count, self.view == view).clicked() {
+                        self.view = view;
+                    }
+                };
+                nav(ui, View::Dashboard, icons::HOUSE, "Dashboard", None);
+                nav(ui, View::Calendar, icons::CALENDAR_DOTS, "Calendar", None);
+                section(ui, "PROJECT STUDENTS");
+                for list in lists {
+                    let cat = Category::Projects(list.clone());
+                    let count = cat.count(&self.db);
+                    nav(ui, View::List(cat), icons::BOOK_OPEN_TEXT, &list, Some(count));
                 }
-                if ui.add(b).clicked() {
-                    self.view = view;
-                }
-            };
-            nav(ui, View::Dashboard, "🏠  Dashboard", None);
-            nav(ui, View::Calendar, "📅  Calendar", None);
-            ui.add_space(6.0);
-            ui.label(RichText::new("PROJECT STUDENTS").small().color(theme::GREY));
-            for list in lists {
-                let cat = Category::Projects(list.clone());
-                let count = cat.count(&self.db);
-                nav(ui, View::List(cat), &format!("📘  {list}"), Some(count));
-            }
-            ui.add_space(6.0);
-            ui.label(RichText::new("OTHER").small().color(theme::GREY));
-            nav(ui, View::List(Category::Placement), "🏢  Placement", Some(Category::Placement.count(&self.db)));
-            nav(ui, View::List(Category::Advisee), "💬  Studies Advisees", Some(Category::Advisee.count(&self.db)));
-            nav(ui, View::List(Category::All), "👥  All Students", Some(Category::All.count(&self.db)));
-            ui.add_space(6.0);
-            ui.separator();
-            nav(ui, View::Settings, "⚙  Settings", None);
-        });
+                section(ui, "OTHER");
+                nav(ui, View::List(Category::Placement), icons::BUILDINGS, "Placement", Some(Category::Placement.count(&self.db)));
+                nav(ui, View::List(Category::Advisee), icons::CHAT_CIRCLE_TEXT, "Studies Advisees", Some(Category::Advisee.count(&self.db)));
+                nav(ui, View::List(Category::All), icons::USERS_THREE, "All Students", Some(Category::All.count(&self.db)));
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new(format!("{}  Lock", icons::LOCK_SIMPLE)).corner_radius(egui::CornerRadius::same(10)))
+                            .on_hover_text("Lock (Ctrl+L)")
+                            .clicked()
+                        {
+                            *lock = true;
+                        }
+                        let dark = &mut self.db.settings.dark_mode;
+                        if ui
+                            .add(egui::Button::new(RichText::new(if *dark { icons::SUN } else { icons::MOON }).size(16.0)).corner_radius(egui::CornerRadius::same(10)))
+                            .on_hover_text("Toggle light/dark")
+                            .clicked()
+                        {
+                            *dark = !*dark;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match &self.status {
+                                SaveStatus::Saved => ui
+                                    .label(RichText::new(format!("{} Saved", icons::CLOUD_CHECK)).small().color(theme::fg(ui, theme::GREEN)))
+                                    .on_hover_text("All changes are saved and encrypted"),
+                                SaveStatus::Pending => ui.label(RichText::new("Saving…").small().color(theme::muted(ui))),
+                                SaveStatus::Error(e) => ui
+                                    .label(RichText::new(format!("{} Save failed", icons::WARNING)).small().color(theme::fg(ui, theme::RED)))
+                                    .on_hover_text(e),
+                            };
+                        });
+                    });
+                    ui.add_space(4.0);
+                    nav(ui, View::Settings, icons::GEAR_SIX, "Settings", None);
+                });
+            });
     }
 
     fn detail_panel(&mut self, ui: &mut Ui) {
@@ -329,12 +384,15 @@ impl Session {
             return;
         };
         let mut action = FormAction::None;
+        let frame = egui::Frame::side_top_panel(ui.style())
+            .fill(ui.visuals().window_fill)
+            .inner_margin(egui::Margin { left: 20, right: 14, top: 20, bottom: 8 });
         egui::Panel::right("detail")
             .resizable(true)
-            .default_size(520.0)
-            .min_size(400.0)
+            .default_size(500.0)
+            .min_size(420.0)
+            .frame(frame)
             .show(ui, |ui| {
-                ui.add_space(6.0);
                 action = student_form::show(ui, student, settings, dup);
             });
         match action {
@@ -353,6 +411,11 @@ impl Session {
                 DashAction::Open(id) => self.selected = Some(id),
                 DashAction::Goto(cat) => self.view = View::List(cat),
                 DashAction::ExportIcs => self.export_ics(ui),
+                DashAction::Month(month) => {
+                    self.calendar.layout = calendar::Layout::Month;
+                    self.calendar.month = month;
+                    self.view = View::Calendar;
+                }
             },
             View::Calendar => {
                 let mut guests = self.db.settings.export_with_guests;
@@ -548,17 +611,24 @@ impl Session {
             let mut create = false;
             let mut cancel = false;
             let dup = self.db.b_number_taken(&n.student.b_number, None);
-            let resp = egui::Modal::new(Id::unique("new-student")).show(&ctx, |ui| {
-                ui.set_width(440.0);
-                ui.heading("Add student");
-                ui.add_space(6.0);
+            let resp = egui::Modal::new(Id::unique("new-student")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
+                ui.set_width(460.0);
+                ui.horizontal(|ui| {
+                    theme::icon_badge(ui, icons::STUDENT, theme::ACCENT, 40.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(theme::serif("Add student", 24.0));
+                        ui.label(RichText::new("Details can be completed later in the side panel.").small().color(theme::muted(ui)));
+                    });
+                });
+                ui.add_space(10.0);
                 crate::ui::widgets::form_grid(ui, "new-grid", |ui| {
                     let s = &mut n.student;
                     ui.label("B Number");
                     ui.vertical(|ui| {
                         crate::ui::widgets::text_field(ui, &mut s.b_number, "B00123456");
                         if dup {
-                            ui.colored_label(theme::AMBER, "⚠ Already exists");
+                            ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} Already exists", icons::WARNING));
                         }
                     });
                     ui.end_row();
@@ -572,8 +642,8 @@ impl Session {
                     crate::ui::widgets::text_field(ui, &mut s.course, "Course");
                     ui.end_row();
                 });
-                ui.add_space(6.0);
-                ui.label(RichText::new("Roles").strong());
+                ui.add_space(8.0);
+                theme::card_title(ui, "Roles");
                 ui.checkbox(&mut n.fyp, "Project student (FYP / MSc)");
                 if n.fyp {
                     ui.indent("fyp-kind", |ui| {
@@ -590,16 +660,13 @@ impl Session {
                     });
                 }
                 ui.checkbox(&mut n.advisee, "Studies advisee");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let valid = !n.student.name.trim().is_empty() || !n.student.b_number.trim().is_empty();
-                    if ui
-                        .add_enabled(valid, egui::Button::new(RichText::new("Create").strong()).fill(theme::ACCENT.gamma_multiply(0.85)))
-                        .clicked()
-                    {
+                    if ui.add_enabled(valid, theme::primary_button("Create")).clicked() {
                         create = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 34.0))).clicked() {
                         cancel = true;
                     }
                 });
@@ -629,16 +696,20 @@ impl Session {
             };
             let mut yes = false;
             let mut no = false;
-            let resp = egui::Modal::new(Id::unique("confirm")).show(&ctx, |ui| {
-                ui.set_width(360.0);
-                ui.heading(title);
-                ui.label(body);
-                ui.add_space(8.0);
+            let resp = egui::Modal::new(Id::unique("confirm")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
+                ui.set_width(380.0);
                 ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new(RichText::new("Delete").strong()).fill(theme::RED.gamma_multiply(0.8))).clicked() {
+                    theme::icon_badge(ui, icons::TRASH, theme::RED, 40.0);
+                    ui.label(theme::serif(title, 22.0));
+                });
+                ui.add_space(4.0);
+                ui.label(body);
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(theme::danger_button("Delete")).clicked() {
                         yes = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 34.0))).clicked() {
                         no = true;
                     }
                 });
@@ -847,9 +918,9 @@ mod ui_tests {
         assert!(path.exists());
 
         // Add a student through the dialog.
-        h.get_by_label_contains("🏢  Placement").click();
+        h.get_by_label("Placement").click();
         h.run_steps(2);
-        h.get_by_label("➕ Add student").click();
+        h.get_by_label(&format!("{}  Add student", icons::PLUS)).click();
         h.run_steps(2);
         shot(&mut h, "02_add_student_dialog");
         let inputs = h.get_all_by_role(AkRole::TextInput).collect::<Vec<_>>();
@@ -947,7 +1018,7 @@ mod ui_tests {
         shot(&mut h, "10_dashboard_dark");
 
         // Lock: back to the unlock screen, and the right password reopens the data.
-        h.get_by_label("🔒 Lock").click();
+        h.get_by_label(&format!("{}  Lock", icons::LOCK_SIMPLE)).click();
         h.run_steps(2);
         assert!(matches!(h.state().screen, Screen::Locked(_)));
         let (_, saved) = Vault::open(&path, PASSWORD).unwrap();

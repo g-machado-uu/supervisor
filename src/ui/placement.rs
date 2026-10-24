@@ -1,11 +1,11 @@
 //! Placement section: company details and the two visits.
 
-use egui::{RichText, Ui};
+use egui::Ui;
 
 use uuid::Uuid;
 
 use crate::model::{PlacementRecord, ReplyStatus, VisitMode, visit_uid};
-use crate::ui::{theme, widgets};
+use crate::ui::{icons, theme, widgets};
 
 /// Returns the UID of a visit to save an invite for.
 pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<String> {
@@ -28,12 +28,11 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<St
     for (i, v) in p.visits.iter_mut().enumerate() {
         ui.add_space(6.0);
         ui.push_id(("visit", i), |ui| {
-            egui::Frame::group(ui.style())
-                .corner_radius(egui::CornerRadius::same(8))
+            widgets::inner_frame(ui)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Visit {}", i + 1)).strong());
+                        ui.label(theme::semibold(format!("Visit {}", i + 1)));
                         if v.completed {
                             theme::chip(ui, "completed", theme::GREEN);
                         }
@@ -46,8 +45,8 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<St
                     widgets::form_grid(ui, "visit-grid", |ui| {
                         ui.label("Mode");
                         ui.horizontal(|ui| {
-                            ui.selectable_value(&mut v.mode, VisitMode::Online, "💻 Online");
-                            ui.selectable_value(&mut v.mode, VisitMode::FaceToFace, "🏢 Face-to-face");
+                            ui.selectable_value(&mut v.mode, VisitMode::Online, format!("{} Online", icons::DESKTOP));
+                            ui.selectable_value(&mut v.mode, VisitMode::FaceToFace, format!("{} Face-to-face", icons::BUILDINGS));
                         });
                         ui.end_row();
 

@@ -3,7 +3,7 @@
 use egui::{Align, Layout, RichText, Ui};
 
 use crate::model::{AdviseeRecord, FypRecord, PlacementRecord, Settings, Student};
-use crate::ui::{advisee, fyp, placement, theme, widgets};
+use crate::ui::{advisee, fyp, icons, placement, theme, widgets};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -34,17 +34,47 @@ pub enum FormAction {
 pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool) -> FormAction {
     let mut action = FormAction::None;
     ui.horizontal(|ui| {
-        ui.heading(if s.name.is_empty() { "New student" } else { &s.name });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("×").on_hover_text("Close").clicked() {
+        theme::avatar(ui, &s.name, 52.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(theme::serif(if s.name.is_empty() { "New student" } else { &s.name }, 24.0));
+            let mut sub = vec![];
+            if !s.b_number.is_empty() {
+                sub.push(s.b_number.as_str());
+            }
+            if !s.course.is_empty() {
+                sub.push(s.course.as_str());
+            }
+            if !sub.is_empty() {
+                ui.label(RichText::new(sub.join(" · ")).color(theme::muted(ui)));
+            }
+        });
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            if ui
+                .add(egui::Button::new(RichText::new(icons::X).size(15.0)).frame(false))
+                .on_hover_text("Close")
+                .clicked()
+            {
                 action = FormAction::Close;
             }
         });
     });
-    if s.archived {
-        theme::chip(ui, "archived", theme::GREY);
-    }
-    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(60.0);
+        if let Some(f) = &s.fyp {
+            theme::chip(ui, format!("{} {}", icons::BOOK_OPEN_TEXT, settings.programme_short(&f.programme)), theme::ACCENT);
+        }
+        if s.placement.is_some() {
+            theme::chip(ui, format!("{} Placement", icons::BUILDINGS), theme::AMBER);
+        }
+        if s.advisee.is_some() {
+            theme::chip(ui, format!("{} Advisee", icons::CHAT_CIRCLE_TEXT), theme::GREEN);
+        }
+        if s.archived {
+            theme::chip(ui, format!("{} archived", icons::ARCHIVE), theme::GREY);
+        }
+    });
+    ui.add_space(10.0);
 
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         theme::card(ui, "Details", |ui| {
@@ -53,7 +83,7 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
                 ui.vertical(|ui| {
                     widgets::text_field(ui, &mut s.b_number, "B00123456");
                     if duplicate_b {
-                        ui.colored_label(theme::AMBER, "⚠ Another student has this B number");
+                        ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} Another student has this B number", icons::WARNING));
                     }
                 });
                 ui.end_row();
@@ -73,19 +103,21 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
             widgets::notes(ui, &mut s.notes, "General notes…");
         });
 
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Add role:");
-            if s.fyp.is_none() && ui.button("➕ Project supervision").clicked() {
-                s.fyp = Some(FypRecord::default());
-            }
-            if s.placement.is_none() && ui.button("➕ Placement").clicked() {
-                s.placement = Some(PlacementRecord::default());
-            }
-            if s.advisee.is_none() && ui.button("➕ Studies Advisee").clicked() {
-                s.advisee = Some(AdviseeRecord::default());
-            }
-        });
+        if s.fyp.is_none() || s.placement.is_none() || s.advisee.is_none() {
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Add role").color(theme::muted(ui)));
+                if s.fyp.is_none() && ui.button(format!("{} Project supervision", icons::PLUS)).clicked() {
+                    s.fyp = Some(FypRecord::default());
+                }
+                if s.placement.is_none() && ui.button(format!("{} Placement", icons::PLUS)).clicked() {
+                    s.placement = Some(PlacementRecord::default());
+                }
+                if s.advisee.is_none() && ui.button(format!("{} Studies Advisee", icons::PLUS)).clicked() {
+                    s.advisee = Some(AdviseeRecord::default());
+                }
+            });
+        }
 
         // At most one invite button is clicked per frame.
         let mut invite = None;
@@ -116,28 +148,36 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
         }
 
         ui.add_space(16.0);
-        ui.separator();
         if ui
-            .button(RichText::new("🗑 Delete student…").color(theme::RED))
+            .button(RichText::new(format!("{} Delete student…", icons::TRASH)).color(theme::fg(ui, theme::RED)))
             .clicked()
         {
             action = FormAction::Delete;
         }
+        ui.add_space(8.0);
     });
     action
 }
 
 fn role_section(ui: &mut Ui, role: Role, action: &mut FormAction, add: impl FnOnce(&mut Ui)) {
-    ui.add_space(6.0);
+    let (icon, color) = match role {
+        Role::Fyp => (icons::BOOK_OPEN_TEXT, theme::ACCENT),
+        Role::Placement => (icons::BUILDINGS, theme::AMBER),
+        Role::Advisee => (icons::CHAT_CIRCLE_TEXT, theme::GREEN),
+    };
+    ui.add_space(10.0);
     theme::card(ui, "", |ui| {
-        egui::CollapsingHeader::new(RichText::new(role.label()).strong().size(16.0))
+        let title = theme::semibold(format!("{icon}  {}", role.label()))
+            .size(15.0)
+            .color(theme::fg(ui, color));
+        egui::CollapsingHeader::new(title)
             .id_salt(role.label())
             .default_open(true)
             .show(ui, |ui| {
                 add(ui);
                 ui.add_space(4.0);
                 if ui
-                    .small_button(RichText::new(format!("Remove {} record…", role.label())).color(theme::GREY))
+                    .small_button(RichText::new(format!("Remove {} record…", role.label())).color(theme::muted(ui)))
                     .clicked()
                 {
                     *action = FormAction::RemoveRole(role);

@@ -37,21 +37,21 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings) -> Option<Str
         ui.end_row();
     });
 
-    ui.add_space(6.0);
-    ui.label(RichText::new("Coursework").strong());
+    ui.add_space(10.0);
+    theme::card_title(ui, "Coursework");
     let today = widgets::today();
     let mut any_module = false;
     for module in settings.modules_for(&fyp.programme) {
         any_module = true;
         ui.label(
-            RichText::new(format!("{} – {} · {}", module.code, module.name, module.semester.label()))
-                .color(theme::ACCENT),
+            theme::semibold(format!("{} – {} · {}", module.code, module.name, module.semester.label()))
+                .color(theme::fg(ui, theme::ACCENT)),
         );
         if module.courseworks.is_empty() {
             ui.label(
                 RichText::new("No courseworks defined yet – add them in Settings › Modules.")
                     .italics()
-                    .color(theme::GREY),
+                    .color(theme::muted(ui)),
             );
             continue;
         }
@@ -60,10 +60,10 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings) -> Option<Str
             .striped(true)
             .spacing([10.0, 6.0])
             .show(ui, |ui| {
-                ui.label(RichText::new("Item").small().color(theme::GREY));
-                ui.label(RichText::new("Deadline").small().color(theme::GREY));
-                ui.label(RichText::new("Extension").small().color(theme::GREY));
-                ui.label(RichText::new("Submitted").small().color(theme::GREY));
+                ui.label(RichText::new("Item").small().color(theme::muted(ui)));
+                ui.label(RichText::new("Deadline").small().color(theme::muted(ui)));
+                ui.label(RichText::new("Extension").small().color(theme::muted(ui)));
+                ui.label(RichText::new("Submitted").small().color(theme::muted(ui)));
                 ui.end_row();
                 for cw in &module.courseworks {
                     // Edit a copy so merely viewing doesn't create (and save) empty entries.
@@ -74,16 +74,16 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings) -> Option<Str
                     match settings.effective_deadline(module, cw, Some(status)) {
                         Some(due) => {
                             let color = if status.submitted {
-                                theme::GREEN
+                                theme::fg(ui, theme::GREEN)
                             } else if due < today {
-                                theme::RED
+                                theme::fg(ui, theme::RED)
                             } else {
                                 ui.visuals().text_color()
                             };
                             ui.colored_label(color, widgets::fmt_date(Some(due)));
                         }
                         None => {
-                            ui.label(RichText::new("TBC").color(theme::GREY));
+                            ui.label(RichText::new("TBC").color(theme::muted(ui)));
                         }
                     }
                     widgets::opt_date(ui, ("ext", cw.id), &mut status.deadline_override);
@@ -109,11 +109,11 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings) -> Option<Str
         ui.label(
             RichText::new("No modules are linked to this course – add them in Settings › Modules.")
                 .italics()
-                .color(theme::GREY),
+                .color(theme::muted(ui)),
         );
     }
 
-    ui.add_space(6.0);
-    ui.label(RichText::new("Meetings").strong());
+    ui.add_space(10.0);
+    theme::card_title(ui, "Meetings");
     widgets::meetings_editor(ui, "fyp-meetings", &mut fyp.meetings, None, settings)
 }

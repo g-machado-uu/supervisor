@@ -7,7 +7,7 @@ use egui::{RichText, Ui};
 use zeroize::Zeroizing;
 
 use crate::model::{CourseworkTemplate, Module, Programme, Semester, Settings};
-use crate::ui::{theme, widgets};
+use crate::ui::{icons, theme, widgets};
 
 #[derive(Default)]
 pub struct PasswordForm {
@@ -32,9 +32,10 @@ pub fn show(
     pw: &mut PasswordForm,
 ) -> SettingsAction {
     let mut action = SettingsAction::None;
-    ui.heading("Settings");
-    ui.add_space(6.0);
+    theme::page_header(ui, "Settings", "Academic calendar, courses, invitations and security", |_| {});
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        ui.set_max_width(920.0);
+        ui.spacing_mut().item_spacing.y = 14.0;
         theme::card(ui, "Academic year", |ui| {
             widgets::form_grid(ui, "year-grid", |ui| {
                 ui.label("Academic year");
@@ -59,7 +60,7 @@ pub fn show(
                                 *end = Some(default);
                             }
                         } else {
-                            ui.label(RichText::new("set week 1 first").color(theme::GREY));
+                            ui.label(RichText::new("set week 1 first").color(theme::muted(ui)));
                         }
                     });
                     ui.end_row();
@@ -69,15 +70,15 @@ pub fn show(
                 ui.end_row();
                 ui.label("Appearance");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut settings.dark_mode, false, "☀ Light");
-                    ui.selectable_value(&mut settings.dark_mode, true, "🌙 Dark");
+                    ui.selectable_value(&mut settings.dark_mode, false, format!("{} Light", icons::SUN));
+                    ui.selectable_value(&mut settings.dark_mode, true, format!("{} Dark", icons::MOON));
                 });
                 ui.end_row();
             });
             ui.label(
                 RichText::new("Coursework set by teaching week is due at the start of that week (Monday if week 1 starts on a Monday). Give an explicit date to override. Repeating meetings run until teaching ends, not until the end of exams.")
                     .small()
-                    .color(theme::GREY),
+                    .color(theme::muted(ui)),
             );
         });
 
@@ -91,7 +92,7 @@ pub fn show(
             ui.label(
                 RichText::new("Each module applies to one or more courses. SUST modules are kept separate so their dates and coursework can differ.")
                     .small()
-                    .color(theme::GREY),
+                    .color(theme::muted(ui)),
             );
             let starts = (settings.sem1_start, settings.sem2_start);
             let programmes = settings.programmes.clone();
@@ -131,7 +132,7 @@ pub fn show(
                     widgets::text_field(ui, &mut settings.my_email, "name@ulster.ac.uk");
                     let email = settings.my_email.trim();
                     if !email.is_empty() && !crate::ics::valid_email(email) {
-                        ui.colored_label(theme::AMBER, "⚠ This doesn't look like an email address");
+                        ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} This doesn't look like an email address", icons::WARNING));
                     }
                 });
                 ui.end_row();
@@ -140,26 +141,26 @@ pub fn show(
                 ui.end_row();
             });
             ui.label(
-                RichText::new("“📨 Invite file…” on a meeting or visit saves a one-event .ics: upload it in Outlook (Add calendar › Upload from file), open the event and Send. For Teams meetings the link above is included; without one, turn on “Teams meeting” in Outlook before sending.")
+                RichText::new("“Invite file…” on a meeting or visit saves a one-event .ics: upload it in Outlook (Add calendar › Upload from file), open the event and Send. For Teams meetings the link above is included; without one, turn on “Teams meeting” in Outlook before sending.")
                     .small()
-                    .color(theme::GREY),
+                    .color(theme::muted(ui)),
             );
             ui.label(
                 RichText::new("These details are stored in the encrypted data file. Invite files themselves are not encrypted and contain your and the student's email addresses.")
                     .small()
-                    .color(theme::GREY),
+                    .color(theme::muted(ui)),
             );
         });
 
         ui.add_space(8.0);
         theme::card(ui, "Calendar", |ui| {
-            if ui.button("📅 Export calendar (.ics)…").clicked() {
+            if ui.button(format!("{} Export calendar (.ics)…", icons::EXPORT)).clicked() {
                 action = SettingsAction::ExportIcs;
             }
             ui.label(
                 RichText::new("Exports meetings, visits and coursework deadlines for Outlook / Google Calendar. The exported file is not encrypted.")
                     .small()
-                    .color(theme::GREY),
+                    .color(theme::muted(ui)),
             );
         });
 
@@ -169,7 +170,7 @@ pub fn show(
             ui.label(
                 RichText::new("Encrypted with Argon2id + XChaCha20-Poly1305. A backup of the previous save is kept alongside it (.bak).")
                     .small()
-                    .color(theme::GREY),
+                    .color(theme::muted(ui)),
             );
             ui.add_space(6.0);
             ui.label(RichText::new("Change password").strong());
@@ -188,7 +189,7 @@ pub fn show(
                 action = SettingsAction::ChangePassword;
             }
             if let Some((ok, msg)) = &pw.message {
-                ui.colored_label(if *ok { theme::GREEN } else { theme::RED }, msg);
+                ui.colored_label(theme::fg(ui, if *ok { theme::GREEN } else { theme::RED }), msg);
             }
         });
     });
@@ -239,7 +240,7 @@ fn module_editor(
 
     ui.label(RichText::new("Courseworks").strong());
     if module.courseworks.is_empty() {
-        ui.label(RichText::new("None yet.").italics().color(theme::GREY));
+        ui.label(RichText::new("None yet.").italics().color(theme::muted(ui)));
     }
     let mut remove_cw = None;
     egui::Grid::new("cw-template-grid")
@@ -248,7 +249,7 @@ fn module_editor(
         .show(ui, |ui| {
             if !module.courseworks.is_empty() {
                 for h in ["Title", "Teaching week", "Fixed deadline", "Resolves to", ""] {
-                    ui.label(RichText::new(h).small().color(theme::GREY));
+                    ui.label(RichText::new(h).small().color(theme::muted(ui)));
                 }
                 ui.end_row();
             }
@@ -284,7 +285,7 @@ fn module_editor(
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .small_button(RichText::new("Remove module").color(theme::RED))
+                .small_button(RichText::new("Remove module").color(theme::fg(ui, theme::RED)))
                 .on_hover_text("Double-click to remove this module")
                 .double_clicked()
             {
@@ -301,7 +302,7 @@ fn courses_editor(ui: &mut Ui, programmes: &mut Vec<Programme>, in_use: &HashMap
     ui.label(
         RichText::new("Courses sharing a list name are shown together in the sidebar. Add their modules and coursework below.")
             .small()
-            .color(theme::GREY),
+            .color(theme::muted(ui)),
     );
     let mut remove = None;
     egui::Grid::new("courses-grid")
@@ -309,7 +310,7 @@ fn courses_editor(ui: &mut Ui, programmes: &mut Vec<Programme>, in_use: &HashMap
         .spacing([10.0, 6.0])
         .show(ui, |ui| {
             for h in ["Name", "Short name", "Sidebar list", "Students", ""] {
-                ui.label(RichText::new(h).small().color(theme::GREY));
+                ui.label(RichText::new(h).small().color(theme::muted(ui)));
             }
             ui.end_row();
             for (i, p) in programmes.iter_mut().enumerate() {

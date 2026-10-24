@@ -2,6 +2,7 @@ pub mod advisee;
 pub mod calendar;
 pub mod dashboard;
 pub mod fyp;
+pub mod icons;
 pub mod lock;
 pub mod placement;
 pub mod settings;

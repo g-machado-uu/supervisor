@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::model::{
     Database, FypRecord, Meeting, ReplyStatus, SemesterContact, Settings, Student, Visit,
 };
-use crate::ui::{theme, widgets};
+use crate::ui::{icons, theme, widgets};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Category {
@@ -59,26 +59,43 @@ pub struct ListState<'a> {
 /// Returns true when "Add student" was clicked.
 pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bool {
     let mut add = false;
-    ui.horizontal(|ui| {
-        ui.heading(cat.title());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(egui::Button::new(RichText::new("➕ Add student").strong()).fill(theme::ACCENT.gamma_multiply(0.85)))
-                .clicked()
-            {
-                add = true;
-            }
-        });
+    let count = cat.count(db);
+    let subtitle = match count {
+        0 => "No current students".to_string(),
+        1 => "1 current student".to_string(),
+        n => format!("{n} current students"),
+    };
+    theme::page_header(ui, &cat.title(), &subtitle, |ui| {
+        if ui
+            .add(theme::primary_button(format!("{}  Add student", icons::PLUS)))
+            .on_hover_text("Ctrl+N")
+            .clicked()
+        {
+            add = true;
+        }
     });
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(st.search)
-                .hint_text("🔍 Search name, B number, email, course, company…")
-                .desired_width(360.0),
-        );
+        egui::Frame::new()
+            .fill(ui.visuals().window_fill)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(10, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icons::MAGNIFYING_GLASS).size(16.0).color(theme::muted(ui)));
+                    ui.add(
+                        egui::TextEdit::singleline(st.search)
+                            .hint_text("Search name, B number, email, course, company…")
+                            .frame(egui::Frame::NONE)
+                            .background_color(egui::Color32::TRANSPARENT)
+                            .desired_width(340.0),
+                    );
+                });
+            });
+        ui.add_space(8.0);
         ui.checkbox(st.show_archived, "Show archived");
     });
-    ui.add_space(6.0);
+    ui.add_space(12.0);
 
     let rows: Vec<&Student> = db
         .students
@@ -93,13 +110,18 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
     rows.sort_by_key(|s| s.name.to_lowercase());
 
     if rows.is_empty() {
-        ui.add_space(30.0);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                RichText::new("No students here yet.")
-                    .color(theme::GREY)
-                    .size(16.0),
-            );
+        theme::card(ui, "", |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(30.0);
+                ui.label(RichText::new(icons::STUDENT).size(40.0).color(theme::muted(ui)));
+                let text = if st.search.is_empty() {
+                    "No students here yet."
+                } else {
+                    "No students match the search."
+                };
+                ui.label(RichText::new(text).color(theme::muted(ui)).size(16.0));
+                ui.add_space(30.0);
+            });
         });
         return add;
     }
@@ -131,38 +153,66 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
         Category::All => &["Name", "B Number", "Email", "Course", "Roles"],
     };
 
+    theme::card_frame(ui)
+        .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 4 })
+        .show(ui, |ui| table(ui, db, cat, &rows, mixed, headers, st.selected, today));
+    add
+}
+
+#[allow(clippy::too_many_arguments)]
+fn table(
+    ui: &mut Ui,
+    db: &Database,
+    cat: &Category,
+    rows: &[&Student],
+    mixed: bool,
+    headers: &[&str],
+    selected: &mut Option<Uuid>,
+    today: NaiveDate,
+) {
+    ui.spacing_mut().item_spacing.x = 6.0;
     let mut table = TableBuilder::new(ui)
-        .striped(true)
+        .striped(false)
         .sense(Sense::click())
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::initial(170.0).at_least(110.0).resizable(true).clip(true))
-        .column(Column::initial(100.0).resizable(true));
+        .column(Column::initial(210.0).at_least(140.0).resizable(true).clip(true))
+        .column(Column::initial(110.0).resizable(true));
     for _ in 2..headers.len() - 1 {
         table = table.column(Column::initial(140.0).at_least(80.0).resizable(true).clip(true));
     }
     table
         .column(Column::remainder().at_least(140.0))
-        .header(26.0, |mut header| {
+        .header(32.0, |mut header| {
             for h in headers {
                 header.col(|ui| {
-                    ui.label(RichText::new(*h).strong());
+                    ui.label(
+                        theme::semibold(h.to_uppercase())
+                            .size(11.0)
+                            .extra_letter_spacing(0.6)
+                            .color(theme::muted(ui)),
+                    );
                 });
             }
         })
         .body(|body| {
-            body.rows(30.0, rows.len(), |mut row| {
+            body.rows(46.0, rows.len(), |mut row| {
                 let s = rows[row.index()];
-                row.set_selected(*st.selected == Some(s.id));
+                row.set_selected(*selected == Some(s.id));
                 row.col(|ui| {
+                    theme::avatar(ui, &s.name, 30.0);
                     let text = if s.name.is_empty() { "(no name)" } else { &s.name };
-                    let mut rt = RichText::new(text).strong();
+                    let mut rt = theme::semibold(text);
                     if s.archived {
-                        rt = rt.color(theme::GREY);
+                        rt = rt.color(theme::muted(ui));
                     }
                     ui.label(rt);
+                    if s.archived {
+                        ui.label(RichText::new(icons::ARCHIVE).color(theme::muted(ui)))
+                            .on_hover_text("Archived");
+                    }
                 });
                 row.col(|ui| {
-                    ui.label(&s.b_number);
+                    ui.label(RichText::new(&s.b_number).color(theme::muted(ui)));
                 });
                 match cat {
                     Category::Projects(_) => {
@@ -179,9 +229,9 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
                         });
                         row.col(|ui| {
                             if f.initial_contact {
-                                theme::chip(ui, "✔ contacted", theme::GREEN);
+                                theme::chip(ui, format!("{} contacted", icons::CHECK), theme::GREEN);
                             } else {
-                                theme::chip(ui, "✖ not yet", theme::AMBER);
+                                theme::chip(ui, format!("{} not yet", icons::HOURGLASS), theme::AMBER);
                             }
                         });
                         row.col(|ui| meetings_chip(ui, &f.meetings, &db.settings, today));
@@ -236,11 +286,10 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
                     }
                 }
                 if row.response().clicked() {
-                    *st.selected = Some(s.id);
+                    *selected = Some(s.id);
                 }
             });
         });
-    add
 }
 
 /// Next planned meeting on or after `today` and how many have been held,
@@ -269,7 +318,7 @@ fn meetings_chip(ui: &mut Ui, meetings: &[Meeting], settings: &Settings, today: 
         Some(d) => theme::chip(ui, format!("next {}", widgets::fmt_short(d)), theme::ACCENT),
         None => theme::chip(ui, "none booked", theme::GREY),
     };
-    ui.label(RichText::new(format!("{held} held")).small().color(theme::GREY));
+    ui.label(RichText::new(format!("{held} held")).small().color(theme::muted(ui)));
 }
 
 fn coursework_chip(ui: &mut Ui, f: &FypRecord, settings: &Settings, today: NaiveDate) {
@@ -309,7 +358,7 @@ fn coursework_chip(ui: &mut Ui, f: &FypRecord, settings: &Settings, today: Naive
 
 pub fn visit_status(v: &Visit) -> (String, Color32) {
     if v.completed {
-        return ("✔ done".into(), theme::GREEN);
+        return (format!("{} done", icons::CHECK), theme::GREEN);
     }
     if let Some(d) = v.date {
         return (format!("booked {}", widgets::fmt_short(d)), theme::ACCENT);
@@ -332,7 +381,7 @@ pub fn semester_status(
         return (format!("meeting {}", widgets::fmt_short(d)), theme::ACCENT);
     }
     if held > 0 {
-        return (format!("✔ met ({held})"), theme::GREEN);
+        return (format!("{} met ({held})", icons::CHECK), theme::GREEN);
     }
     match (c.contacted_on, c.reply) {
         (None, _) => ("not contacted".into(), theme::GREY),

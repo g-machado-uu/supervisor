@@ -7,7 +7,7 @@ use egui::{RichText, Ui};
 use egui_extras::DatePickerButton;
 
 use crate::model::{Meeting, Repeat, ReplyStatus, Settings, TriState};
-use crate::ui::theme;
+use crate::ui::{icons, theme};
 
 pub fn today() -> NaiveDate {
     Local::now().date_naive()
@@ -42,12 +42,12 @@ pub fn opt_date(ui: &mut Ui, salt: impl AsIdSalt, value: &mut Option<NaiveDate>)
                         .calendar_week(false),
                 );
                 *date = from_jiff(j);
-                if ui.small_button("×").on_hover_text("Clear date").clicked() {
+                if ui.small_button(icons::X).on_hover_text("Clear date").clicked() {
                     *value = None;
                 }
             }
             None => {
-                if ui.button("📅 Set date").clicked() {
+                if ui.button(format!("{} Set date", icons::CALENDAR_BLANK)).clicked() {
                     *value = Some(today());
                 }
             }
@@ -71,12 +71,12 @@ pub fn opt_time(ui: &mut Ui, salt: impl AsIdSalt, value: &mut Option<NaiveTime>)
                         .custom_formatter(|v, _| format!("{v:02}")),
                 );
                 *time = NaiveTime::from_hms_opt(h, m, 0).unwrap_or(*time);
-                if ui.small_button("×").on_hover_text("Clear time").clicked() {
+                if ui.small_button(icons::X).on_hover_text("Clear time").clicked() {
                     *value = None;
                 }
             }
             None => {
-                if ui.button("🕑 Set time").clicked() {
+                if ui.button(format!("{} Set time", icons::CLOCK)).clicked() {
                     *value = NaiveTime::from_hms_opt(10, 0, 0);
                 }
             }
@@ -117,6 +117,15 @@ pub fn text_field(ui: &mut Ui, text: &mut String, hint: &str) {
     );
 }
 
+/// A subtle inset frame for a meeting or visit inside a card.
+pub fn inner_frame(ui: &Ui) -> egui::Frame {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(12))
+}
+
 /// Two-column form grid with consistent spacing.
 pub fn form_grid(ui: &mut Ui, id: impl AsIdSalt, add: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id)
@@ -128,7 +137,7 @@ pub fn form_grid(ui: &mut Ui, id: impl AsIdSalt, add: impl FnOnce(&mut Ui)) {
 
 /// Button for saving an invite file; needs a date to be set.
 pub fn invite_button(ui: &mut Ui, has_date: bool) -> bool {
-    ui.add_enabled(has_date, egui::Button::new("📨 Invite file…").small())
+    ui.add_enabled(has_date, egui::Button::new(format!("{} Invite file…", icons::PAPER_PLANE_TILT)).small())
         .on_hover_text("Save an .ics with the student as attendee, to upload to Outlook and send")
         .on_disabled_hover_text("Set a date first")
         .clicked()
@@ -163,12 +172,10 @@ pub fn meetings_editor(
                 (None, n) => format!("Meeting {}", n + 1),
             };
             ui.push_id(m.id, |ui| {
-                egui::Frame::group(ui.style())
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .show(ui, |ui| {
+                inner_frame(ui).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(title).strong());
+                            ui.label(theme::semibold(title));
                             if let Some(r) = &m.repeat {
                                 theme::chip(ui, every_label(r.every_weeks), theme::ACCENT);
                             } else if m.held {
@@ -178,7 +185,7 @@ pub fn meetings_editor(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .small_button("🗑")
+                                        .small_button(icons::TRASH)
                                         .on_hover_text("Remove meeting")
                                         .clicked()
                                     {
@@ -198,9 +205,9 @@ pub fn meetings_editor(
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut m.teams, "💻 Teams");
+                            ui.checkbox(&mut m.teams, format!("{} Teams", icons::DESKTOP));
                             if !m.teams {
-                                ui.label("📍");
+                                ui.label(RichText::new(icons::MAP_PIN).color(theme::muted(ui)));
                                 text_field(ui, &mut m.location, "Room / location");
                             }
                         });
@@ -213,9 +220,9 @@ pub fn meetings_editor(
             meetings.remove(i);
         }
         let add_label = match (first_label, meetings.is_empty()) {
-            (Some(label), true) => format!("➕ Add {}", label.to_lowercase()),
-            (Some(_), false) => "➕ Add follow-on meeting".into(),
-            (None, _) => "➕ Add meeting".into(),
+            (Some(label), true) => format!("{} Add {}", icons::PLUS, label.to_lowercase()),
+            (Some(_), false) => format!("{} Add follow-on meeting", icons::PLUS),
+            (None, _) => format!("{} Add meeting", icons::PLUS),
         };
         if ui.button(add_label).clicked() {
             meetings.push(Meeting::default());
@@ -226,9 +233,9 @@ pub fn meetings_editor(
 
 fn every_label(weeks: u8) -> String {
     match weeks {
-        0 | 1 => "🔁 weekly".into(),
-        2 => "🔁 fortnightly".into(),
-        n => format!("🔁 every {n} weeks"),
+        0 | 1 => format!("{} weekly", icons::REPEAT),
+        2 => format!("{} fortnightly", icons::REPEAT),
+        n => format!("{} every {n} weeks", icons::REPEAT),
     }
 }
 
@@ -239,7 +246,7 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
         .and_then(|d| settings.teaching_end(settings.semester_of(d)));
     ui.horizontal(|ui| {
         let mut on = m.repeat.is_some();
-        if ui.checkbox(&mut on, "🔁 Repeats").changed() {
+        if ui.checkbox(&mut on, format!("{} Repeats", icons::REPEAT)).changed() {
             m.repeat = on.then(Repeat::default);
         }
         let Some(r) = &mut m.repeat else { return };
@@ -277,9 +284,9 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
                 Some(_) => {
                     opt_date(ui, "until", &mut r.until);
                     ui.label(
-                        RichText::new("(× = end of teaching)")
+                        RichText::new(format!("({} = end of teaching)", icons::X))
                             .small()
-                            .color(theme::GREY),
+                            .color(theme::muted(ui)),
                     );
                 }
             }
@@ -292,14 +299,14 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
         ui.label(
             RichText::new("Set the first date to see the weeks.")
                 .small()
-                .color(theme::GREY),
+                .color(theme::muted(ui)),
         );
         return;
     }
     if m.repeat_end(settings).is_none() {
         ui.colored_label(
-            theme::AMBER,
-            "⚠ Set the semester dates in Settings (or an end date) – only the first week is planned.",
+            theme::fg(ui, theme::AMBER),
+            format!("{} Set the semester dates in Settings (or an end date) – only the first week is planned.", icons::WARNING),
         );
     }
 
@@ -324,14 +331,14 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
                 .spacing([10.0, 4.0])
                 .show(ui, |ui| {
                     for h in ["Planned", "Held", "Cancel", "Moved to", "Notes"] {
-                        ui.label(RichText::new(h).small().color(theme::GREY));
+                        ui.label(RichText::new(h).small().color(theme::muted(ui)));
                     }
                     ui.end_row();
                     for occ in weeks {
                         let mut edited = occ.clone();
                         let mut planned = RichText::new(week_label(settings, occ.planned));
                         if occ.cancelled {
-                            planned = planned.strikethrough().color(theme::GREY);
+                            planned = planned.strikethrough().color(theme::muted(ui));
                         }
                         ui.label(planned);
                         ui.push_id((occ.planned, "held"), |ui| {
