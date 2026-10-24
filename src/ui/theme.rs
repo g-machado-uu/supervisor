@@ -265,6 +265,9 @@ pub fn card_frame(ui: &Ui) -> egui::Frame {
 }
 
 /// A titled card used to group sections in the detail panel and dashboard.
+/// The app version shown in the sidebar, e.g. "v0.3.0".
+pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
 pub fn card<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     card_frame(ui)
         .show(ui, |ui| {

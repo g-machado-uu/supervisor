@@ -1,5 +1,5 @@
 //! Settings: academic calendar, courses, module/coursework templates,
-//! invitations and security.
+//! invitations, security and about.
 
 use std::collections::HashMap;
 
@@ -32,7 +32,7 @@ pub fn show(
     pw: &mut PasswordForm,
 ) -> SettingsAction {
     let mut action = SettingsAction::None;
-    theme::page_header(ui, "Settings", "Academic calendar, courses, invitations and security", |_| {});
+    theme::page_header(ui, "Settings", "Academic calendar, courses, invitations, security and version", |_| {});
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.set_max_width(920.0);
         ui.spacing_mut().item_spacing.y = 14.0;
@@ -191,6 +191,26 @@ pub fn show(
             if let Some((ok, msg)) = &pw.message {
                 ui.colored_label(theme::fg(ui, if *ok { theme::GREEN } else { theme::RED }), msg);
             }
+        });
+
+        ui.add_space(8.0);
+        theme::card(ui, "About", |ui| {
+            ui.horizontal(|ui| {
+                theme::icon_badge(ui, icons::GRADUATION_CAP, theme::ACCENT, 40.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.label(theme::serif("Supervisor", 21.0));
+                    ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(theme::muted(ui)));
+                });
+            });
+            ui.add_space(4.0);
+            ui.label("Tracks project students, placement visits and studies advisees.");
+            ui.hyperlink_to(format!("{} github.com/g-machado-uu/supervisor", icons::ARROW_RIGHT), "https://github.com/g-machado-uu/supervisor");
+            ui.label(
+                RichText::new("Built with egui. Fonts: Inter and DM Serif Display (SIL Open Font License). Icons: Phosphor (MIT).")
+                    .small()
+                    .color(theme::muted(ui)),
+            );
         });
     });
     action

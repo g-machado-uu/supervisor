@@ -298,7 +298,12 @@ impl Session {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.label(theme::serif("Supervisor", 21.0));
-                        ui.label(RichText::new(&self.db.settings.academic_year).small().color(theme::muted(ui)));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&self.db.settings.academic_year).small().color(theme::muted(ui)));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(theme::VERSION).small().color(theme::muted(ui)));
+                            });
+                        });
                     });
                 });
                 ui.add_space(18.0);

@@ -63,6 +63,7 @@ It's written in Rust with [egui](https://github.com/emilk/egui) and runs as a na
   - Every module and coursework is editable. Week-based deadlines (e.g. MEC526 Week 8 / Week 12) are worked out from the semester start dates you enter. Give a coursework a fixed date to override that.
   - The SUST modules are separate entries, so their courseworks and dates can be filled in later without affecting the BEng cohort.
   - Per-student extensions are set in the student's coursework grid.
+- **Settings → About**: the app version (also shown under the name in the sidebar) and the font and icon licences.
 - **Export calendar (.ics)** on the Dashboard or in Settings exports everything. Re-importing updates events rather than duplicating them.
 - **Invite files**: each meeting and visit has a **Invite file…** button that saves an `.ics` with you as organiser and the student as attendee (plus the line manager for visits, unless they're marked as not attending). For a repeating meeting it's the whole series.
   - Set your name, email and an optional reusable Teams link in **Settings → Invitations**. They're stored in the encrypted data file.
