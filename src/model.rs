@@ -1,12 +1,15 @@
-//! Data model: students, their roles (project, placement, advisee) and settings.
+//! Data model: students, their roles (project, placement, advisee, PhD) and settings.
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{Datelike, Duration, NaiveDate, NaiveTime};
+use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const DB_VERSION: u32 = 1;
+
+/// How long before a PhD student's visa ends to flag it on the dashboard.
+const VISA_WARNING_DAYS: i64 = 90;
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -669,6 +672,359 @@ pub struct AdviseeRecord {
     pub s2: SemesterContact,
 }
 
+// ---------------------------------------------------------------------------
+// PhD / research students
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ResearchStatus {
+    #[default]
+    Registered,
+    Suspended,
+    WritingUp,
+    Submitted,
+    Awarded,
+    Withdrawn,
+}
+
+impl ResearchStatus {
+    pub const ALL: [ResearchStatus; 6] = [
+        ResearchStatus::Registered,
+        ResearchStatus::Suspended,
+        ResearchStatus::WritingUp,
+        ResearchStatus::Submitted,
+        ResearchStatus::Awarded,
+        ResearchStatus::Withdrawn,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ResearchStatus::Registered => "Registered",
+            ResearchStatus::Suspended => "Suspended",
+            ResearchStatus::WritingUp => "Writing up",
+            ResearchStatus::Submitted => "Submitted",
+            ResearchStatus::Awarded => "Awarded",
+            ResearchStatus::Withdrawn => "Withdrawn",
+        }
+    }
+
+    /// Still working towards the degree, so deadlines and visas matter.
+    pub fn active(self) -> bool {
+        !matches!(self, ResearchStatus::Awarded | ResearchStatus::Withdrawn)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum StudyMode {
+    #[default]
+    FullTime,
+    PartTime,
+}
+
+impl StudyMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            StudyMode::FullTime => "Full time",
+            StudyMode::PartTime => "Part time",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ResearchDegree {
+    #[default]
+    PhD,
+    MPhil,
+    ProfDoc,
+    MRes,
+}
+
+impl ResearchDegree {
+    pub const ALL: [ResearchDegree; 4] = [
+        ResearchDegree::PhD,
+        ResearchDegree::MPhil,
+        ResearchDegree::ProfDoc,
+        ResearchDegree::MRes,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ResearchDegree::PhD => "PhD",
+            ResearchDegree::MPhil => "MPhil",
+            ResearchDegree::ProfDoc => "Professional doctorate",
+            ResearchDegree::MRes => "MRes",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FeeStatus {
+    #[default]
+    National,
+    Overseas,
+}
+
+impl FeeStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            FeeStatus::National => "National",
+            FeeStatus::Overseas => "Overseas",
+        }
+    }
+}
+
+/// UK immigration routes a research student may hold.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum VisaType {
+    #[default]
+    NotRequired,
+    Student,
+    Graduate,
+    SkilledWorker,
+    GlobalTalent,
+    Dependant,
+    EuSettlement,
+    Other,
+}
+
+impl VisaType {
+    pub const ALL: [VisaType; 8] = [
+        VisaType::NotRequired,
+        VisaType::Student,
+        VisaType::Graduate,
+        VisaType::SkilledWorker,
+        VisaType::GlobalTalent,
+        VisaType::Dependant,
+        VisaType::EuSettlement,
+        VisaType::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VisaType::NotRequired => "Not required",
+            VisaType::Student => "Student (Tier 4)",
+            VisaType::Graduate => "Graduate",
+            VisaType::SkilledWorker => "Skilled Worker",
+            VisaType::GlobalTalent => "Global Talent",
+            VisaType::Dependant => "Dependant",
+            VisaType::EuSettlement => "EU Settlement Scheme",
+            VisaType::Other => "Other",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Funder {
+    #[default]
+    NotSet,
+    DfeQr,
+    Dfe,
+    Vcrs,
+    MarieCurie,
+    Erasmus,
+    SelfFunded,
+    Other,
+}
+
+impl Funder {
+    pub const ALL: [Funder; 8] = [
+        Funder::NotSet,
+        Funder::DfeQr,
+        Funder::Dfe,
+        Funder::Vcrs,
+        Funder::MarieCurie,
+        Funder::Erasmus,
+        Funder::SelfFunded,
+        Funder::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Funder::NotSet => "—",
+            Funder::DfeQr => "DfE QR",
+            Funder::Dfe => "DfE",
+            Funder::Vcrs => "VCRS",
+            Funder::MarieCurie => "Marie Curie",
+            Funder::Erasmus => "Erasmus",
+            Funder::SelfFunded => "Self-funded",
+            Funder::Other => "Other",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum VivaOutcome {
+    #[default]
+    Pending,
+    Pass,
+    MinorCorrections,
+    MajorCorrections,
+    Resubmit,
+    MPhil,
+    Fail,
+}
+
+impl VivaOutcome {
+    pub const ALL: [VivaOutcome; 7] = [
+        VivaOutcome::Pending,
+        VivaOutcome::Pass,
+        VivaOutcome::MinorCorrections,
+        VivaOutcome::MajorCorrections,
+        VivaOutcome::Resubmit,
+        VivaOutcome::MPhil,
+        VivaOutcome::Fail,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VivaOutcome::Pending => "Not yet known",
+            VivaOutcome::Pass => "Pass, no corrections",
+            VivaOutcome::MinorCorrections => "Minor corrections",
+            VivaOutcome::MajorCorrections => "Major corrections",
+            VivaOutcome::Resubmit => "Revise and resubmit",
+            VivaOutcome::MPhil => "Award of MPhil",
+            VivaOutcome::Fail => "Fail",
+        }
+    }
+}
+
+/// A deadline from the university system, typed in, and when it was met.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Milestone {
+    pub deadline: Option<NaiveDate>,
+    pub done: bool,
+    pub done_on: Option<NaiveDate>,
+}
+
+impl Milestone {
+    /// The reminder date, `lead_months` before the deadline.
+    pub fn reminder(&self, lead_months: u32) -> Option<NaiveDate> {
+        self.deadline?.checked_sub_months(Months::new(lead_months))
+    }
+}
+
+/// One dated step of a research degree, for events, reminders and editing
+/// (change a copy, then write it back with `PhdRecord::milestone_mut`).
+pub struct PhdStep {
+    /// Stable part of the event UID.
+    pub key: String,
+    /// E.g. "Initial assessment".
+    pub label: String,
+    pub milestone: Milestone,
+    /// How long before the deadline the reminder falls.
+    pub lead_months: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct PhdRecord {
+    pub title: String,
+    pub chair: String,
+    /// The rest of the supervisory team.
+    pub supervisors: String,
+    pub status: ResearchStatus,
+    pub mode: StudyMode,
+    pub degree: ResearchDegree,
+    pub fee_status: FeeStatus,
+    pub visa: VisaType,
+    /// Name of the visa when `visa` is `Other`.
+    pub visa_other: String,
+    pub visa_start: Option<NaiveDate>,
+    pub visa_end: Option<NaiveDate>,
+    pub cas_number: String,
+    pub funding_source: String,
+    pub funder: Funder,
+    /// Name of the funder when `funder` is `Other`.
+    pub funder_other: String,
+    pub start: Option<NaiveDate>,
+    pub end: Option<NaiveDate>,
+    pub initial: Milestone,
+    pub confirmation: Milestone,
+    pub final_assessment: Milestone,
+    pub annual_reports: Vec<Milestone>,
+    pub examiners: Milestone,
+    pub intention: Milestone,
+    /// The earliest date the thesis may be submitted.
+    pub earliest_submission: Option<NaiveDate>,
+    pub submission: Milestone,
+    pub viva: Option<NaiveDate>,
+    pub viva_time: Option<NaiveTime>,
+    pub viva_location: String,
+    pub outcome: VivaOutcome,
+    pub amendments: Milestone,
+    pub awarded_on: Option<NaiveDate>,
+    pub meetings: Vec<Meeting>,
+}
+
+impl PhdRecord {
+    /// Every step with a deadline, in the order of the degree. Reminder lead
+    /// times follow the university system (e.g. 3 months for the initial
+    /// assessment).
+    pub fn steps(&self) -> Vec<PhdStep> {
+        let step = |key: &str, label: &str, milestone: &Milestone, lead_months| PhdStep {
+            key: key.into(),
+            label: label.into(),
+            milestone: milestone.clone(),
+            lead_months,
+        };
+        let mut steps = vec![
+            step("initial", "Initial assessment", &self.initial, 3),
+            step("confirmation", "Confirmation assessment", &self.confirmation, 4),
+            step("final", "Final assessment", &self.final_assessment, 7),
+        ];
+        for (i, report) in self.annual_reports.iter().enumerate() {
+            let label = match report.deadline {
+                Some(d) => format!("Annual report {}", d.year()),
+                None => format!("Annual report {}", i + 1),
+            };
+            steps.push(step(&format!("annual{}", i + 1), &label, report, 1));
+        }
+        steps.extend([
+            step("examiners", "Appoint examiners", &self.examiners, 1),
+            step("intention", "Intention to submit", &self.intention, 1),
+            step("submission", "Thesis submission", &self.submission, 1),
+            step("amendments", "Amendments", &self.amendments, 1),
+        ]);
+        steps
+    }
+
+    /// Year of study (1-based) on `date`, counted from the start.
+    pub fn year_of_study(&self, date: NaiveDate) -> Option<u32> {
+        let start = self.start?;
+        let mut year = 1;
+        while start.checked_add_months(Months::new(12 * year)).is_some_and(|d| d <= date) {
+            year += 1;
+        }
+        (date >= start).then_some(year)
+    }
+
+    /// The milestone a `PhdStep::key` refers to.
+    pub fn milestone_mut(&mut self, key: &str) -> Option<&mut Milestone> {
+        match key {
+            "initial" => Some(&mut self.initial),
+            "confirmation" => Some(&mut self.confirmation),
+            "final" => Some(&mut self.final_assessment),
+            "examiners" => Some(&mut self.examiners),
+            "intention" => Some(&mut self.intention),
+            "submission" => Some(&mut self.submission),
+            "amendments" => Some(&mut self.amendments),
+            _ => {
+                let n: usize = key.strip_prefix("annual")?.parse().ok()?;
+                self.annual_reports.get_mut(n.checked_sub(1)?)
+            }
+        }
+    }
+
+    /// The earliest deadline not yet met.
+    pub fn next_step(&self) -> Option<PhdStep> {
+        self.steps()
+            .into_iter()
+            .filter(|s| !s.milestone.done && s.milestone.deadline.is_some())
+            .min_by_key(|s| s.milestone.deadline)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Student {
@@ -682,6 +1038,7 @@ pub struct Student {
     pub fyp: Option<FypRecord>,
     pub placement: Option<PlacementRecord>,
     pub advisee: Option<AdviseeRecord>,
+    pub phd: Option<PhdRecord>,
 }
 
 impl Default for Student {
@@ -697,19 +1054,21 @@ impl Default for Student {
             fyp: None,
             placement: None,
             advisee: None,
+            phd: None,
         }
     }
 }
 
 impl Student {
-    /// Every meeting across the project and advisee roles.
+    /// Every meeting across the project, advisee and PhD roles.
     pub fn meetings(&self) -> impl Iterator<Item = &Meeting> {
         let fyp = self.fyp.iter().flat_map(|f| &f.meetings);
         let advisee = self
             .advisee
             .iter()
             .flat_map(|a| a.s1.meetings.iter().chain(&a.s2.meetings));
-        fyp.chain(advisee)
+        let phd = self.phd.iter().flat_map(|p| &p.meetings);
+        fyp.chain(advisee).chain(phd)
     }
 
     pub fn display_name(&self) -> String {
@@ -727,12 +1086,14 @@ impl Student {
         }
         let q = query.to_lowercase();
         let company = self.placement.as_ref().map(|p| p.company.as_str());
+        let thesis = self.phd.as_ref().map(|p| p.title.as_str());
         [
             Some(self.name.as_str()),
             Some(self.b_number.as_str()),
             Some(self.email.as_str()),
             Some(self.course.as_str()),
             company,
+            thesis,
         ]
         .into_iter()
         .flatten()
@@ -767,7 +1128,11 @@ pub enum EventKind {
     FypMeeting,
     Visit,
     AdviseeMeeting,
+    /// PhD supervision meetings and the viva.
+    PhdMeeting,
     Deadline,
+    /// Advance notice of a PhD deadline.
+    Reminder,
 }
 
 /// A dated item derived from the records, used for the dashboard, the
@@ -959,6 +1324,9 @@ impl Database {
                 }
             }
         }
+        if let Some(p) = &s.phd {
+            self.phd_events(s, p, &name, out);
+        }
         if let Some(a) = &s.advisee {
             for (sem, contact) in [("S1", &a.s1), ("S2", &a.s2)] {
                 for (i, m) in contact.meetings.iter().enumerate() {
@@ -972,6 +1340,71 @@ impl Database {
                         format!("Advisee {sem} {label} – {name}"),
                     );
                 }
+            }
+        }
+    }
+
+    fn phd_events(&self, s: &Student, p: &PhdRecord, name: &str, out: &mut Vec<Event>) {
+        for m in &p.meetings {
+            push_meeting(
+                out,
+                &self.settings,
+                s,
+                m,
+                EventKind::PhdMeeting,
+                format!("PhD supervision – {name}"),
+            );
+        }
+        if let Some(date) = p.viva {
+            let location = p.viva_location.trim();
+            out.push(Event {
+                uid: format!("phd-viva-{}", s.id),
+                student_id: s.id,
+                date,
+                time: p.viva_time,
+                kind: EventKind::PhdMeeting,
+                title: format!("PhD viva – {name}"),
+                done: p.outcome != VivaOutcome::Pending,
+                online: false,
+                location: location.into(),
+                series: None,
+                cancelled: false,
+            });
+        }
+        if !p.status.active() {
+            return;
+        }
+        for step in p.steps() {
+            let Some(due) = step.milestone.deadline else {
+                continue;
+            };
+            let what = step.label.to_lowercase();
+            let event = |uid: String, date, kind, title| Event {
+                uid,
+                student_id: s.id,
+                date,
+                time: None,
+                kind,
+                title,
+                done: step.milestone.done,
+                online: false,
+                location: String::new(),
+                series: None,
+                cancelled: false,
+            };
+            out.push(event(
+                format!("phd-{}-{}", step.key, s.id),
+                due,
+                EventKind::Deadline,
+                format!("PhD {what} due – {name}"),
+            ));
+            if let Some(remind) = step.milestone.reminder(step.lead_months) {
+                out.push(event(
+                    format!("phd-{}-reminder-{}", step.key, s.id),
+                    remind,
+                    EventKind::Reminder,
+                    format!("Reminder: PhD {what} due {} – {name}", due.format("%d %b %Y")),
+                ));
             }
         }
     }
@@ -993,7 +1426,7 @@ impl Database {
             }
         };
         match (event.kind, &s.placement) {
-            (EventKind::Deadline, _) => {}
+            (EventKind::Deadline | EventKind::Reminder, _) => {}
             (EventKind::Visit, Some(p)) => {
                 let email = if s.email.trim().is_empty() {
                     &p.professional_email
@@ -1089,7 +1522,7 @@ impl Database {
         let mut events = Vec::new();
         self.student_events(s, &mut events);
         let e = events.into_iter().find(|e| {
-            e.kind != EventKind::Deadline
+            !matches!(e.kind, EventKind::Deadline | EventKind::Reminder)
                 && (e.uid == uid || e.series.as_ref().is_some_and(|(series, _)| series == uid))
         })?;
         let attendees = Self::attendees(s, &e);
@@ -1158,6 +1591,26 @@ impl Database {
                     }
                     if v.date.is_some() && v.line_manager_attending == TriState::Unknown {
                         push(s, Severity::Pending, format!("visit {}: line manager attendance unknown", i + 1));
+                    }
+                }
+            }
+            if let Some(p) = s.phd.as_ref().filter(|p| p.status.active()) {
+                for step in p.steps() {
+                    let m = step.milestone;
+                    let Some(due) = m.deadline.filter(|_| !m.done) else {
+                        continue;
+                    };
+                    if due < today {
+                        push(s, Severity::Overdue, format!("{} overdue (due {due})", step.label));
+                    } else if m.reminder(step.lead_months).is_some_and(|r| r <= today) {
+                        push(s, Severity::Pending, format!("{} due {due}", step.label));
+                    }
+                }
+                if let Some(end) = p.visa_end {
+                    if end < today {
+                        push(s, Severity::Overdue, format!("visa ended {end}"));
+                    } else if end <= today + Duration::days(VISA_WARNING_DAYS) {
+                        push(s, Severity::Pending, format!("visa ends {end}"));
                     }
                 }
             }
@@ -1455,5 +1908,117 @@ mod tests {
         let items = db.attention(d(2026, 10, 21));
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].severity, Severity::Overdue);
+    }
+
+    /// The example from the university system: start 14 Sep 2026.
+    fn example_phd() -> PhdRecord {
+        let due = |date| Milestone {
+            deadline: Some(date),
+            ..Default::default()
+        };
+        PhdRecord {
+            start: Some(d(2026, 9, 14)),
+            end: Some(d(2029, 9, 14)),
+            initial: due(d(2027, 3, 3)),
+            confirmation: due(d(2027, 12, 3)),
+            final_assessment: due(d(2029, 3, 3)),
+            annual_reports: vec![due(d(2027, 5, 1))],
+            examiners: due(d(2029, 6, 3)),
+            intention: due(d(2029, 6, 3)),
+            submission: due(d(2029, 9, 3)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn phd_reminders_match_the_university_system() {
+        let p = example_phd();
+        let reminders: Vec<(String, Option<NaiveDate>)> = p
+            .steps()
+            .iter()
+            .map(|s| (s.label.clone(), s.milestone.reminder(s.lead_months)))
+            .collect();
+        assert_eq!(
+            reminders,
+            [
+                ("Initial assessment", Some(d(2026, 12, 3))),
+                ("Confirmation assessment", Some(d(2027, 8, 3))),
+                ("Final assessment", Some(d(2028, 8, 3))),
+                ("Annual report 2027", Some(d(2027, 4, 1))),
+                ("Appoint examiners", Some(d(2029, 5, 3))),
+                ("Intention to submit", Some(d(2029, 5, 3))),
+                ("Thesis submission", Some(d(2029, 8, 3))),
+                ("Amendments", None),
+            ]
+            .map(|(label, date)| (label.to_string(), date))
+        );
+        assert_eq!(p.year_of_study(d(2026, 9, 13)), None);
+        assert_eq!(p.year_of_study(d(2026, 9, 14)), Some(1));
+        assert_eq!(p.year_of_study(d(2027, 9, 14)), Some(2));
+        assert_eq!(p.next_step().map(|s| s.label), Some("Initial assessment".into()));
+    }
+
+    #[test]
+    fn phd_milestones_are_editable_by_key() {
+        let mut p = example_phd();
+        for step in p.steps() {
+            assert!(p.milestone_mut(&step.key).is_some(), "{}", step.key);
+        }
+        p.milestone_mut("annual1").unwrap().done = true;
+        assert!(p.annual_reports[0].done);
+        assert!(p.milestone_mut("annual2").is_none());
+        assert!(p.milestone_mut("annual0").is_none());
+    }
+
+    #[test]
+    fn phd_deadlines_reminders_and_attention() {
+        let mut p = example_phd();
+        p.visa_end = Some(d(2027, 1, 10));
+        let db = Database {
+            students: vec![Student {
+                name: "Priya".into(),
+                phd: Some(p),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let events = db.events();
+        let deadlines = events.iter().filter(|e| e.kind == EventKind::Deadline).count();
+        let reminders: Vec<&Event> = events.iter().filter(|e| e.kind == EventKind::Reminder).collect();
+        assert_eq!(deadlines, 7);
+        assert_eq!(reminders.len(), 7);
+        assert_eq!(reminders[0].date, d(2026, 12, 3));
+        assert_eq!(reminders[0].title, "Reminder: PhD initial assessment due 03 Mar 2027 – Priya");
+
+        // Reminder date passed: pending. Visa within 90 days: pending.
+        let items = db.attention(d(2026, 12, 10));
+        let messages: Vec<&str> = items.iter().map(|a| a.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            ["Priya – Initial assessment due 2027-03-03", "Priya – visa ends 2027-01-10"]
+        );
+        // Deadline passed: overdue, listed first.
+        let items = db.attention(d(2027, 3, 4));
+        assert_eq!(items[0].severity, Severity::Overdue);
+        assert!(items[0].message.contains("Initial assessment overdue"));
+
+        // Met deadlines, and students who have finished, raise nothing.
+        let mut db = db;
+        let p = db.students[0].phd.as_mut().unwrap();
+        p.initial.done = true;
+        p.visa_end = None;
+        assert!(db.attention(d(2026, 12, 10)).is_empty());
+        db.students[0].phd.as_mut().unwrap().status = ResearchStatus::Awarded;
+        assert!(db.attention(d(2027, 3, 4)).is_empty());
+        assert!(db.events().iter().all(|e| e.kind != EventKind::Deadline));
+    }
+
+    #[test]
+    fn files_without_phd_records_still_load() {
+        let json = r#"{"version":1,"students":[{"name":"Old","fyp":{"programme":"BEng"}}]}"#;
+        let db: Database = serde_json::from_str(json).unwrap();
+        assert!(db.students[0].phd.is_none());
+        let p: PhdRecord = serde_json::from_str("{}").unwrap();
+        assert_eq!(p, PhdRecord::default());
     }
 }

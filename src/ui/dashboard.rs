@@ -98,7 +98,9 @@ fn side_column(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, a
 /// One tile per list, as many per row as fit, stretched to fill the row.
 fn tiles(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, action: &mut DashAction) {
     let lists = db.settings.programme_lists().into_iter().map(Category::Projects);
-    let tiles: Vec<Category> = lists.chain([Category::Placement, Category::Advisee]).collect();
+    let tiles: Vec<Category> = lists
+        .chain([Category::Phd, Category::Placement, Category::Advisee])
+        .collect();
     let width = ui.available_width();
     let fit = ((width + GAP) / (190.0 + GAP)).floor().clamp(1.0, tiles.len() as f32) as usize;
     // Balance the rows, e.g. 3 + 3 rather than 5 + 1.
@@ -114,6 +116,7 @@ fn tiles(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, action:
             for cat in row {
                 let (icon, color, caption) = match cat {
                     Category::Projects(list) => (icons::BOOK_OPEN_TEXT, theme::ACCENT, format!("{list} projects")),
+                    Category::Phd => (icons::GRADUATION_CAP, theme::PLUM, "PhD students".into()),
                     Category::Placement => (icons::BUILDINGS, theme::AMBER, "Placements".into()),
                     Category::Advisee => (icons::CHAT_CIRCLE_TEXT, theme::GREEN, "Studies advisees".into()),
                     Category::All => (icons::USERS_THREE, theme::GREY, "All students".into()),
@@ -122,7 +125,7 @@ fn tiles(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, action:
                     .iter()
                     .filter(|e| {
                         !e.cancelled
-                            && e.kind != EventKind::Deadline
+                            && !matches!(e.kind, EventKind::Deadline | EventKind::Reminder)
                             && (today..week_end).contains(&e.date)
                             && db.student(e.student_id).is_some_and(|s| {
                                 !s.archived
@@ -130,6 +133,7 @@ fn tiles(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, action:
                                     && match cat {
                                         Category::Placement => e.kind == EventKind::Visit,
                                         Category::Advisee => e.kind == EventKind::AdviseeMeeting,
+                                        Category::Phd => e.kind == EventKind::PhdMeeting,
                                         _ => e.kind == EventKind::FypMeeting,
                                     }
                             })
@@ -258,7 +262,9 @@ fn kind_name(kind: EventKind) -> &'static str {
         EventKind::FypMeeting => "Project meeting",
         EventKind::Visit => "Placement visit",
         EventKind::AdviseeMeeting => "Advisee meeting",
+        EventKind::PhdMeeting => "PhD",
         EventKind::Deadline => "Deadline",
+        EventKind::Reminder => "Reminder",
     }
 }
 
@@ -397,10 +403,13 @@ fn mini_month(ui: &mut Ui, events: &[Event], today: NaiveDate, action: &mut Dash
                 (EventKind::FypMeeting, "Project"),
                 (EventKind::Visit, "Visit"),
                 (EventKind::AdviseeMeeting, "Advisee"),
+                (EventKind::PhdMeeting, "PhD"),
                 (EventKind::Deadline, "Deadline"),
+                (EventKind::Reminder, "Reminder"),
             ] {
                 let color = theme::fg(ui, theme::kind_style(kind).1);
-                ui.label(RichText::new(format!("● {label}")).small().color(color));
+                // Keep each dot with its name when the legend wraps.
+                ui.add(egui::Label::new(RichText::new(format!("● {label}")).small().color(color)).wrap_mode(egui::TextWrapMode::Extend));
             }
         });
     });

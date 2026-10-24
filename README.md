@@ -9,6 +9,7 @@ A desktop app for keeping track of supervision work:
   - **MSc** Electronics and MSc Mechatronics
 
   Courses can be added or renamed in Settings, e.g. for an MSc student from another school.
+- **PhD students**: project details, the deadlines from the university system (assessments, annual reports, examination) with reminders, the viva and supervision meetings.
 - **Placement students**: two visits, with requests, replies and line-manager attendance tracked.
 - **Studies advisees**: contact, reply and meetings for each semester, with as many follow-on meetings as you need.
 
@@ -16,7 +17,7 @@ It's written in Rust with [egui](https://github.com/emilk/egui) and runs as a na
 
 ## Look and feel
 
-- A calm, academic palette: cream background, powder-blue sidebar, with soft peach, sage, taupe and deep rosewood marking status (upcoming, done, waiting, overdue).
+- A calm, academic palette: cream background, powder-blue sidebar, with soft peach, sage, taupe and deep rosewood marking status (upcoming, done, waiting, overdue), and dusky mauve for PhD students.
 - **Light and dark** themes built from the same palette. Switch with the sun/moon button at the bottom of the sidebar; the choice is remembered.
 - Fonts and icons are bundled in the binary, so the app looks the same on every machine with nothing to install:
   - [Inter](https://rsms.me/inter/) for text
@@ -49,14 +50,23 @@ It's written in Rust with [egui](https://github.com/emilk/egui) and runs as a na
     - visit requests or advisee emails with no reply
     - overdue coursework
     - unknown line-manager attendance
+    - PhD deadlines whose reminder date has passed, or that are overdue
+    - PhD student visas ending within 90 days
   - on wide windows, a side column with **this month's calendar** (dots on busy days; click to open it in the Calendar), **teaching-week progress** and a **coursework ring** (submitted / still to come / overdue)
 
   Click any item to open that student.
-- **Calendar**: meetings, visits and deadlines as a **list** grouped by week or a **month** grid, both labelled with teaching weeks. Switch views with the **List / Month** toggle. Filter by semester (list) or month, and by type with the **Meetings / Visits / Deadlines** buttons. Tick items in the list (or a whole week), or click them in the month grid (double-click opens the student), then **Export N selected** to an `.ics`. Selections are kept across months and views.
+- **Calendar**: meetings, visits and deadlines as a **list** grouped by week or a **month** grid, both labelled with teaching weeks. Switch views with the **List / Month** toggle. Filter by semester (list) or month, and by type with the **Meetings / Visits / Deadlines / Reminders** buttons. Tick items in the list (or a whole week), or click them in the month grid (double-click opens the student), then **Export N selected** to an `.ics`. Selections are kept across months and views.
   - **Repeating meetings as one series**: ticking any week exports the whole series as a repeating event that ends when the series ends, with cancelled weeks left out and moved weeks moved.
   - **Students as guests** (on by default, remembered): adds you as organiser and the students (and line managers for visits) as guests, to send from Outlook. The export message says if any student has no email.
 - **Meetings** can be one-off or **repeat** every 1–4 weeks, until the end of teaching for that semester or a date you choose. Under **Weeks**, each week can be marked held, cancelled or moved, and has its own notes. Each meeting is either **Teams** (online) or has a **room / location** (face-to-face).
 - **Lists**: one per category, with search (name, B number, email, course or company), initials avatars and status chips. Click a row to open the student in the side panel, which shows their roles and a section for each one. A student can hold several roles, e.g. an FYP student who is also your advisee.
+- **PhD students** (sidebar → *Research → PhD*):
+  - **Details**: title, type (PhD, MPhil, professional doctorate, MRes), status, full or part time, chair of supervisors and the rest of the team, fee status (National / Overseas), UK visa type with start/end dates and CAS number, funder (DfE QR, DfE, VCRS, Marie Curie, Erasmus, self-funded, or another you type) and funding source.
+  - **Project dates**: start and end. For a full-time student with no end date, **36 months from start** fills it in.
+  - **Assessments & deadlines**: initial, confirmation and final assessment, one annual report per year (**+ Annual report** adds the next one a year after the last), appoint examiners, intention to submit, earliest submission and thesis submission. Type each deadline from the university system and tick it when it's done.
+  - **Reminders** are worked out from each deadline, as in the university system: 3 months before the initial assessment, 4 before confirmation, 7 before the final assessment, and 1 month before the annual report, examiners, intention to submit, submission and amendments. They appear in the calendar, the .ics export and the dashboard. Deadlines and reminders stop once the status is *Awarded* or *Withdrawn*.
+  - **Viva & award**: viva date, time and room (with an invite file), outcome, amendments deadline (shown when the outcome needs corrections) and award date.
+  - **Supervision meetings** work like project meetings, including repeats.
 - **Settings → Academic year**: week 1 of each semester, and when **teaching ends** (Friday of week 12 unless you set it). Repeating meetings stop there, not at the end of exams.
 - **Settings → Courses**: name, short name and the sidebar list each course appears in. Courses that still have students can't be removed.
 - **Settings → Modules & coursework**:
@@ -129,6 +139,6 @@ Only `supervisor.exe` is needed. Rust and the Build Tools are not.
 | `src/app.rs` | Lock/unlock state, navigation, autosave, dialogs, end-to-end UI test |
 | `src/ui/theme.rs` | Palette, fonts, light/dark visuals and shared widgets (cards, chips, sidebar items, toggles, progress ring) |
 | `src/ui/icons.rs` | Phosphor icon codepoints |
-| `src/ui/*` | Screens (dashboard, calendar, lists, detail sections, settings, unlock screen) |
+| `src/ui/*` | Screens (dashboard, calendar, lists, detail sections such as `phd.rs`, settings, unlock screen) |
 | `assets/fonts/` | Bundled fonts with their licences (Inter is subset; see `README.txt` there) |
 | `packaging/` | App icon (SVG, PNG, ICO) and the Linux launcher |

@@ -275,10 +275,12 @@ fn push_details(out: &mut String, item: &CalItem, settings: &Settings, invite: b
         EventKind::FypMeeting => "Project",
         EventKind::Visit => "Placement",
         EventKind::AdviseeMeeting => "Advisee",
+        EventKind::PhdMeeting => "PhD",
         EventKind::Deadline => "Deadline",
+        EventKind::Reminder => "Reminder",
     };
     push_line(out, &format!("CATEGORIES:{category}"));
-    if e.kind == EventKind::Deadline {
+    if matches!(e.kind, EventKind::Deadline | EventKind::Reminder) {
         push_line(out, "TRANSP:TRANSPARENT");
     }
     if invite {

@@ -22,8 +22,10 @@ pub const GREEN: Color32 = Color32::from_rgb(0x5f, 0x86, 0x64);
 pub const AMBER: Color32 = Color32::from_rgb(0xbf, 0x76, 0x45);
 /// Deep rosewood: overdue, no reply, destructive.
 pub const RED: Color32 = Color32::from_rgb(0x9c, 0x4a, 0x52);
-/// Taupe: secondary text and neutral states.
+/// Taupe: secondary text and neutral states; reminders.
 pub const GREY: Color32 = Color32::from_rgb(0x8c, 0x7e, 0x71);
+/// Dusky mauve, between rosewood and taupe: PhD students.
+pub const PLUM: Color32 = Color32::from_rgb(0x7d, 0x5f, 0x84);
 
 // Palette 4 surfaces.
 const CREAM: Color32 = Color32::from_rgb(0xf6, 0xf1, 0xe9);
@@ -231,7 +233,9 @@ pub fn kind_style(kind: EventKind) -> (&'static str, Color32) {
         EventKind::FypMeeting => (icons::USERS, ACCENT),
         EventKind::Visit => (icons::BUILDINGS, AMBER),
         EventKind::AdviseeMeeting => (icons::CHAT_CIRCLE_TEXT, GREEN),
+        EventKind::PhdMeeting => (icons::GRADUATION_CAP, PLUM),
         EventKind::Deadline => (icons::PUSH_PIN, RED),
+        EventKind::Reminder => (icons::BELL, GREY),
     }
 }
 

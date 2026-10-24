@@ -6,7 +6,7 @@ use egui::{Id, RichText, Ui};
 use uuid::Uuid;
 
 use crate::ics;
-use crate::model::{AdviseeRecord, CalItem, Database, FypRecord, PlacementRecord, Student};
+use crate::model::{AdviseeRecord, CalItem, Database, FypRecord, PhdRecord, PlacementRecord, Student};
 use crate::storage::{self, Vault};
 use crate::ui::calendar::{self, CalAction, CalendarState};
 use crate::ui::dashboard::{self, DashAction};
@@ -91,6 +91,7 @@ struct NewStudent {
     student: Student,
     fyp: bool,
     programme: String,
+    phd: bool,
     placement: bool,
     company: String,
     professional_email: String,
@@ -108,6 +109,7 @@ impl NewStudent {
             student: Student::default(),
             fyp: false,
             programme: first,
+            phd: false,
             placement: false,
             company: String::new(),
             professional_email: String::new(),
@@ -120,6 +122,7 @@ impl NewStudent {
                     n.programme = p.id.clone();
                 }
             }
+            Some(Category::Phd) => n.phd = true,
             Some(Category::Placement) => n.placement = true,
             Some(Category::Advisee) => n.advisee = true,
             _ => {}
@@ -134,6 +137,9 @@ impl NewStudent {
                 programme: self.programme,
                 ..Default::default()
             });
+        }
+        if self.phd {
+            s.phd = Some(PhdRecord::default());
         }
         if self.placement {
             s.placement = Some(PlacementRecord {
@@ -336,6 +342,8 @@ impl Session {
                     let count = cat.count(&self.db);
                     nav(ui, View::List(cat), icons::BOOK_OPEN_TEXT, &list, Some(count));
                 }
+                section(ui, "RESEARCH");
+                nav(ui, View::List(Category::Phd), icons::GRADUATION_CAP, "PhD", Some(Category::Phd.count(&self.db)));
                 section(ui, "OTHER");
                 nav(ui, View::List(Category::Placement), icons::BUILDINGS, "Placement", Some(Category::Placement.count(&self.db)));
                 nav(ui, View::List(Category::Advisee), icons::CHAT_CIRCLE_TEXT, "Studies Advisees", Some(Category::Advisee.count(&self.db)));
@@ -533,10 +541,13 @@ impl Session {
         if self.write_ics(ui, &items, invite, name) {
             let mut msg = format!("Exported {} items", items.len());
             if invite {
-                // Deadlines never have guests; anything else without one lacks an email.
+                // Deadlines and reminders never have guests; anything else without one lacks an email.
                 let missing = items
                     .iter()
-                    .filter(|i| i.event.kind != crate::model::EventKind::Deadline && i.attendees.is_empty())
+                    .filter(|i| {
+                        !matches!(i.event.kind, crate::model::EventKind::Deadline | crate::model::EventKind::Reminder)
+                            && i.attendees.is_empty()
+                    })
                     .count();
                 if missing > 0 {
                     msg.push_str(&format!(" – {missing} without a student email, add it to invite them"));
@@ -657,6 +668,7 @@ impl Session {
                         }
                     });
                 }
+                ui.checkbox(&mut n.phd, "PhD student");
                 ui.checkbox(&mut n.placement, "Placement student");
                 if n.placement {
                     ui.indent("placement", |ui| {
@@ -729,6 +741,7 @@ impl Session {
                         if let Some(s) = self.db.student_mut(id) {
                             match role {
                                 Role::Fyp => s.fyp = None,
+                                Role::Phd => s.phd = None,
                                 Role::Placement => s.placement = None,
                                 Role::Advisee => s.advisee = None,
                             }
@@ -895,6 +908,45 @@ mod ui_tests {
                 }),
                 ..Default::default()
             },
+            Student {
+                b_number: "B00654321".into(),
+                name: "Priya Raman".into(),
+                email: "raman-p@uni.ac.uk".into(),
+                course: "PhD Engineering".into(),
+                phd: Some(PhdRecord {
+                    title: "Self-healing composites for wind turbine blades".into(),
+                    chair: "Prof. A. Byrne".into(),
+                    fee_status: FeeStatus::Overseas,
+                    visa: VisaType::Student,
+                    visa_start: Some(today - Days::days(60)),
+                    visa_end: Some(today + Days::days(1420)),
+                    funder: Funder::DfeQr,
+                    start: Some(today - Days::days(40)),
+                    end: Some(today + Days::days(1055)),
+                    initial: Milestone {
+                        deadline: Some(today + Days::days(130)),
+                        ..Default::default()
+                    },
+                    confirmation: Milestone {
+                        deadline: Some(today + Days::days(405)),
+                        ..Default::default()
+                    },
+                    annual_reports: vec![Milestone {
+                        deadline: Some(today + Days::days(25)),
+                        ..Default::default()
+                    }],
+                    meetings: vec![Meeting {
+                        teams: true,
+                        repeat: Some(Repeat {
+                            every_weeks: 2,
+                            ..Default::default()
+                        }),
+                        ..meeting(2, false, "")
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
         ]
     }
 
@@ -966,6 +1018,7 @@ mod ui_tests {
         }
         h.run_steps(2);
         assert!(h.query_by_label_contains("no reply").is_some(), "dashboard attention list");
+        assert!(h.query_by_label_contains("Annual report").is_some(), "PhD reminder on the dashboard");
         shot(&mut h, "03_dashboard");
 
         for (view, name) in [
@@ -973,6 +1026,7 @@ mod ui_tests {
             (View::List(Category::Projects("BEng".into())), "04_fyp_beng"),
             (View::List(Category::Placement), "05_placement"),
             (View::List(Category::Advisee), "06_advisees"),
+            (View::List(Category::Phd), "11_phd"),
             (View::Settings, "07_settings"),
         ] {
             session(&mut h).view = view;
@@ -1014,6 +1068,14 @@ mod ui_tests {
         }
         h.run_steps(2);
         shot(&mut h, "09_placement_detail");
+        let priya = id_of(&mut h, "Priya Raman");
+        {
+            let s = session(&mut h);
+            s.view = View::List(Category::Phd);
+            s.selected = Some(priya);
+        }
+        h.run_steps(2);
+        shot(&mut h, "12_phd_detail");
 
         // Dark mode.
         session(&mut h).db.settings.dark_mode = true;

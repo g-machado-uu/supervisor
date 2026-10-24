@@ -6,7 +6,8 @@ use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
 
 use crate::model::{
-    Database, FypRecord, Meeting, ReplyStatus, SemesterContact, Settings, Student, Visit,
+    Database, FypRecord, Meeting, PhdRecord, ReplyStatus, SemesterContact, Settings, Student,
+    Visit,
 };
 use crate::ui::{icons, theme, widgets};
 
@@ -14,6 +15,7 @@ use crate::ui::{icons, theme, widgets};
 pub enum Category {
     /// Project students on the courses shown in this sidebar list.
     Projects(String),
+    Phd,
     Placement,
     Advisee,
     All,
@@ -23,6 +25,7 @@ impl Category {
     pub fn title(&self) -> String {
         match self {
             Category::Projects(list) => format!("Project students – {list}"),
+            Category::Phd => "PhD Students".into(),
             Category::Placement => "Placement Students".into(),
             Category::Advisee => "Studies Advisees".into(),
             Category::All => "All Students".into(),
@@ -36,6 +39,7 @@ impl Category {
                     .programme(&f.programme)
                     .is_some_and(|p| p.list_name() == list)
             }),
+            Category::Phd => s.phd.is_some(),
             Category::Placement => s.placement.is_some(),
             Category::Advisee => s.advisee.is_some(),
             Category::All => true,
@@ -148,6 +152,7 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
             "Meetings",
             "Coursework",
         ],
+        Category::Phd => &["Name", "B Number", "Year", "Meetings", "Next deadline"],
         Category::Placement => &["Name", "B Number", "Company", "Visit 1", "Visit 2"],
         Category::Advisee => &["Name", "B Number", "Course", "Semester 1", "Semester 2"],
         Category::All => &["Name", "B Number", "Email", "Course", "Roles"],
@@ -237,6 +242,17 @@ fn table(
                         row.col(|ui| meetings_chip(ui, &f.meetings, &db.settings, today));
                         row.col(|ui| coursework_chip(ui, f, &db.settings, today));
                     }
+                    Category::Phd => {
+                        let p = s.phd.as_ref().expect("filtered");
+                        row.col(|ui| {
+                            match p.year_of_study(today) {
+                                Some(year) => ui.label(format!("Year {year} · {}", p.mode.label())),
+                                None => ui.label(RichText::new(p.mode.label()).color(theme::muted(ui))),
+                            };
+                        });
+                        row.col(|ui| meetings_chip(ui, &p.meetings, &db.settings, today));
+                        row.col(|ui| next_deadline_chip(ui, p, today));
+                    }
                     Category::Placement => {
                         let p = s.placement.as_ref().expect("filtered");
                         row.col(|ui| {
@@ -275,6 +291,9 @@ fn table(
                                     db.settings.programme_short(&f.programme),
                                     theme::ACCENT,
                                 );
+                            }
+                            if let Some(p) = &s.phd {
+                                theme::chip(ui, p.degree.label(), theme::PLUM);
                             }
                             if s.placement.is_some() {
                                 theme::chip(ui, "Placement", theme::GREEN);
@@ -354,6 +373,28 @@ fn coursework_chip(ui: &mut Ui, f: &FypRecord, settings: &Settings, today: Naive
     if overdue > 0 {
         theme::chip(ui, format!("{overdue} overdue"), theme::RED);
     }
+}
+
+/// The earliest PhD deadline not yet met: rosewood when overdue, peach once
+/// its reminder date has passed.
+fn next_deadline_chip(ui: &mut Ui, p: &PhdRecord, today: NaiveDate) {
+    if !p.status.active() {
+        theme::chip(ui, p.status.label(), theme::GREY);
+        return;
+    }
+    let Some(step) = p.next_step() else {
+        theme::chip(ui, "no deadlines set", theme::GREY);
+        return;
+    };
+    let due = step.milestone.deadline.expect("next_step has a deadline");
+    let color = if due < today {
+        theme::RED
+    } else if step.milestone.reminder(step.lead_months).is_some_and(|r| r <= today) {
+        theme::AMBER
+    } else {
+        theme::ACCENT
+    };
+    theme::chip(ui, format!("{} · {}", step.label, due.format("%d %b %Y")), color);
 }
 
 pub fn visit_status(v: &Visit) -> (String, Color32) {

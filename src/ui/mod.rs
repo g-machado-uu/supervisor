@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod fyp;
 pub mod icons;
 pub mod lock;
+pub mod phd;
 pub mod placement;
 pub mod settings;
 pub mod student_form;

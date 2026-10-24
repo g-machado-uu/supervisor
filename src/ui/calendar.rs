@@ -32,6 +32,7 @@ pub struct CalendarState {
     pub meetings: bool,
     pub visits: bool,
     pub deadlines: bool,
+    pub reminders: bool,
     /// Event UIDs; kept while switching months or layouts.
     pub selected: HashSet<String>,
     /// Export a repeating meeting as one series rather than single weeks.
@@ -47,6 +48,7 @@ impl Default for CalendarState {
             meetings: true,
             visits: true,
             deadlines: true,
+            reminders: true,
             selected: HashSet::new(),
             as_series: true,
         }
@@ -70,9 +72,10 @@ fn monday_of(date: NaiveDate) -> NaiveDate {
 
 fn shown(db: &Database, st: &CalendarState, e: &Event, today: NaiveDate) -> bool {
     let kind = match e.kind {
-        EventKind::FypMeeting | EventKind::AdviseeMeeting => st.meetings,
+        EventKind::FypMeeting | EventKind::AdviseeMeeting | EventKind::PhdMeeting => st.meetings,
         EventKind::Visit => st.visits,
         EventKind::Deadline => st.deadlines,
+        EventKind::Reminder => st.reminders,
     };
     let in_range = match st.layout {
         Layout::Month => {
@@ -172,6 +175,7 @@ pub fn show(
         theme::toggle_pill(ui, &mut st.meetings, icons::USERS, "Meetings", theme::ACCENT);
         theme::toggle_pill(ui, &mut st.visits, icons::BUILDINGS, "Visits", theme::AMBER);
         theme::toggle_pill(ui, &mut st.deadlines, icons::PUSH_PIN, "Deadlines", theme::RED);
+        theme::toggle_pill(ui, &mut st.reminders, icons::BELL, "Reminders", theme::GREY);
         ui.separator();
         if ui.button("Select all shown").clicked() {
             st.selected.extend(
@@ -362,7 +366,7 @@ fn row(ui: &mut Ui, e: &Event, st: &mut CalendarState) -> bool {
 /// Short text for a month cell: the student, or the coursework for deadlines.
 fn cell_text(db: &Database, e: &Event) -> String {
     let what = match e.kind {
-        EventKind::Deadline => e.title.split(" – ").next().unwrap_or(&e.title).to_string(),
+        EventKind::Deadline | EventKind::Reminder => e.title.split(" – ").next().unwrap_or(&e.title).to_string(),
         _ => db
             .student(e.student_id)
             .map(|s| {

@@ -2,12 +2,13 @@
 
 use egui::{Align, Layout, RichText, Ui};
 
-use crate::model::{AdviseeRecord, FypRecord, PlacementRecord, Settings, Student};
-use crate::ui::{advisee, fyp, icons, placement, theme, widgets};
+use crate::model::{AdviseeRecord, FypRecord, PhdRecord, PlacementRecord, Settings, Student};
+use crate::ui::{advisee, fyp, icons, phd, placement, theme, widgets};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Fyp,
+    Phd,
     Placement,
     Advisee,
 }
@@ -16,6 +17,7 @@ impl Role {
     pub fn label(self) -> &'static str {
         match self {
             Role::Fyp => "Project supervision",
+            Role::Phd => "PhD supervision",
             Role::Placement => "Placement",
             Role::Advisee => "Studies Advisee",
         }
@@ -64,6 +66,9 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
         if let Some(f) = &s.fyp {
             theme::chip(ui, format!("{} {}", icons::BOOK_OPEN_TEXT, settings.programme_short(&f.programme)), theme::ACCENT);
         }
+        if let Some(p) = &s.phd {
+            theme::chip(ui, format!("{} {}", icons::GRADUATION_CAP, p.degree.label()), theme::PLUM);
+        }
         if s.placement.is_some() {
             theme::chip(ui, format!("{} Placement", icons::BUILDINGS), theme::AMBER);
         }
@@ -103,12 +108,15 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
             widgets::notes(ui, &mut s.notes, "General notes…");
         });
 
-        if s.fyp.is_none() || s.placement.is_none() || s.advisee.is_none() {
+        if s.fyp.is_none() || s.phd.is_none() || s.placement.is_none() || s.advisee.is_none() {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Add role").color(theme::muted(ui)));
                 if s.fyp.is_none() && ui.button(format!("{} Project supervision", icons::PLUS)).clicked() {
                     s.fyp = Some(FypRecord::default());
+                }
+                if s.phd.is_none() && ui.button(format!("{} PhD", icons::PLUS)).clicked() {
+                    s.phd = Some(PhdRecord::default());
                 }
                 if s.placement.is_none() && ui.button(format!("{} Placement", icons::PLUS)).clicked() {
                     s.placement = Some(PlacementRecord::default());
@@ -125,6 +133,13 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
         if let Some(f) = &mut s.fyp {
             role_section(ui, Role::Fyp, &mut action, |ui| {
                 if let Some(uid) = fyp::show(ui, f, settings) {
+                    invite = Some(uid);
+                }
+            });
+        }
+        if let Some(p) = &mut s.phd {
+            role_section(ui, Role::Phd, &mut action, |ui| {
+                if let Some(uid) = phd::show(ui, p, settings, id) {
                     invite = Some(uid);
                 }
             });
@@ -162,6 +177,7 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
 fn role_section(ui: &mut Ui, role: Role, action: &mut FormAction, add: impl FnOnce(&mut Ui)) {
     let (icon, color) = match role {
         Role::Fyp => (icons::BOOK_OPEN_TEXT, theme::ACCENT),
+        Role::Phd => (icons::GRADUATION_CAP, theme::PLUM),
         Role::Placement => (icons::BUILDINGS, theme::AMBER),
         Role::Advisee => (icons::CHAT_CIRCLE_TEXT, theme::GREEN),
     };
