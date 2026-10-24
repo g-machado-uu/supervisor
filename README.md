@@ -14,6 +14,15 @@ A desktop app for keeping track of supervision work:
 
 It's written in Rust with [egui](https://github.com/emilk/egui) and runs as a native desktop app on Linux, Windows and macOS (no browser).
 
+## Look and feel
+
+- A calm, academic palette: cream background, powder-blue sidebar, with soft peach, sage, taupe and deep rosewood marking status (upcoming, done, waiting, overdue).
+- **Light and dark** themes built from the same palette. Switch with the sun/moon button at the bottom of the sidebar; the choice is remembered.
+- Fonts and icons are bundled in the binary, so the app looks the same on every machine with nothing to install:
+  - [Inter](https://rsms.me/inter/) for text
+  - [DM Serif Display](https://fonts.google.com/specimen/DM+Serif+Display) for page titles
+  - [Phosphor](https://phosphoricons.com) line icons
+
 ## Data & security
 
 - Everything is stored in **one encrypted file**:
@@ -27,23 +36,27 @@ It's written in Rust with [egui](https://github.com/emilk/egui) and runs as a na
   You can create or open a file elsewhere (e.g. a synced folder) from the unlock screen, or pass a path on the command line: `supervisor /path/to/file.svt`.
 - Changes **autosave** about a second after you stop typing, and again on exit. Each save is written atomically, and the previous version is kept as `data.svt.bak`.
 - **There is no password recovery.** Keep a backup of the file and remember the password.
-- **Lock** (button or `Ctrl+L`) wipes the key and the decrypted data from memory and returns to the unlock screen.
+- **Lock** (button at the bottom of the sidebar, or `Ctrl+L`) wipes the key and the decrypted data from memory and returns to the unlock screen.
 - The `.ics` calendar export and invite files are **not** encrypted.
 
 ## Using it
 
-- **Dashboard**: what's coming up in the next N days (meetings, visits, coursework deadlines), plus a "Needs attention" list:
-  - no initial contact
-  - visit requests or advisee emails with no reply
-  - overdue coursework
-  - unknown line-manager attendance
+- **Dashboard**: a greeting with today's date and teaching week, then:
+  - a **tile per list** with the number of students and how many meetings or visits fall in the next 7 days (click a tile to open the list)
+  - **Upcoming**: meetings, visits and coursework deadlines in the next N days (set in Settings)
+  - **Needs attention**, each marked *overdue* or *pending*:
+    - no initial contact
+    - visit requests or advisee emails with no reply
+    - overdue coursework
+    - unknown line-manager attendance
+  - on wide windows, a side column with **this month's calendar** (dots on busy days; click to open it in the Calendar), **teaching-week progress** and a **coursework ring** (submitted / still to come / overdue)
 
   Click any item to open that student.
-- **Calendar**: meetings, visits and deadlines as a **list** grouped by week or a **month** grid, both labelled with teaching weeks. Filter by semester (list) or month, and by type. Tick items in the list (or a whole week), or click them in the month grid (double-click opens the student), then **Export selected** to an `.ics`. Selections are kept across months and views.
+- **Calendar**: meetings, visits and deadlines as a **list** grouped by week or a **month** grid, both labelled with teaching weeks. Switch views with the **List / Month** toggle. Filter by semester (list) or month, and by type with the **Meetings / Visits / Deadlines** buttons. Tick items in the list (or a whole week), or click them in the month grid (double-click opens the student), then **Export N selected** to an `.ics`. Selections are kept across months and views.
   - **Repeating meetings as one series**: ticking any week exports the whole series as a repeating event that ends when the series ends, with cancelled weeks left out and moved weeks moved.
   - **Students as guests** (on by default, remembered): adds you as organiser and the students (and line managers for visits) as guests, to send from Outlook. The export message says if any student has no email.
-- **Meetings** can be one-off or **🔁 repeat** every 1–4 weeks, until the end of teaching for that semester or a date you choose. Under **Weeks**, each week can be marked held, cancelled or moved, and has its own notes. Each meeting is either **💻 Teams** or has a **📍 room / location**.
-- **Lists**: one per category, with search (name, B number, email, course or company) and status chips. Click a row to edit it in the side panel. A student can hold several roles, e.g. an FYP student who is also your advisee.
+- **Meetings** can be one-off or **repeat** every 1–4 weeks, until the end of teaching for that semester or a date you choose. Under **Weeks**, each week can be marked held, cancelled or moved, and has its own notes. Each meeting is either **Teams** (online) or has a **room / location** (face-to-face).
+- **Lists**: one per category, with search (name, B number, email, course or company), initials avatars and status chips. Click a row to open the student in the side panel, which shows their roles and a section for each one. A student can hold several roles, e.g. an FYP student who is also your advisee.
 - **Settings → Academic year**: week 1 of each semester, and when **teaching ends** (Friday of week 12 unless you set it). Repeating meetings stop there, not at the end of exams.
 - **Settings → Courses**: name, short name and the sidebar list each course appears in. Courses that still have students can't be removed.
 - **Settings → Modules & coursework**:
@@ -51,9 +64,9 @@ It's written in Rust with [egui](https://github.com/emilk/egui) and runs as a na
   - The SUST modules are separate entries, so their courseworks and dates can be filled in later without affecting the BEng cohort.
   - Per-student extensions are set in the student's coursework grid.
 - **Export calendar (.ics)** on the Dashboard or in Settings exports everything. Re-importing updates events rather than duplicating them.
-- **Invite files**: each meeting and visit has a **📨 Invite file…** button that saves an `.ics` with you as organiser and the student as attendee (plus the line manager for visits, unless they're marked as not attending). For a repeating meeting it's the whole series.
+- **Invite files**: each meeting and visit has a **Invite file…** button that saves an `.ics` with you as organiser and the student as attendee (plus the line manager for visits, unless they're marked as not attending). For a repeating meeting it's the whole series.
   - Set your name, email and an optional reusable Teams link in **Settings → Invitations**. They're stored in the encrypted data file.
-  - In Outlook on the web: **Add calendar → Upload from file**, then open the event and **Send**. For a meeting ticked **💻 Teams** with no saved link, turn on **Teams meeting** in Outlook before sending.
+  - In Outlook on the web: **Add calendar → Upload from file**, then open the event and **Send**. For a meeting ticked **Teams** with no saved link, turn on **Teams meeting** in Outlook before sending.
   - Rooms are included; meeting notes never are. The invite file itself is not encrypted and contains the email addresses.
 
 ## Building
@@ -113,4 +126,8 @@ Only `supervisor.exe` is needed. Rust and the Build Tools are not.
 | `src/storage.rs` | Encrypted file format, atomic save, password change |
 | `src/ics.rs` | iCalendar export |
 | `src/app.rs` | Lock/unlock state, navigation, autosave, dialogs, end-to-end UI test |
-| `src/ui/*` | Screens and widgets (dashboard, lists, detail sections, settings, theme) |
+| `src/ui/theme.rs` | Palette, fonts, light/dark visuals and shared widgets (cards, chips, sidebar items, toggles, progress ring) |
+| `src/ui/icons.rs` | Phosphor icon codepoints |
+| `src/ui/*` | Screens (dashboard, calendar, lists, detail sections, settings, unlock screen) |
+| `assets/fonts/` | Bundled fonts with their licences (Inter is subset; see `README.txt` there) |
+| `packaging/` | App icon (SVG, PNG, ICO) and the Linux launcher |
