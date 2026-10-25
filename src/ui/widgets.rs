@@ -117,6 +117,15 @@ pub fn text_field(ui: &mut Ui, text: &mut String, hint: &str) {
     );
 }
 
+/// Shows `edit` as a masked field. egui keeps an unmasked undo history of
+/// every text field, so for passwords it is wiped after each frame.
+pub fn password_field(ui: &mut Ui, edit: egui::TextEdit<'_>) -> egui::Response {
+    let mut out = edit.password(true).show(ui);
+    out.state.clear_undoer();
+    out.state.store(ui.ctx(), out.response.id);
+    out.response.response
+}
+
 /// A subtle inset frame for a meeting or visit inside a card.
 pub fn inner_frame(ui: &Ui) -> egui::Frame {
     egui::Frame::new()

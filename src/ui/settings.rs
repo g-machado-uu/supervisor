@@ -1,5 +1,5 @@
 //! Settings: academic calendar, courses, module/coursework templates,
-//! invitations, security and about.
+//! invitations, security, key file and about.
 
 use std::collections::HashMap;
 
@@ -7,6 +7,7 @@ use egui::{RichText, Ui};
 use zeroize::Zeroizing;
 
 use crate::model::{CourseworkTemplate, Module, Programme, Semester, Settings};
+use crate::storage;
 use crate::ui::{icons, theme, widgets};
 
 #[derive(Default)]
@@ -17,10 +18,37 @@ pub struct PasswordForm {
     pub message: Option<(bool, String)>,
 }
 
+#[derive(Default)]
+pub struct KeyFileForm {
+    pub password: Zeroizing<String>,
+    pub message: Option<(bool, String)>,
+}
+
+/// What the Security and Key file cards show and edit.
+pub struct Security<'a> {
+    pub data_path: &'a str,
+    pub key_file_on: bool,
+    pub weak_password: bool,
+    pub password: &'a mut PasswordForm,
+    pub key_file: &'a mut KeyFileForm,
+}
+
 pub enum SettingsAction {
     None,
     ChangePassword,
+    AddKeyFile,
+    RemoveKeyFile,
     ExportIcs,
+}
+
+/// Choices for locking after a while without use (minutes; 0 = never).
+const AUTO_LOCK_CHOICES: [u32; 7] = [2, 5, 10, 15, 30, 60, 0];
+
+fn auto_lock_label(minutes: u32) -> String {
+    match minutes {
+        0 => "Never".into(),
+        m => format!("After {m} minutes without use"),
+    }
 }
 
 /// `in_use` counts the project students on each course (by id).
@@ -28,10 +56,10 @@ pub fn show(
     ui: &mut Ui,
     settings: &mut Settings,
     in_use: &HashMap<String, usize>,
-    data_path: &str,
-    pw: &mut PasswordForm,
+    security: Security<'_>,
 ) -> SettingsAction {
     let mut action = SettingsAction::None;
+    let Security { data_path, key_file_on, weak_password, password: pw, key_file: kf } = security;
     theme::page_header(ui, "Settings", "Academic calendar, courses, invitations, security and version", |_| {});
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.set_max_width(920.0);
@@ -137,7 +165,13 @@ pub fn show(
                 });
                 ui.end_row();
                 ui.label("Teams link (optional)");
-                widgets::text_field(ui, &mut settings.teams_link, "Reusable Teams meeting link");
+                ui.vertical(|ui| {
+                    widgets::text_field(ui, &mut settings.teams_link, "Reusable Teams meeting link");
+                    let link = settings.teams_link.trim();
+                    if !link.is_empty() && !crate::ics::valid_link(link) {
+                        ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} Paste the full link, starting with https://", icons::WARNING));
+                    }
+                });
                 ui.end_row();
             });
             ui.label(
@@ -173,7 +207,30 @@ pub fn show(
                     .color(theme::muted(ui)),
             );
             ui.add_space(6.0);
+            widgets::form_grid(ui, "lock-grid", |ui| {
+                ui.label("Lock automatically");
+                egui::ComboBox::from_id_salt("auto-lock")
+                    .selected_text(auto_lock_label(settings.auto_lock_minutes))
+                    .show_ui(ui, |ui| {
+                        for minutes in AUTO_LOCK_CHOICES {
+                            ui.selectable_value(&mut settings.auto_lock_minutes, minutes, auto_lock_label(minutes));
+                        }
+                    });
+                ui.end_row();
+            });
+            ui.label(
+                RichText::new("Locking saves your changes and closes the data; your password opens it again.")
+                    .small()
+                    .color(theme::muted(ui)),
+            );
+            ui.add_space(6.0);
             ui.label(RichText::new("Change password").strong());
+            if weak_password {
+                ui.colored_label(
+                    theme::fg(ui, theme::AMBER),
+                    format!("{} Your password is easier to guess than Supervisor now allows. Please choose a new one.", icons::WARNING),
+                );
+            }
             widgets::form_grid(ui, "pw-grid", |ui| {
                 for (label, field) in [
                     ("Current password", &mut pw.current),
@@ -181,14 +238,73 @@ pub fn show(
                     ("Confirm new password", &mut pw.confirm),
                 ] {
                     ui.label(label);
-                    ui.add(egui::TextEdit::singleline(&mut **field).password(true).desired_width(240.0));
+                    widgets::password_field(ui, egui::TextEdit::singleline(&mut **field).desired_width(240.0));
                     ui.end_row();
                 }
             });
+            ui.label(
+                RichText::new(format!(
+                    "At least {} characters – a short sentence you'll remember works well.",
+                    storage::MIN_PASSWORD_LEN
+                ))
+                .small()
+                .color(theme::muted(ui)),
+            );
             if ui.button("Change password").clicked() {
                 action = SettingsAction::ChangePassword;
             }
             if let Some((ok, msg)) = &pw.message {
+                ui.colored_label(theme::fg(ui, if *ok { theme::GREEN } else { theme::RED }), msg);
+            }
+        });
+
+        ui.add_space(8.0);
+        theme::card(ui, "Key file (optional)", |ui| {
+            if key_file_on {
+                ui.colored_label(
+                    theme::fg(ui, theme::GREEN),
+                    format!("{} On – this data file opens only with your password and the key file on this computer.", icons::KEY),
+                );
+            } else {
+                ui.label("Off – your password alone opens this data file.");
+            }
+            ui.label(
+                RichText::new(
+                    "A key file is a small file kept on each computer you use, never next to the data file. \
+                     With it, a copy of your data file is useless to anyone who doesn't also have the key file, \
+                     even if they guess your password. Use it if your data file is in a synced or shared folder.",
+                )
+                .small()
+                .color(theme::muted(ui)),
+            );
+            ui.label(
+                RichText::new(
+                    "You copy it once to each computer you use and keep a backup, for example on a USB stick or in a \
+                     password manager. If every copy is lost, your data can't be opened.",
+                )
+                .small()
+                .color(theme::muted(ui)),
+            );
+            if let Some(path) = storage::key_file_path() {
+                ui.label(
+                    RichText::new(format!("Key file location on this computer: {}", path.display()))
+                        .small()
+                        .color(theme::muted(ui)),
+                );
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Your password");
+                widgets::password_field(ui, egui::TextEdit::singleline(&mut *kf.password).desired_width(200.0));
+                if key_file_on {
+                    if ui.button("Remove key file").clicked() {
+                        action = SettingsAction::RemoveKeyFile;
+                    }
+                } else if ui.button(format!("{}  Add key file…", icons::KEY)).clicked() {
+                    action = SettingsAction::AddKeyFile;
+                }
+            });
+            if let Some((ok, msg)) = &kf.message {
                 ui.colored_label(theme::fg(ui, if *ok { theme::GREEN } else { theme::RED }), msg);
             }
         });

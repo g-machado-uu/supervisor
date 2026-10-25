@@ -228,6 +228,8 @@ pub struct Settings {
     pub teams_link: String,
     /// Calendar exports include you as organiser and the students as guests.
     pub export_with_guests: bool,
+    /// Lock after this many minutes without input; 0 = never.
+    pub auto_lock_minutes: u32,
 }
 
 impl Default for Settings {
@@ -246,6 +248,7 @@ impl Default for Settings {
             my_email: String::new(),
             teams_link: String::new(),
             export_with_guests: true,
+            auto_lock_minutes: 10,
         }
     }
 }

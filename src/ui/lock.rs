@@ -1,6 +1,6 @@
 //! Unlock screen (and first-run password creation).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 
 use anyhow::Result;
@@ -8,28 +8,57 @@ use egui::{Align, Key, Layout, RichText};
 use zeroize::Zeroizing;
 
 use crate::model::Database;
-use crate::storage::{self, Vault};
-use crate::ui::{icons, theme};
+use crate::storage::{self, KeyFile, Vault};
+use crate::ui::{icons, theme, widgets};
 
-const MIN_PASSWORD_LEN: usize = 8;
+/// What the lock screen hands over once the data is open.
+pub struct Unlocked {
+    pub vault: Vault,
+    pub db: Database,
+    /// The password is weaker than new passwords may be; suggest changing it.
+    pub weak_password: bool,
+}
 
-type Unlocked = (Vault, Database);
+/// Whether the data file needs a key file, and whether this computer has the right one.
+enum KeyState {
+    NotNeeded,
+    Ready(KeyFile),
+    Missing([u8; 32]),
+    Wrong([u8; 32]),
+}
+
+impl KeyState {
+    fn of(path: &Path) -> Self {
+        let Ok(Some(id)) = storage::required_key_id(path) else {
+            return Self::NotNeeded;
+        };
+        match storage::local_key_file() {
+            Ok(Some(key)) if key.id() == id => Self::Ready(key),
+            Ok(Some(_)) => Self::Wrong(id),
+            _ => Self::Missing(id),
+        }
+    }
+}
 
 pub struct LockScreen {
     pub path: PathBuf,
     password: Zeroizing<String>,
     confirm: Zeroizing<String>,
     error: Option<String>,
-    pending: Option<Receiver<Result<Unlocked>>>,
+    key: KeyState,
+    weak_password: bool,
+    pending: Option<Receiver<Result<(Vault, Database)>>>,
 }
 
 impl LockScreen {
     pub fn new(path: PathBuf) -> Self {
         Self {
+            key: KeyState::of(&path),
             path,
             password: Zeroizing::new(String::new()),
             confirm: Zeroizing::new(String::new()),
             error: None,
+            weak_password: false,
             pending: None,
         }
     }
@@ -41,8 +70,8 @@ impl LockScreen {
     fn submit(&mut self, ctx: &egui::Context) {
         let creating = self.first_run();
         if creating {
-            if self.password.chars().count() < MIN_PASSWORD_LEN {
-                self.error = Some(format!("Use at least {MIN_PASSWORD_LEN} characters."));
+            if let Some(problem) = storage::password_problem(&self.password) {
+                self.error = Some(problem);
                 return;
             }
             if *self.password != *self.confirm {
@@ -52,6 +81,14 @@ impl LockScreen {
         } else if self.password.is_empty() {
             return;
         }
+        // The file may have changed (e.g. synced) since this screen opened.
+        self.key = KeyState::of(&self.path);
+        let key_file = match &self.key {
+            KeyState::NotNeeded => None,
+            KeyState::Ready(key) => Some(key.clone()),
+            KeyState::Missing(_) | KeyState::Wrong(_) => return,
+        };
+        self.weak_password = !creating && storage::password_problem(&self.password).is_some();
         self.error = None;
         let (tx, rx) = channel();
         let path = self.path.clone();
@@ -64,7 +101,7 @@ impl LockScreen {
                 let db = Database::default();
                 Vault::create(&path, &password, &db).map(|v| (v, db))
             } else {
-                Vault::open(&path, &password)
+                Vault::open(&path, &password, key_file.as_ref())
             };
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -79,9 +116,13 @@ impl LockScreen {
         {
             self.pending = None;
             match result {
-                Ok(unlocked) => {
+                Ok((vault, db)) => {
                     storage::remember_path(&self.path);
-                    return Some(unlocked);
+                    return Some(Unlocked {
+                        vault,
+                        db,
+                        weak_password: self.weak_password,
+                    });
                 }
                 Err(e) => self.error = Some(e.to_string()),
             }
@@ -89,6 +130,7 @@ impl LockScreen {
 
         let first_run = self.first_run();
         let busy = self.pending.is_some();
+        let needs_key = matches!(self.key, KeyState::Missing(_) | KeyState::Wrong(_));
         let width = ui.available_width();
         if width > 900.0 {
             egui::Panel::left("lock-brand")
@@ -104,7 +146,7 @@ impl LockScreen {
                         (icons::BOOK_OPEN_TEXT, "Project students", "Meetings, coursework and deadlines by course"),
                         (icons::BUILDINGS, "Placements", "Visit requests, replies and line managers"),
                         (icons::CHAT_CIRCLE_TEXT, "Studies advisees", "Contact and meetings for each semester"),
-                        (icons::LOCK_SIMPLE, "Encrypted", "Password protected"),
+                        (icons::LOCK_SIMPLE, "Encrypted", "Password protected, with an optional key file"),
                     ] {
                         ui.horizontal(|ui| {
                             theme::icon_badge(ui, icon, theme::ACCENT, 38.0);
@@ -142,33 +184,73 @@ impl LockScreen {
                                     )
                                     .color(theme::fg(ui, theme::AMBER)),
                                 );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "At least {} characters – a short sentence you'll remember works well.",
+                                        storage::MIN_PASSWORD_LEN
+                                    ))
+                                    .small()
+                                    .color(theme::muted(ui)),
+                                );
                             } else {
                                 ui.label(theme::serif("Welcome back", 24.0));
                                 ui.label(RichText::new("Enter your password to unlock your data.").color(theme::muted(ui)));
                             }
+                            if let KeyState::Missing(id) | KeyState::Wrong(id) = self.key {
+                                ui.add_space(8.0);
+                                let text = if matches!(self.key, KeyState::Missing(_)) {
+                                    "This data file also needs its key file, which isn't on this computer yet. \
+                                     Import it from your backup copy (for example on a USB stick)."
+                                } else {
+                                    "The key file on this computer belongs to a different data file. \
+                                     Import the right one from your backup copy."
+                                };
+                                ui.label(RichText::new(text).color(theme::fg(ui, theme::AMBER)));
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new(format!("{}  Import key file…", icons::KEY)))
+                                    .clicked()
+                                    && let Some(src) = rfd::FileDialog::new()
+                                        .set_title("Choose your Supervisor key file")
+                                        .pick_file()
+                                {
+                                    match storage::import_key_file(&src, id) {
+                                        Ok(key) => {
+                                            self.key = KeyState::Ready(key);
+                                            self.error = None;
+                                        }
+                                        Err(e) => self.error = Some(format!("{e:#}")),
+                                    }
+                                }
+                            }
                             ui.add_space(10.0);
 
-                            let pw = ui.add_enabled(
-                                !busy,
-                                egui::TextEdit::singleline(&mut *self.password)
-                                    .password(true)
-                                    .hint_text("Password")
-                                    .desired_width(300.0)
-                                        .margin(egui::vec2(10.0, 8.0)),
-                            );
+                            let pw = ui
+                                .add_enabled_ui(!busy, |ui| {
+                                    widgets::password_field(
+                                        ui,
+                                        egui::TextEdit::singleline(&mut *self.password)
+                                            .hint_text("Password")
+                                            .desired_width(300.0)
+                                            .margin(egui::vec2(10.0, 8.0)),
+                                    )
+                                })
+                                .inner;
                             if !busy && self.error.is_none() && !pw.has_focus() && self.password.is_empty() {
                                 pw.request_focus();
                             }
                             let mut enter = pw.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                             if first_run {
-                                let c = ui.add_enabled(
-                                    !busy,
-                                    egui::TextEdit::singleline(&mut *self.confirm)
-                                        .password(true)
-                                        .hint_text("Confirm password")
-                                        .desired_width(300.0)
-                                        .margin(egui::vec2(10.0, 8.0)),
-                                );
+                                let c = ui
+                                    .add_enabled_ui(!busy, |ui| {
+                                        widgets::password_field(
+                                            ui,
+                                            egui::TextEdit::singleline(&mut *self.confirm)
+                                                .hint_text("Confirm password")
+                                                .desired_width(300.0)
+                                                .margin(egui::vec2(10.0, 8.0)),
+                                        )
+                                    })
+                                    .inner;
                                 if enter {
                                     c.request_focus();
                                     enter = false;
@@ -184,7 +266,7 @@ impl LockScreen {
                                     ui.spinner();
                                     ui.label("Unlocking…");
                                 });
-                            } else if ui.add(button).clicked() || enter {
+                            } else if ui.add_enabled(!needs_key, button).clicked() || (enter && !needs_key) {
                                 self.submit(ui.ctx());
                             }
                             if let Some(err) = &self.error {
@@ -200,6 +282,13 @@ impl LockScreen {
                         .small()
                         .color(theme::muted(ui)),
                 );
+                if matches!(self.key, KeyState::Ready(_)) {
+                    ui.label(
+                        RichText::new(format!("{} Key file found on this computer", icons::KEY))
+                            .small()
+                            .color(theme::muted(ui)),
+                    );
+                }
                 ui.horizontal(|ui| {
                     ui.add_space((ui.available_width() - 330.0).max(0.0) / 2.0);
                     if ui.add_enabled(!busy, egui::Button::new("Open another file…").small()).clicked()

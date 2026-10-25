@@ -49,19 +49,28 @@ fn param(text: &str) -> String {
     }
 }
 
-/// Loose check that keeps anything odd out of a `mailto:` value.
+/// Plain addresses only (letters, digits and `.+-_'`), so nothing odd ends
+/// up in a `mailto:` value. The apostrophe is for names like O'Neill.
 pub fn valid_email(email: &str) -> bool {
-    let email = email.trim();
-    match email.split_once('@') {
-        Some((user, domain)) => {
-            !user.is_empty()
-                && domain.contains('.')
-                && !email
-                    .chars()
-                    .any(|c| c.is_whitespace() || c.is_control() || "\"<>;:,()[]\\".contains(c))
-        }
-        None => false,
-    }
+    let Some((user, domain)) = email.trim().split_once('@') else {
+        return false;
+    };
+    let plain = |part: &str, extra: &str| {
+        !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
+    };
+    plain(user, ".+-_'")
+        && plain(domain, ".-")
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+}
+
+/// A Teams link is used only if it's a plain `https://` address.
+pub fn valid_link(link: &str) -> bool {
+    let link = link.trim();
+    link.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        && link.len() > 8
+        && !link.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
 }
 
 fn to_jiff(dt: NaiveDateTime) -> Option<jiff::civil::DateTime> {
@@ -261,7 +270,7 @@ fn push_details(out: &mut String, item: &CalItem, settings: &Settings, invite: b
         push_line(out, &format!("LOCATION:{}", escape(location)));
     }
     let link = settings.teams_link.trim();
-    if e.online && !link.is_empty() {
+    if e.online && valid_link(link) {
         push_line(
             out,
             &format!(
@@ -269,7 +278,8 @@ fn push_details(out: &mut String, item: &CalItem, settings: &Settings, invite: b
                 escape(&format!("Join on Microsoft Teams:\n{link}"))
             ),
         );
-        push_line(out, &format!("URL:{}", escape(link)));
+        // A URI, not text: escaping would add backslashes to the link.
+        push_line(out, &format!("URL:{link}"));
     }
     let category = match e.kind {
         EventKind::FypMeeting => "Project",
@@ -552,9 +562,20 @@ mod tests {
         assert!(!without.contains("DESCRIPTION"));
 
         let link = "https://teams.microsoft.com/l/meetup-join/abc";
-        let with = unfold(&calendar(&[teams], &settings(link), true, &uk()));
+        let with = unfold(&calendar(std::slice::from_ref(&teams), &settings(link), true, &uk()));
         assert!(with.contains("DESCRIPTION:Join on Microsoft Teams:\\n"));
         assert!(with.contains(&format!("URL:{link}")));
+
+        // Commas and semicolons stay as they are in the URI.
+        let odd = "https://teams.example.com/join?a=1;b=2,3";
+        let with = unfold(&calendar(std::slice::from_ref(&teams), &settings(odd), true, &uk()));
+        assert!(with.contains(&format!("URL:{odd}\r\n")));
+
+        // Anything that isn't a plain https:// link is left out.
+        for bad in ["teams.microsoft.com/l/abc", "http://x.com/a", "javascript:alert(1)", "https://x.com/a b"] {
+            let ics = calendar(std::slice::from_ref(&teams), &settings(bad), true, &uk());
+            assert!(!ics.contains("URL:") && !ics.contains("DESCRIPTION"), "{bad}");
+        }
     }
 
     #[test]
@@ -601,5 +622,10 @@ mod tests {
         assert!(!valid_email("no-at-sign"));
         assert!(!valid_email("a@b"));
         assert!(!valid_email("a@b.com;x"));
+        assert!(!valid_email("x@y.com?cc=other@z.com"));
+        assert!(!valid_email("x@y.com/path"));
+        assert!(!valid_email("a@b@c.com"));
+        assert!(!valid_email("a@.com"));
+        assert!(valid_email("sean.o'neill+placement@company.co.uk"));
     }
 }

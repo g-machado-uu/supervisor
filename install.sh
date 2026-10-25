@@ -23,6 +23,7 @@ ICON_DIR="$DATA_HOME/icons/hicolor"
 # Must match storage.rs (directories::ProjectDirs "Supervisor" on Linux).
 DEFAULT_DATA="$DATA_HOME/$APP/data.svt"
 LAST_FILE="$CONFIG_HOME/$APP/last_file.txt"
+KEY_FILE="$CONFIG_HOME/$APP/key.bin"
 
 data_path=""
 uninstall=0
@@ -53,7 +54,7 @@ if [[ $uninstall -eq 1 ]]; then
     rm -f "$BIN_DIR/$APP" "$APPS_DIR/$APP.desktop"
     rm -f "$ICON_DIR"/scalable/apps/$APP.svg "$ICON_DIR"/*/apps/$APP.png
     refresh_caches
-    echo "Removed Supervisor. Your data file and $LAST_FILE were left in place."
+    echo "Removed Supervisor. Your data file, key file (if any) and $LAST_FILE were left in place."
     exit 0
 fi
 
@@ -118,7 +119,8 @@ chmod 644 "$APPS_DIR/$APP.desktop"
 
 # The app opens the last-used file, so pointing that at the chosen path makes
 # both the launcher and a bare `supervisor` in a terminal use it.
-mkdir -p "$(dirname -- "$LAST_FILE")"
+# Owner-only: this folder also holds the key file, if you add one.
+mkdir -p -m 700 "$(dirname -- "$LAST_FILE")"
 printf '%s' "$data_path" > "$LAST_FILE"
 
 refresh_caches
@@ -139,6 +141,9 @@ else
     echo "             (doesn't exist yet – set a password on first launch to create it)"
 fi
 echo "             Backup: $data_path.bak (kept after each save)"
+if [[ -e "$KEY_FILE" ]]; then
+    echo "  Key file:  $KEY_FILE"
+fi
 
 case ":$PATH:" in
     *":$BIN_DIR:"*)

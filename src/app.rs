@@ -1,17 +1,19 @@
 //! Application shell: lock state, navigation, autosave and dialogs.
 
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use egui::{Id, RichText, Ui};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::ics;
 use crate::model::{AdviseeRecord, CalItem, Database, FypRecord, PhdRecord, PlacementRecord, Student};
-use crate::storage::{self, Vault};
+use crate::storage::{self, KeyFile, Vault, VaultError};
 use crate::ui::calendar::{self, CalAction, CalendarState};
 use crate::ui::dashboard::{self, DashAction};
-use crate::ui::lock::LockScreen;
-use crate::ui::settings::{self, PasswordForm, SettingsAction};
+use crate::ui::lock::{LockScreen, Unlocked};
+use crate::ui::settings::{self, KeyFileForm, PasswordForm, SettingsAction};
 use crate::ui::student_form::{self, FormAction, Role};
 use crate::ui::student_list::{self, Category, ListState};
 use crate::ui::{icons, theme};
@@ -39,31 +41,48 @@ impl SupervisorApp {
     }
 }
 
+impl SupervisorApp {
+    /// Drop the session, which wipes the key, and egui's copies of what was
+    /// on screen, such as the undo history every text field keeps.
+    fn lock(&mut self, ctx: &egui::Context) {
+        let Screen::Unlocked(s) = &self.screen else { return };
+        let path = s.vault.path().to_path_buf();
+        self.screen = Screen::Locked(LockScreen::new(path));
+        ctx.data_mut(|d| d.clear());
+        ctx.forget_all_images();
+    }
+}
+
 impl eframe::App for SupervisorApp {
+    // Also runs while the window is hidden, so idle locking works then too.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.viewport().close_requested())
-            && let Screen::Unlocked(s) = &mut self.screen
-            && s.dirty_since.is_some()
-        {
-            s.save();
+        let Screen::Unlocked(s) = &mut self.screen else { return };
+        if ctx.input(|i| i.viewport().close_requested()) && !s.discard {
+            s.detect_changes(ctx.input(|i| i.time));
+            s.leave(Leave::Quit);
+            if s.dirty_since.is_some() {
+                // Not saved: stay open and say why.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+        s.check_idle(ctx);
+        if s.ready_to_leave() == Some(Leave::Lock) {
+            self.lock(ctx);
         }
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         match &mut self.screen {
             Screen::Locked(lock) => {
-                if let Some((vault, db)) = lock.ui(ui) {
-                    self.screen = Screen::Unlocked(Box::new(Session::new(vault, db)));
+                if let Some(unlocked) = lock.ui(ui) {
+                    self.screen = Screen::Unlocked(Box::new(Session::new(unlocked)));
                 }
             }
-            Screen::Unlocked(session) => {
-                if session.ui(ui) {
-                    session.save();
-                    let path = session.vault.path().to_path_buf();
-                    // Dropping the session wipes the key and decrypted data from memory.
-                    self.screen = Screen::Locked(LockScreen::new(path));
-                }
-            }
+            Screen::Unlocked(session) => match session.ui(ui) {
+                Some(Leave::Lock) => self.lock(ui.ctx()),
+                Some(Leave::Quit) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                None => {}
+            },
         }
     }
 }
@@ -80,6 +99,25 @@ enum SaveStatus {
     Saved,
     Pending,
     Error(String),
+    /// The file was written elsewhere since it was unlocked; saving waits for the user.
+    Conflict,
+}
+
+/// Lock or quit, once nothing is left unsaved.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Leave {
+    Lock,
+    Quit,
+}
+
+/// Adding a key file: it's already in place on this computer; the data file
+/// is re-keyed only after a backup copy has been saved.
+struct KeyFileSetup {
+    key: KeyFile,
+    path: PathBuf,
+    password: Zeroizing<String>,
+    backup: Option<PathBuf>,
+    error: Option<String>,
 }
 
 enum Confirm {
@@ -167,14 +205,27 @@ struct Session {
     new_student: Option<NewStudent>,
     confirm: Option<Confirm>,
     password_form: PasswordForm,
+    key_form: KeyFileForm,
+    key_setup: Option<KeyFileSetup>,
     calendar: CalendarState,
     toast: Option<(String, f64)>,
     applied_dark: Option<bool>,
+    /// Fingerprint of `db` when last checked, to spot edits.
+    db_print: [u8; 32],
+    last_active: Instant,
+    leaving: Option<Leave>,
+    /// Lock or quit even though the latest changes aren't saved.
+    discard: bool,
+    weak_password: bool,
+    /// Shown once the session is on screen.
+    notice: Option<String>,
 }
 
 impl Session {
-    fn new(vault: Vault, db: Database) -> Self {
+    fn new(unlocked: Unlocked) -> Self {
+        let Unlocked { vault, db, weak_password } = unlocked;
         Self {
+            db_print: storage::fingerprint(&db),
             vault,
             db,
             view: View::Dashboard,
@@ -186,17 +237,36 @@ impl Session {
             new_student: None,
             confirm: None,
             password_form: PasswordForm::default(),
+            key_form: KeyFileForm::default(),
+            key_setup: None,
             calendar: CalendarState::default(),
             toast: None,
             applied_dark: None,
+            last_active: Instant::now(),
+            leaving: None,
+            discard: false,
+            weak_password,
+            notice: weak_password.then(|| {
+                "Your password is easier to guess than Supervisor now allows – please change it in Settings › Security."
+                    .to_string()
+            }),
         }
     }
 
     fn save(&mut self) {
-        match self.vault.save(&self.db) {
+        let result = self.vault.save(&self.db);
+        self.saved(result);
+    }
+
+    fn saved(&mut self, result: anyhow::Result<()>) {
+        match result {
             Ok(()) => {
                 self.status = SaveStatus::Saved;
                 self.dirty_since = None;
+            }
+            // Written elsewhere: ask before replacing it.
+            Err(e) if storage::vault_error(&e) == Some(VaultError::ChangedOnDisk) => {
+                self.status = SaveStatus::Conflict;
             }
             Err(e) => {
                 // Keep it dirty so the next autosave retries.
@@ -205,15 +275,61 @@ impl Session {
         }
     }
 
+    /// Mark the data unsaved if anything changed since the last check.
+    fn detect_changes(&mut self, now: f64) {
+        let print = storage::fingerprint(&self.db);
+        if print != self.db_print {
+            self.db_print = print;
+            self.dirty_since = Some(now);
+            if !matches!(self.status, SaveStatus::Conflict) {
+                self.status = SaveStatus::Pending;
+            }
+        }
+    }
+
+    /// Ask to lock or quit. It happens once nothing is left unsaved; if
+    /// saving fails, a dialog says so and offers to go ahead anyway.
+    fn leave(&mut self, leave: Leave) {
+        if self.leaving.is_none() || leave == Leave::Quit {
+            self.leaving = Some(leave);
+        }
+        if self.dirty_since.is_some() && !matches!(self.status, SaveStatus::Conflict) {
+            self.save();
+        }
+    }
+
+    fn ready_to_leave(&self) -> Option<Leave> {
+        self.leaving.filter(|_| self.dirty_since.is_none() || self.discard)
+    }
+
+    /// Lock after the chosen time without input. Uses the wall clock, as
+    /// egui's time stands still while the window is hidden.
+    fn check_idle(&mut self, ctx: &egui::Context) {
+        let minutes = self.db.settings.auto_lock_minutes;
+        if minutes == 0 || self.leaving.is_some() {
+            return;
+        }
+        let limit = Duration::from_secs(u64::from(minutes) * 60);
+        match limit.checked_sub(self.last_active.elapsed()) {
+            Some(left) if !left.is_zero() => ctx.request_repaint_after(left),
+            _ => self.leave(Leave::Lock),
+        }
+    }
+
     fn notify(&mut self, ui: &Ui, msg: impl Into<String>) {
         self.toast = Some((msg.into(), ui.input(|i| i.time)));
     }
 
-    /// Draws the unlocked app. Returns true if the user asked to lock.
-    fn ui(&mut self, ui: &mut Ui) -> bool {
-        let before = self.db.clone();
+    /// Draws the unlocked app. Returns what to do once nothing is left unsaved.
+    fn ui(&mut self, ui: &mut Ui) -> Option<Leave> {
         let now = ui.input(|i| i.time);
         let mut lock = false;
+        if ui.input(|i| !i.events.is_empty()) {
+            self.last_active = Instant::now();
+        }
+        if let Some(msg) = self.notice.take() {
+            self.notify(ui, msg);
+        }
 
         if ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::L))) {
             lock = true;
@@ -232,15 +348,17 @@ impl Session {
         self.toast(ui);
         self.dialogs(ui);
 
-        if self.db != before {
-            self.dirty_since = Some(now);
-            self.status = SaveStatus::Pending;
-        }
+        self.detect_changes(now);
         if self.applied_dark != Some(self.db.settings.dark_mode) {
             self.applied_dark = Some(self.db.settings.dark_mode);
             theme::apply(ui.ctx(), self.db.settings.dark_mode);
         }
-        if let Some(since) = self.dirty_since {
+        if lock {
+            self.leave(Leave::Lock);
+        }
+        if let Some(since) = self.dirty_since
+            && !matches!(self.status, SaveStatus::Conflict)
+        {
             let wait = AUTOSAVE_DELAY - (now - since);
             if wait <= 0.0 {
                 self.save();
@@ -252,7 +370,7 @@ impl Session {
                 ui.ctx().request_repaint_after(Duration::from_secs_f64(wait));
             }
         }
-        lock
+        self.ready_to_leave()
     }
 
     /// The latest message, floating at the bottom of the window for a few seconds.
@@ -376,6 +494,9 @@ impl Session {
                                 SaveStatus::Error(e) => ui
                                     .label(RichText::new(format!("{} Save failed", icons::WARNING)).small().color(theme::fg(ui, theme::RED)))
                                     .on_hover_text(e),
+                                SaveStatus::Conflict => ui
+                                    .label(RichText::new(format!("{} Not saved", icons::WARNING)).small().color(theme::fg(ui, theme::RED)))
+                                    .on_hover_text("The data file was changed somewhere else"),
                             };
                         });
                     });
@@ -469,16 +590,19 @@ impl Session {
                 for f in self.db.students.iter().filter_map(|s| s.fyp.as_ref()) {
                     *in_use.entry(f.programme.clone()).or_insert(0) += 1;
                 }
-                match settings::show(
-                    ui,
-                    &mut self.db.settings,
-                    &in_use,
-                    &path,
-                    &mut self.password_form,
-                ) {
+                let security = settings::Security {
+                    data_path: &path,
+                    key_file_on: self.vault.uses_key_file(),
+                    weak_password: self.weak_password,
+                    password: &mut self.password_form,
+                    key_file: &mut self.key_form,
+                };
+                match settings::show(ui, &mut self.db.settings, &in_use, security) {
                     SettingsAction::None => {}
                     SettingsAction::ExportIcs => self.export_ics(ui),
                     SettingsAction::ChangePassword => self.change_password(),
+                    SettingsAction::AddKeyFile => self.start_key_file(),
+                    SettingsAction::RemoveKeyFile => self.remove_key_file(),
                 }
             }
         }
@@ -589,7 +713,7 @@ impl Session {
         } else {
             ""
         };
-        let hint = if invite.event.online && self.db.settings.teams_link.trim().is_empty() {
+        let hint = if invite.event.online && !ics::valid_link(&self.db.settings.teams_link) {
             "upload it in Outlook, open the event, turn on Teams meeting and Send"
         } else {
             "upload it in Outlook, open the event and Send"
@@ -600,28 +724,267 @@ impl Session {
     }
 
     fn change_password(&mut self) {
-        let pw = &mut self.password_form;
-        let result = (|| {
-            if pw.new.chars().count() < 8 {
-                return Err("The new password must have at least 8 characters.".to_string());
-            }
-            if *pw.new != *pw.confirm {
-                return Err("The new passwords do not match.".to_string());
-            }
-            Vault::open(self.vault.path(), &pw.current).map_err(|_| "The current password is incorrect.".to_string())?;
-            self.vault
-                .change_password(&pw.new, &self.db)
-                .map_err(|e| format!("Could not change password: {e:#}"))
-        })();
-        *pw = PasswordForm::default();
-        pw.message = Some(match result {
+        let pw = std::mem::take(&mut self.password_form);
+        let result = if let Some(problem) = storage::password_problem(&pw.new) {
+            Err(problem)
+        } else if *pw.new != *pw.confirm {
+            Err("The new passwords do not match.".to_string())
+        } else {
+            let result = self.vault.change_password(&pw.current, &pw.new, &self.db);
+            self.resealed(result, "Could not change password")
+        };
+        if result.is_ok() {
+            self.weak_password = false;
+        }
+        self.password_form.message = Some(match result {
             Ok(()) => (true, "Password changed.".into()),
+            Err(e) => (false, e),
+        });
+    }
+
+    /// Re-keying saves the data too. Failures are put in plain words.
+    fn resealed(&mut self, result: anyhow::Result<()>, failed: &str) -> Result<(), String> {
+        let Err(e) = result else {
+            self.saved(Ok(()));
+            return Ok(());
+        };
+        Err(match storage::vault_error(&e) {
+            Some(VaultError::WrongPassword) => "The current password is incorrect.".into(),
+            Some(VaultError::ChangedOnDisk) => {
+                self.status = SaveStatus::Conflict;
+                format!("{failed}: {e}")
+            }
+            _ => format!("{failed}: {e:#}"),
+        })
+    }
+
+    /// Adding a key file, step 1: check the password and put the key file in
+    /// place on this computer. The data file is re-keyed only after a backup
+    /// copy has been saved (see `dialogs`).
+    fn start_key_file(&mut self) {
+        let form = std::mem::take(&mut self.key_form);
+        let result = (|| {
+            let path = storage::key_file_path().ok_or("This computer has no folder for settings.")?;
+            if storage::same_folder(self.vault.path(), &path) {
+                return Err(format!(
+                    "Your data file is in the folder where the key file would go ({}). Move the data file first.",
+                    path.parent().unwrap_or(&path).display()
+                ));
+            }
+            match self.vault.check_password(&form.password) {
+                Ok(true) => {}
+                Ok(false) => return Err("The current password is incorrect.".into()),
+                Err(e) => return Err(format!("{e:#}")),
+            }
+            // One key file per computer: reuse it if there already is one.
+            let key = match storage::local_key_file() {
+                Ok(Some(key)) => key,
+                Ok(None) => {
+                    let key = KeyFile::generate();
+                    storage::install_key_file(&key).map_err(|e| format!("Could not save the key file: {e:#}"))?;
+                    key
+                }
+                Err(e) => return Err(format!("{e:#}")),
+            };
+            Ok(KeyFileSetup {
+                key,
+                path,
+                password: form.password,
+                backup: None,
+                error: None,
+            })
+        })();
+        match result {
+            Ok(setup) => self.key_setup = Some(setup),
+            Err(e) => self.key_form.message = Some((false, e)),
+        }
+    }
+
+    fn finish_key_file(&mut self) {
+        let Some(setup) = self.key_setup.take() else { return };
+        let result = self.vault.set_key_file(&setup.password, Some(setup.key), &self.db);
+        self.key_form.message = Some(match self.resealed(result, "Could not turn on the key file") {
+            Ok(()) => (
+                true,
+                "Key file turned on. On another computer, Supervisor will ask for your backup copy the first time.".into(),
+            ),
+            Err(e) => (false, e),
+        });
+    }
+
+    fn remove_key_file(&mut self) {
+        let form = std::mem::take(&mut self.key_form);
+        let result = self.vault.set_key_file(&form.password, None, &self.db);
+        self.key_form.message = Some(match self.resealed(result, "Could not remove the key file") {
+            Ok(()) => (
+                true,
+                "Key file removed – your password alone opens this data file again. \
+                 The key file stays on this computer in case another data file uses it."
+                    .into(),
+            ),
             Err(e) => (false, e),
         });
     }
 
     fn dialogs(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        let without_saving = if self.leaving == Some(Leave::Quit) {
+            "Quit without saving"
+        } else {
+            "Lock without saving"
+        };
+
+        if matches!(self.status, SaveStatus::Conflict) {
+            let backup = format!("{}.bak", self.vault.path().file_name().unwrap_or_default().to_string_lossy());
+            let mut keep_mine = false;
+            let mut discard = false;
+            egui::Modal::new(Id::unique("conflict")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
+                ui.set_width(460.0);
+                ui.horizontal(|ui| {
+                    theme::icon_badge(ui, icons::WARNING, theme::AMBER, 40.0);
+                    ui.label(theme::serif("Changed somewhere else", 22.0));
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    "Since you unlocked it, your data file was changed by another copy of Supervisor – \
+                     probably on another computer that shares the file, or in a second window.",
+                );
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "Saving your version replaces that one. It is kept as {backup} in the same folder, so nothing is lost for good."
+                ));
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(theme::primary_button("Save my version")).clicked() {
+                        keep_mine = true;
+                    }
+                    if ui
+                        .add(egui::Button::new(without_saving).min_size(egui::vec2(0.0, 34.0)))
+                        .on_hover_text("Your changes since the last save are lost. Unlock again to see the other version.")
+                        .clicked()
+                    {
+                        discard = true;
+                    }
+                });
+            });
+            if keep_mine {
+                let result = self.vault.overwrite(&self.db);
+                self.saved(result);
+            } else if discard {
+                self.discard = true;
+                self.leaving.get_or_insert(Leave::Lock);
+            }
+        }
+
+        if let (Some(leave), SaveStatus::Error(err)) = (self.leaving, &self.status)
+            && self.dirty_since.is_some()
+        {
+            let err = err.clone();
+            let mut retry = false;
+            let mut stay = false;
+            let mut discard = false;
+            let resp = egui::Modal::new(Id::unique("not-saved")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
+                ui.set_width(460.0);
+                ui.horizontal(|ui| {
+                    theme::icon_badge(ui, icons::WARNING, theme::RED, 40.0);
+                    ui.label(theme::serif("Not saved yet", 22.0));
+                });
+                ui.add_space(4.0);
+                let what = if leave == Leave::Quit { "close" } else { "lock" };
+                ui.label(format!("Supervisor couldn't save your latest changes, so it didn't {what}:"));
+                ui.label(RichText::new(err).small().color(theme::muted(ui)));
+                ui.add_space(4.0);
+                ui.label("It keeps trying. If the data file is on a network or USB drive, check that it's connected.");
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(theme::primary_button("Try again")).clicked() {
+                        retry = true;
+                    }
+                    if ui.add(egui::Button::new("Keep working").min_size(egui::vec2(0.0, 34.0))).clicked() {
+                        stay = true;
+                    }
+                    if ui.add(theme::danger_button(without_saving)).clicked() {
+                        discard = true;
+                    }
+                });
+            });
+            if retry {
+                self.save();
+            } else if discard {
+                self.discard = true;
+            } else if stay || resp.should_close() {
+                self.leaving = None;
+            }
+        }
+
+        if let Some(setup) = &mut self.key_setup {
+            let mut turn_on = false;
+            let mut cancel = false;
+            let data_file = self.vault.path().to_path_buf();
+            let resp = egui::Modal::new(Id::unique("key-file-setup")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
+                ui.set_width(500.0);
+                ui.horizontal(|ui| {
+                    theme::icon_badge(ui, icons::KEY, theme::ACCENT, 40.0);
+                    ui.label(theme::serif("Back up your key file", 24.0));
+                });
+                ui.add_space(6.0);
+                ui.label("Your key file is saved on this computer at:");
+                ui.label(RichText::new(setup.path.display().to_string()).small().color(theme::muted(ui)));
+                ui.add_space(6.0);
+                ui.label(
+                    "Save a backup copy before turning it on. Keep it somewhere safe and away from your data file: \
+                     a USB stick, or as an attachment in a password manager such as KeePassXC or Bitwarden. \
+                     You'll also need it to use Supervisor on another computer.",
+                );
+                ui.add_space(4.0);
+                ui.colored_label(
+                    theme::fg(ui, theme::AMBER),
+                    "Without the key file your data can't be opened, even with the right password.",
+                );
+                ui.add_space(10.0);
+                if ui.button(format!("{} Save backup copy…", icons::EXPORT)).clicked()
+                    && let Some(dest) = rfd::FileDialog::new()
+                        .set_title("Save a backup copy of your key file")
+                        .set_file_name("supervisor-key.bin")
+                        .save_file()
+                {
+                    match storage::save_key_backup(&setup.key, &dest, &data_file) {
+                        Ok(()) => {
+                            setup.backup = Some(dest);
+                            setup.error = None;
+                        }
+                        Err(e) => setup.error = Some(format!("{e:#}")),
+                    }
+                }
+                if let Some(dest) = &setup.backup {
+                    ui.colored_label(
+                        theme::fg(ui, theme::GREEN),
+                        format!("{} Backup saved to {}", icons::CHECK_CIRCLE, dest.display()),
+                    );
+                }
+                if let Some(e) = &setup.error {
+                    ui.colored_label(theme::fg(ui, theme::RED), e);
+                }
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(setup.backup.is_some(), theme::primary_button("Turn on key file"))
+                        .on_disabled_hover_text("Save a backup copy first")
+                        .clicked()
+                    {
+                        turn_on = true;
+                    }
+                    if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 34.0))).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if turn_on {
+                self.finish_key_file();
+            } else if cancel || resp.should_close() {
+                self.key_setup = None;
+            }
+        }
 
         if let Some(n) = &mut self.new_student {
             let mut create = false;
@@ -950,29 +1313,45 @@ mod ui_tests {
         ]
     }
 
-    #[test]
-    fn end_to_end() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data.svt");
-        let p = path.clone();
+    /// Opens the app on `path`, which doesn't exist yet, and creates the password.
+    fn create_and_unlock(path: &std::path::Path, shots: bool) -> Harness<'static, SupervisorApp> {
+        let p = path.to_path_buf();
         let mut h = Harness::builder()
             .with_size(egui::vec2(1360.0, 860.0))
             .build_eframe(move |cc| SupervisorApp::new(cc, Some(p)));
         h.run_steps(2);
-        shot(&mut h, "01_create_password");
+        if shots {
+            shot(&mut h, "01_create_password");
+        }
 
-        // First run: create the password.
-        let fields = h.get_all_by_role(AkRole::PasswordInput).collect::<Vec<_>>();
-        assert_eq!(fields.len(), 2);
-        fields[0].focus();
-        fields[0].type_text(PASSWORD);
-        fields[1].focus();
-        fields[1].type_text(PASSWORD);
-        h.run_steps(1);
-        h.get_by_label("Create & unlock").click();
+        // First run: create the password. A short one is refused first.
+        let (start, rest) = PASSWORD.split_at(4);
+        for text in [start, rest] {
+            let fields = h.get_all_by_role(AkRole::PasswordInput).collect::<Vec<_>>();
+            assert_eq!(fields.len(), 2);
+            for field in &fields {
+                field.focus();
+                field.type_text(text);
+            }
+            h.run_steps(1);
+            h.get_by_label("Create & unlock").click();
+            h.run_steps(2);
+            if text == start {
+                assert!(h.query_by_label_contains("at least 12 characters").is_some());
+                assert!(!path.exists());
+            }
+        }
         wait_unlocked(&mut h);
         h.run_steps(2);
         assert!(path.exists());
+        h
+    }
+
+    #[test]
+    fn end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, true);
 
         // Add a student through the dialog.
         h.get_by_label("Placement").click();
@@ -1004,7 +1383,7 @@ mod ui_tests {
         for _ in 0..90 {
             h.run_steps(1);
         }
-        let (_, saved) = Vault::open(&path, PASSWORD).unwrap();
+        let saved = storage::read_database(&path, PASSWORD, None).unwrap();
         assert!(saved.students.iter().any(|s| s.name == "Niamh Kelly"));
 
         // Seed richer data and capture each screen.
@@ -1088,8 +1467,72 @@ mod ui_tests {
         h.get_by_label(&format!("{}  Lock", icons::LOCK_SIMPLE)).click();
         h.run_steps(2);
         assert!(matches!(h.state().screen, Screen::Locked(_)));
-        let (_, saved) = Vault::open(&path, PASSWORD).unwrap();
+        let (_, saved) = Vault::open(&path, PASSWORD, None).unwrap();
         assert!(saved.students.iter().any(|s| s.name == "Ciara Doyle"));
         assert!(saved.settings.dark_mode);
+    }
+
+    fn unlock(h: &mut Harness<'_, SupervisorApp>) {
+        let field = h.get_by_role(AkRole::PasswordInput);
+        field.focus();
+        field.type_text(PASSWORD);
+        h.run_steps(1);
+        h.get_by_label("Unlock").click();
+        wait_unlocked(h);
+        h.run_steps(2);
+    }
+
+    #[test]
+    fn lock_waits_for_save_and_locks_when_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+
+        // Saving fails (a folder is in the backup's way): Lock must not drop the edit.
+        let bak = dir.path().join("data.svt.bak");
+        std::fs::create_dir_all(bak.join("blocker")).unwrap();
+        session(&mut h).db.settings.my_name = "Unsaved edit".into();
+        h.run_steps(1);
+        h.get_by_label(&format!("{}  Lock", icons::LOCK_SIMPLE)).click();
+        h.run_steps(3);
+        assert!(matches!(h.state().screen, Screen::Unlocked(_)), "stays unlocked when saving fails");
+        assert!(h.query_by_label("Not saved yet").is_some());
+
+        // Once saving works again, Try again saves and locks.
+        std::fs::remove_dir_all(&bak).unwrap();
+        h.get_by_label("Try again").click();
+        h.run_steps(2);
+        assert!(matches!(h.state().screen, Screen::Locked(_)));
+        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Unsaved edit");
+
+        // Idle for longer than the auto-lock time: locks by itself.
+        unlock(&mut h);
+        assert_eq!(session(&mut h).db.settings.auto_lock_minutes, 10);
+        if let Some(earlier) = Instant::now().checked_sub(Duration::from_secs(11 * 60)) {
+            session(&mut h).last_active = earlier;
+            h.run_steps(1);
+            assert!(matches!(h.state().screen, Screen::Locked(_)), "auto-locked");
+        }
+    }
+
+    #[test]
+    fn changed_elsewhere_asks_before_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+
+        // Another computer saves the file (simulated by writing other bytes).
+        std::fs::write(&path, b"someone else's version").unwrap();
+        session(&mut h).db.settings.my_name = "Mine".into();
+        for _ in 0..90 {
+            h.run_steps(1);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's version", "not overwritten");
+        assert!(h.query_by_label("Changed somewhere else").is_some());
+
+        h.get_by_label("Save my version").click();
+        h.run_steps(2);
+        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Mine");
+        assert_eq!(std::fs::read(dir.path().join("data.svt.bak")).unwrap(), b"someone else's version");
     }
 }

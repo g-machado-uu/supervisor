@@ -3,3 +3,5 @@
 *.svt
 *.svt.bak
 *.svt.tmp
+*.svt.*.tmp
+/Supervisor security review.md
