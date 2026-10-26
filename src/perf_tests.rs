@@ -118,5 +118,6 @@ fn perf_timings() {
         let dir = tempfile::tempdir().unwrap();
         let mut vault = Vault::create(&dir.path().join("data.svt"), "correct horse battery staple", &db).unwrap();
         time("autosave (Vault::save)", 20, || vault.save(&db).unwrap());
+        time("autosave, UI-thread part (Vault::seal)", 20, || vault.seal(&db).unwrap());
     }
 }

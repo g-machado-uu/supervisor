@@ -369,52 +369,36 @@ impl Vault {
     /// Fails with [`VaultError::ChangedOnDisk`] rather than overwrite a file
     /// that another window or computer has written since.
     pub fn save(&mut self, db: &Database) -> Result<()> {
-        self.on_disk = Some(self.write(&self.seal, db, true)?);
+        let bytes = self.seal(db)?;
+        let hash = self.writer().write(&bytes)?;
+        self.saved(hash);
         Ok(())
     }
 
     /// Save even though the file changed elsewhere; that version becomes the `.bak`.
     pub fn overwrite(&mut self, db: &Database) -> Result<()> {
-        self.on_disk = Some(self.write(&self.seal, db, false)?);
+        let bytes = self.seal(db)?;
+        self.on_disk = Some(self.writer().put(&bytes, false)?);
         Ok(())
     }
 
-    fn write(&self, seal: &Seal, db: &Database, check: bool) -> Result<[u8; 32]> {
-        let plaintext = Zeroizing::new(serde_json::to_vec(db)?);
-        let mut nonce = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
-        let header = seal.header().to_bytes();
-        let cipher = XChaCha20Poly1305::new(seal.key.as_ref().into());
-        let ciphertext = cipher
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &plaintext,
-                    aad: &header,
-                },
-            )
-            .map_err(|_| anyhow!("encryption failed"))?;
-        let mut bytes = Vec::with_capacity(header.len() + NONCE_LEN + ciphertext.len());
-        bytes.extend_from_slice(&header);
-        bytes.extend_from_slice(&nonce);
-        bytes.extend_from_slice(&ciphertext);
+    /// The first half of a save: `db` serialised and encrypted. The second
+    /// half, [`Writer::write`], only needs these bytes.
+    pub fn seal(&self, db: &Database) -> Result<Vec<u8>> {
+        sealed(&self.seal, db)
+    }
 
-        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            create_private_dir(dir)?;
+    /// The disk half of a save, to run on another thread if need be.
+    pub fn writer(&self) -> Writer {
+        Writer {
+            path: self.path.clone(),
+            on_disk: self.on_disk,
         }
-        match fs::read(&self.path) {
-            Ok(old) => {
-                if check && Some(hash(&old)) != self.on_disk {
-                    return Err(VaultError::ChangedOnDisk.into());
-                }
-                write_atomic(&sibling(&self.path, "bak"), &old).context("writing backup")?;
-            }
-            // Deleted or moved elsewhere: nothing to lose by writing it again.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("reading {}", self.path.display())),
-        }
-        write_atomic(&self.path, &bytes).context("replacing data file")?;
-        Ok(hash(&bytes))
+    }
+
+    /// Record a save finished by a [`Writer`]; `hash` is what it returned.
+    pub fn saved(&mut self, hash: [u8; 32]) {
+        self.on_disk = Some(hash);
     }
 
     /// Whether `password` is the one the file is sealed with (no disk access).
@@ -441,11 +425,72 @@ impl Vault {
             return Err(VaultError::WrongPassword.into());
         }
         let next = Seal::new(password, key_file, self.seal.params.at_least_default())?;
-        self.on_disk = Some(self.write(&next, db, true)?);
+        let bytes = sealed(&next, db)?;
+        self.on_disk = Some(self.writer().put(&bytes, true)?);
         self.seal = next;
         // The backup is still sealed the old way; don't leave it behind.
         let _ = fs::remove_file(sibling(&self.path, "bak"));
         Ok(())
+    }
+}
+
+/// Serialise and encrypt `db` into the bytes of a data file.
+fn sealed(seal: &Seal, db: &Database) -> Result<Vec<u8>> {
+    let plaintext = Zeroizing::new(serde_json::to_vec(db)?);
+    let mut nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let header = seal.header().to_bytes();
+    let cipher = XChaCha20Poly1305::new(seal.key.as_ref().into());
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: &header,
+            },
+        )
+        .map_err(|_| anyhow!("encryption failed"))?;
+    let mut bytes = Vec::with_capacity(header.len() + NONCE_LEN + ciphertext.len());
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&nonce);
+    bytes.extend_from_slice(&ciphertext);
+    Ok(bytes)
+}
+
+/// Writes sealed bytes to a vault's file. It holds no key and only ever
+/// sees ciphertext, so saving can run off the UI thread.
+pub struct Writer {
+    path: PathBuf,
+    /// Hash of the file as last read or written, to notice other writers.
+    on_disk: Option<[u8; 32]>,
+}
+
+impl Writer {
+    /// Write `bytes` atomically, keeping the previous file as `<name>.bak`.
+    /// Fails with [`VaultError::ChangedOnDisk`] rather than overwrite a file
+    /// that another window or computer has written since. Returns the hash
+    /// of the new file, for [`Vault::saved`].
+    pub fn write(&self, bytes: &[u8]) -> Result<[u8; 32]> {
+        self.put(bytes, true)
+    }
+
+    fn put(&self, bytes: &[u8], check: bool) -> Result<[u8; 32]> {
+        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            create_private_dir(dir)?;
+        }
+        match fs::read(&self.path) {
+            Ok(old) => {
+                if check && Some(hash(&old)) != self.on_disk {
+                    return Err(VaultError::ChangedOnDisk.into());
+                }
+                write_atomic(&sibling(&self.path, "bak"), &old).context("writing backup")?;
+            }
+            // Deleted or moved elsewhere: nothing to lose by writing it again.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {}", self.path.display())),
+        }
+        write_atomic(&self.path, bytes).context("replacing data file")?;
+        Ok(hash(bytes))
     }
 }
 

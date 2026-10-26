@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
@@ -59,11 +60,17 @@ impl eframe::App for SupervisorApp {
     // Also runs while the window is hidden, so idle locking works then too.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let Screen::Unlocked(s) = &mut self.screen else { return };
-        if ctx.input(|i| i.viewport().close_requested()) && !s.discard {
-            s.detect_changes(ctx.input(|i| i.time));
-            s.leave(Leave::Quit);
-            if s.dirty_since.is_some() {
-                // Not saved: stay open and say why.
+        let now = ctx.input(|i| i.time);
+        s.poll_save(now, false);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if s.discard {
+                s.leaving = Some(Leave::Quit);
+            } else {
+                s.detect_changes(now);
+                s.leave(ctx, Leave::Quit);
+            }
+            if s.ready_to_leave().is_none() {
+                // Not saved yet: stay open, and close once saved or say why not.
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
@@ -242,6 +249,8 @@ struct Session {
     db_print: [u8; 32],
     /// Events and attention items for `db_print` and today.
     derived: Option<Derived>,
+    /// A save running in the background, and the `db_print` it started from.
+    saving: Option<(Receiver<anyhow::Result<[u8; 32]>>, [u8; 32])>,
     last_active: Instant,
     leaving: Option<Leave>,
     /// Lock or quit even though the latest changes aren't saved.
@@ -257,6 +266,7 @@ impl Session {
         Self {
             db_print: storage::fingerprint(&db),
             derived: None,
+            saving: None,
             vault,
             db,
             view: View::Dashboard,
@@ -284,9 +294,60 @@ impl Session {
         }
     }
 
-    fn save(&mut self) {
-        let result = self.vault.save(&self.db);
-        self.saved(result);
+    /// Start saving in the background, unless a save is already running.
+    /// Serialising and encrypting happen here; only ciphertext goes to the
+    /// worker, which writes it to disk. `poll_save` picks up the result.
+    fn save(&mut self, ctx: &egui::Context) {
+        if self.saving.is_some() {
+            return;
+        }
+        let job = self.vault.seal(&self.db).map(|bytes| (self.vault.writer(), bytes));
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(job.and_then(|(writer, bytes)| writer.write(&bytes)));
+            ctx.request_repaint();
+        });
+        self.saving = Some((rx, self.db_print));
+    }
+
+    /// Take the result of the background save if it has finished, or with
+    /// `wait`, once it does.
+    fn poll_save(&mut self, now: f64, wait: bool) {
+        let Some((rx, started_from)) = &self.saving else { return };
+        let received = if wait {
+            rx.recv().map_err(|_| TryRecvError::Disconnected)
+        } else {
+            rx.try_recv()
+        };
+        let result = match received {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("saving stopped unexpectedly")),
+        };
+        let started_from = *started_from;
+        self.saving = None;
+        match result {
+            Ok(hash) => {
+                self.vault.saved(hash);
+                // Edits made while it was saving stay pending for the next save.
+                if self.db_print == started_from {
+                    self.saved(Ok(()));
+                }
+            }
+            Err(e) => {
+                self.saved(Err(e));
+                if matches!(self.status, SaveStatus::Error(_)) {
+                    // Back off before retrying.
+                    self.dirty_since = Some(now + 4.0);
+                }
+            }
+        }
+    }
+
+    /// Wait for a background save, before writing the file from this thread.
+    fn wait_for_save(&mut self, ui: &Ui) {
+        self.poll_save(ui.input(|i| i.time), true);
     }
 
     fn saved(&mut self, result: anyhow::Result<()>) {
@@ -320,17 +381,18 @@ impl Session {
 
     /// Ask to lock or quit. It happens once nothing is left unsaved; if
     /// saving fails, a dialog says so and offers to go ahead anyway.
-    fn leave(&mut self, leave: Leave) {
+    fn leave(&mut self, ctx: &egui::Context, leave: Leave) {
         if self.leaving.is_none() || leave == Leave::Quit {
             self.leaving = Some(leave);
         }
         if self.dirty_since.is_some() && !matches!(self.status, SaveStatus::Conflict) {
-            self.save();
+            self.save(ctx);
         }
     }
 
     fn ready_to_leave(&self) -> Option<Leave> {
-        self.leaving.filter(|_| self.dirty_since.is_none() || self.discard)
+        self.leaving
+            .filter(|_| (self.dirty_since.is_none() || self.discard) && self.saving.is_none())
     }
 
     /// Lock after the chosen time without input. Uses the wall clock, as
@@ -343,7 +405,7 @@ impl Session {
         let limit = Duration::from_secs(u64::from(minutes) * 60);
         match limit.checked_sub(self.last_active.elapsed()) {
             Some(left) if !left.is_zero() => ctx.request_repaint_after(left),
-            _ => self.leave(Leave::Lock),
+            _ => self.leave(ctx, Leave::Lock),
         }
     }
 
@@ -401,18 +463,20 @@ impl Session {
             theme::apply(ui.ctx(), self.db.settings.dark_mode);
         }
         if lock {
-            self.leave(Leave::Lock);
+            self.leave(ui.ctx(), Leave::Lock);
         }
         if let Some(since) = self.dirty_since
             && !matches!(self.status, SaveStatus::Conflict)
+            && self.saving.is_none()
         {
-            let wait = AUTOSAVE_DELAY - (now - since);
+            // Locking or quitting doesn't wait for a pause in typing, only
+            // for the back-off after a failed save.
+            let wait = match (&self.status, self.leaving) {
+                (SaveStatus::Pending, Some(_)) => 0.0,
+                _ => AUTOSAVE_DELAY - (now - since),
+            };
             if wait <= 0.0 {
-                self.save();
-                if self.dirty_since.is_some() {
-                    // Save failed; back off before retrying.
-                    self.dirty_since = Some(now + 4.0);
-                }
+                self.save(ui.ctx());
             } else {
                 ui.ctx().request_repaint_after(Duration::from_secs_f64(wait));
             }
@@ -652,9 +716,9 @@ impl Session {
                 match settings::show(ui, &mut self.db.settings, &in_use, security) {
                     SettingsAction::None => {}
                     SettingsAction::ExportIcs => self.export_ics(ui),
-                    SettingsAction::ChangePassword => self.change_password(),
+                    SettingsAction::ChangePassword => self.change_password(ui),
                     SettingsAction::AddKeyFile => self.start_key_file(),
-                    SettingsAction::RemoveKeyFile => self.remove_key_file(),
+                    SettingsAction::RemoveKeyFile => self.remove_key_file(ui),
                 }
             }
         }
@@ -775,7 +839,8 @@ impl Session {
         }
     }
 
-    fn change_password(&mut self) {
+    fn change_password(&mut self, ui: &Ui) {
+        self.wait_for_save(ui);
         let pw = std::mem::take(&mut self.password_form);
         let result = if let Some(problem) = storage::password_problem(&pw.new) {
             Err(problem)
@@ -852,7 +917,8 @@ impl Session {
         }
     }
 
-    fn finish_key_file(&mut self) {
+    fn finish_key_file(&mut self, ui: &Ui) {
+        self.wait_for_save(ui);
         let Some(setup) = self.key_setup.take() else { return };
         let result = self.vault.set_key_file(&setup.password, Some(setup.key), &self.db);
         self.key_form.message = Some(match self.resealed(result, "Could not turn on the key file") {
@@ -864,7 +930,8 @@ impl Session {
         });
     }
 
-    fn remove_key_file(&mut self) {
+    fn remove_key_file(&mut self, ui: &Ui) {
+        self.wait_for_save(ui);
         let form = std::mem::take(&mut self.key_form);
         let result = self.vault.set_key_file(&form.password, None, &self.db);
         self.key_form.message = Some(match self.resealed(result, "Could not remove the key file") {
@@ -920,6 +987,7 @@ impl Session {
                 });
             });
             if keep_mine {
+                self.wait_for_save(ui);
                 let result = self.vault.overwrite(&self.db);
                 self.saved(result);
             } else if discard {
@@ -961,7 +1029,7 @@ impl Session {
                 });
             });
             if retry {
-                self.save();
+                self.save(&ctx);
             } else if discard {
                 self.discard = true;
             } else if stay || resp.should_close() {
@@ -1032,7 +1100,7 @@ impl Session {
                 });
             });
             if turn_on {
-                self.finish_key_file();
+                self.finish_key_file(ui);
             } else if cancel || resp.should_close() {
                 self.key_setup = None;
             }
@@ -1198,15 +1266,34 @@ mod ui_tests {
         }
     }
 
-    fn wait_unlocked(h: &mut Harness<'_, SupervisorApp>) {
+    /// Runs frames until `done`, giving work in the background (unlocking,
+    /// saving) time to finish.
+    fn wait_until(h: &mut Harness<'_, SupervisorApp>, what: &str, done: impl Fn(&SupervisorApp) -> bool) {
         for _ in 0..600 {
             h.run_steps(1);
-            if matches!(h.state().screen, Screen::Unlocked(_)) {
+            if done(h.state()) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        panic!("did not unlock");
+        panic!("timed out waiting for: {what}");
+    }
+
+    fn wait_unlocked(h: &mut Harness<'_, SupervisorApp>) {
+        wait_until(h, "unlocked", |app| matches!(app.screen, Screen::Unlocked(_)));
+    }
+
+    fn locked(app: &SupervisorApp) -> bool {
+        matches!(app.screen, Screen::Locked(_))
+    }
+
+    /// Unlocked with every change saved and no save running.
+    fn all_saved(app: &SupervisorApp) -> bool {
+        matches!(&app.screen, Screen::Unlocked(s) if s.saving.is_none() && s.dirty_since.is_none())
+    }
+
+    fn status_is(app: &SupervisorApp, want: fn(&SaveStatus) -> bool) -> bool {
+        matches!(&app.screen, Screen::Unlocked(s) if s.saving.is_none() && want(&s.status))
     }
 
     fn demo_students(today: chrono::NaiveDate) -> Vec<Student> {
@@ -1435,6 +1522,7 @@ mod ui_tests {
         for _ in 0..90 {
             h.run_steps(1);
         }
+        wait_until(&mut h, "autosave", all_saved);
         let saved = storage::read_database(&path, PASSWORD, None).unwrap();
         assert!(saved.students.iter().any(|s| s.name == "Niamh Kelly"));
 
@@ -1517,8 +1605,7 @@ mod ui_tests {
 
         // Lock: back to the unlock screen, and the right password reopens the data.
         h.get_by_label(&format!("{}  Lock", icons::LOCK_SIMPLE)).click();
-        h.run_steps(2);
-        assert!(matches!(h.state().screen, Screen::Locked(_)));
+        wait_until(&mut h, "locked", locked);
         let (_, saved) = Vault::open(&path, PASSWORD, None).unwrap();
         assert!(saved.students.iter().any(|s| s.name == "Ciara Doyle"));
         assert!(saved.settings.dark_mode);
@@ -1546,15 +1633,15 @@ mod ui_tests {
         session(&mut h).db.settings.my_name = "Unsaved edit".into();
         h.run_steps(1);
         h.get_by_label(&format!("{}  Lock", icons::LOCK_SIMPLE)).click();
-        h.run_steps(3);
+        wait_until(&mut h, "save failed", |app| status_is(app, |s| matches!(s, SaveStatus::Error(_))));
+        h.run_steps(2);
         assert!(matches!(h.state().screen, Screen::Unlocked(_)), "stays unlocked when saving fails");
         assert!(h.query_by_label("Not saved yet").is_some());
 
         // Once saving works again, Try again saves and locks.
         std::fs::remove_dir_all(&bak).unwrap();
         h.get_by_label("Try again").click();
-        h.run_steps(2);
-        assert!(matches!(h.state().screen, Screen::Locked(_)));
+        wait_until(&mut h, "locked", locked);
         assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Unsaved edit");
 
         // Idle for longer than the auto-lock time: locks by itself.
@@ -1581,6 +1668,8 @@ mod ui_tests {
         for _ in 0..90 {
             h.run_steps(1);
         }
+        wait_until(&mut h, "conflict", |app| status_is(app, |s| matches!(s, SaveStatus::Conflict)));
+        h.run_steps(2);
         assert_eq!(std::fs::read(&path).unwrap(), b"someone else's version", "not overwritten");
         assert!(h.query_by_label("Changed somewhere else").is_some());
 
@@ -1588,5 +1677,28 @@ mod ui_tests {
         h.run_steps(2);
         assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Mine");
         assert_eq!(std::fs::read(dir.path().join("data.svt.bak")).unwrap(), b"someone else's version");
+    }
+
+    #[test]
+    fn edit_made_while_saving_is_saved_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let ctx = h.ctx.clone();
+        let now = ctx.input(|i| i.time);
+        let s = session(&mut h);
+        s.db.settings.my_name = "First".into();
+        s.detect_changes(now);
+        s.save(&ctx);
+        // Edited while that save is still running.
+        s.db.settings.my_name = "Second".into();
+        s.detect_changes(now);
+        s.poll_save(now, true);
+        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "First");
+        assert!(matches!(s.status, SaveStatus::Pending), "the newer edit isn't saved yet");
+        assert!(s.dirty_since.is_some());
+
+        wait_until(&mut h, "second save", all_saved);
+        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Second");
     }
 }
