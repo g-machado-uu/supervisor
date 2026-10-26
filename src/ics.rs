@@ -5,7 +5,7 @@
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc, Weekday};
 use jiff::tz::TimeZone;
 
-use crate::model::{CalItem, Event, EventKind, Settings};
+use crate::model::{CalItem, Event, EventKind, Platform, Settings};
 
 fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -65,7 +65,7 @@ pub fn valid_email(email: &str) -> bool {
         && !domain.ends_with('.')
 }
 
-/// A Teams link is used only if it's a plain `https://` address.
+/// A meeting link is used only if it's a plain `https://` address.
 pub fn valid_link(link: &str) -> bool {
     let link = link.trim();
     link.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
@@ -269,14 +269,14 @@ fn push_details(out: &mut String, item: &CalItem, settings: &Settings, invite: b
     if let Some(location) = location(e) {
         push_line(out, &format!("LOCATION:{}", escape(location)));
     }
-    let link = settings.teams_link.trim();
-    if e.online && valid_link(link) {
+    if let Some(link) = meeting_link(e, settings) {
+        let join = match e.platform {
+            Platform::Teams => "Join on Microsoft Teams",
+            Platform::GoogleMeet => "Join with Google Meet",
+        };
         push_line(
             out,
-            &format!(
-                "DESCRIPTION:{}",
-                escape(&format!("Join on Microsoft Teams:\n{link}"))
-            ),
+            &format!("DESCRIPTION:{}", escape(&format!("{join}:\n{link}"))),
         );
         // A URI, not text: escaping would add backslashes to the link.
         push_line(out, &format!("URL:{link}"));
@@ -285,7 +285,7 @@ fn push_details(out: &mut String, item: &CalItem, settings: &Settings, invite: b
         EventKind::FypMeeting => "Project",
         EventKind::Visit => "Placement",
         EventKind::AdviseeMeeting => "Advisee",
-        EventKind::PhdMeeting => "PhD",
+        EventKind::PhdMeeting => "Research",
         EventKind::Deadline => "Deadline",
         EventKind::Reminder => "Reminder",
     };
@@ -322,9 +322,25 @@ fn push_details(out: &mut String, item: &CalItem, settings: &Settings, invite: b
     push_line(out, "STATUS:CONFIRMED");
 }
 
+/// The link to join an online event: its own, or for Teams the one in Settings.
+pub fn meeting_link<'a>(e: &'a Event, settings: &'a Settings) -> Option<&'a str> {
+    if !e.online {
+        return None;
+    }
+    let own = e.link.trim();
+    let link = match e.platform {
+        Platform::Teams if own.is_empty() => settings.teams_link.trim(),
+        _ => own,
+    };
+    valid_link(link).then_some(link)
+}
+
 fn location(e: &Event) -> Option<&str> {
     match (e.online, e.location.is_empty()) {
-        (true, _) => Some("Microsoft Teams Meeting"),
+        (true, _) => Some(match e.platform {
+            Platform::Teams => "Microsoft Teams Meeting",
+            Platform::GoogleMeet => "Google Meet",
+        }),
         (false, false) => Some(&e.location),
         (false, true) => None,
     }
@@ -427,6 +443,8 @@ mod tests {
             title: "BEng project meeting – Smith, J".into(),
             done: false,
             online,
+            platform: Platform::Teams,
+            link: String::new(),
             location: "MG.201".into(),
             series: None,
             cancelled: false,
@@ -576,6 +594,28 @@ mod tests {
             let ics = calendar(std::slice::from_ref(&teams), &settings(bad), true, &uk());
             assert!(!ics.contains("URL:") && !ics.contains("DESCRIPTION"), "{bad}");
         }
+    }
+
+    #[test]
+    fn meeting_links_and_google_meet() {
+        let teams_link = "https://teams.microsoft.com/l/meetup-join/abc";
+        let own = "https://teams.microsoft.com/l/meetup-join/own";
+        let mut e = event(d(2026, 10, 30), Some(14), EventKind::FypMeeting, true);
+        e.link = own.into();
+        let ics = unfold(&calendar(&[item(e.clone())], &settings(teams_link), true, &uk()));
+        assert!(ics.contains(&format!("URL:{own}")), "the meeting's own link wins");
+
+        e.platform = Platform::GoogleMeet;
+        e.link = String::new();
+        let ics = unfold(&calendar(&[item(e.clone())], &settings(teams_link), true, &uk()));
+        assert!(ics.contains("LOCATION:Google Meet"));
+        assert!(!ics.contains("URL:"), "the Teams link isn't used for Meet");
+
+        let meet = "https://meet.google.com/abc-defg-hij";
+        e.link = meet.into();
+        let ics = unfold(&calendar(&[item(e)], &settings(""), true, &uk()));
+        assert!(ics.contains("DESCRIPTION:Join with Google Meet:\\n"));
+        assert!(ics.contains(&format!("URL:{meet}")));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use chrono::{Datelike, Local, NaiveDate, NaiveTime, Timelike};
 use egui::{RichText, Ui};
 use egui_extras::DatePickerButton;
 
-use crate::model::{Meeting, Repeat, ReplyStatus, Settings, TriState};
+use crate::model::{Meeting, Platform, Repeat, ReplyStatus, Settings, TriState};
 use crate::ui::{icons, theme};
 
 pub fn today() -> NaiveDate {
@@ -160,7 +160,7 @@ pub fn week_label(settings: &Settings, date: NaiveDate) -> String {
     }
 }
 
-/// Editable list of meetings: date, time, Teams or room, repetition and
+/// Editable list of meetings: date, time, online (Teams / Meet) or room, repetition and
 /// notes. `first_label` names the first entry (e.g. "Semester meeting");
 /// later entries become follow-ons. Returns the UID of a meeting whose
 /// invite button was clicked.
@@ -214,12 +214,26 @@ pub fn meetings_editor(
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut m.teams, format!("{} Teams", icons::DESKTOP));
-                            if !m.teams {
+                            ui.checkbox(&mut m.online, format!("{} Online", icons::DESKTOP));
+                            if m.online {
+                                for platform in Platform::ALL {
+                                    ui.selectable_value(&mut m.platform, platform, platform.label());
+                                }
+                            } else {
                                 ui.label(RichText::new(icons::MAP_PIN).color(theme::muted(ui)));
                                 text_field(ui, &mut m.location, "Room / location");
                             }
                         });
+                        if m.online {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(icons::LINK).color(theme::muted(ui)));
+                                let hint = match m.platform {
+                                    Platform::Teams => "Meeting link (optional; otherwise the one in Settings)",
+                                    Platform::GoogleMeet => "https://meet.google.com/…",
+                                };
+                                text_field(ui, &mut m.link, hint);
+                            });
+                        }
                         repeat_editor(ui, m, settings);
                         notes(ui, &mut m.notes, "Meeting notes…");
                     });

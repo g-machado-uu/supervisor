@@ -1,13 +1,14 @@
-//! PhD section of the student detail panel: project details, the dates from
-//! the university system with their reminders, the viva and meetings.
+//! Research section of the student detail panel: project details, the dates
+//! from the university system (or added by hand) with their reminders, the
+//! viva and meetings.
 
 use chrono::{Months, NaiveDate};
 use egui::{RichText, Ui};
 use uuid::Uuid;
 
 use crate::model::{
-    FeeStatus, Funder, Milestone, PhdRecord, PhdStep, ResearchDegree, ResearchStatus, Settings,
-    StudyMode, VisaType, VivaOutcome,
+    CustomStep, FeeStatus, Funder, Lead, LeadUnit, Milestone, PhdRecord, PhdStep, ResearchDegree,
+    ResearchStatus, Settings, StudyMode, VisaType, VivaOutcome,
 };
 use crate::ui::{icons, theme, widgets};
 
@@ -47,60 +48,75 @@ pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, student_id: Uui
 
     ui.add_space(10.0);
     theme::card_title(ui, "Assessments & deadlines");
-    ui.label(
-        RichText::new("Type the deadlines from the university system. Reminders are worked out from them.")
-            .small()
-            .color(theme::muted(ui)),
-    );
+    let mut standard = !p.skip_standard;
+    if ui
+        .checkbox(&mut standard, "Standard assessments of this university")
+        .on_hover_text("Initial, confirmation and final assessments, annual reports, examiners and submission")
+        .changed()
+    {
+        p.skip_standard = !standard;
+    }
+    let hint = if p.skip_standard {
+        "Add the deadlines from the student's university and choose when to be reminded."
+    } else {
+        "Type the deadlines from the university system. Reminders are worked out from them."
+    };
+    ui.label(RichText::new(hint).small().color(theme::muted(ui)));
     let steps = p.steps();
     let mut remove_report = None;
-    egui::Grid::new("phd-steps")
-        .num_columns(3)
-        .striped(true)
-        .spacing([10.0, 6.0])
-        .show(ui, |ui| {
-            for h in ["Item", "Deadline", "Completed"] {
-                ui.label(RichText::new(h).small().color(theme::muted(ui)));
-            }
-            ui.end_row();
-            for step in steps.iter().filter(|s| s.key != "amendments") {
-                if step.key == "examiners" {
-                    if ui.small_button(format!("{} Annual report", icons::PLUS)).clicked() {
-                        p.annual_reports.push(next_annual_report(p));
-                    }
-                    ui.end_row();
-                }
-                if step.key == "submission" {
-                    ui.label("Earliest submission");
-                    widgets::opt_date(ui, "earliest", &mut p.earliest_submission);
-                    ui.end_row();
-                }
-                let annual = step.key.strip_prefix("annual").and_then(|n| n.parse::<usize>().ok());
-                ui.horizontal(|ui| {
-                    step_label(ui, step, today);
-                    if let Some(n) = annual
-                        && ui
-                            .push_id(&step.key, |ui| ui.small_button(icons::TRASH))
-                            .inner
-                            .on_hover_text("Remove this annual report")
-                            .clicked()
-                    {
-                        remove_report = Some(n - 1);
-                    }
-                });
-                let mut edited = step.milestone.clone();
-                milestone_cells(ui, &step.key, &mut edited, today);
-                if edited != step.milestone
-                    && let Some(m) = p.milestone_mut(&step.key)
-                {
-                    *m = edited;
+    if !p.skip_standard {
+        egui::Grid::new("phd-steps")
+            .num_columns(3)
+            .striped(true)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                for h in ["Item", "Deadline", "Completed"] {
+                    ui.label(RichText::new(h).small().color(theme::muted(ui)));
                 }
                 ui.end_row();
-            }
-        });
+                for step in steps
+                    .iter()
+                    .filter(|s| s.key != "amendments" && !s.key.starts_with("custom-"))
+                {
+                    if step.key == "examiners" {
+                        if ui.small_button(format!("{} Annual report", icons::PLUS)).clicked() {
+                            p.annual_reports.push(next_annual_report(p));
+                        }
+                        ui.end_row();
+                    }
+                    if step.key == "submission" {
+                        ui.label("Earliest submission");
+                        widgets::opt_date(ui, "earliest", &mut p.earliest_submission);
+                        ui.end_row();
+                    }
+                    let annual = step.key.strip_prefix("annual").and_then(|n| n.parse::<usize>().ok());
+                    ui.horizontal(|ui| {
+                        step_label(ui, step, today);
+                        if let Some(n) = annual
+                            && ui
+                                .push_id(&step.key, |ui| ui.small_button(icons::TRASH))
+                                .inner
+                                .on_hover_text("Remove this annual report")
+                                .clicked()
+                        {
+                            remove_report = Some(n - 1);
+                        }
+                    });
+                    let mut edited = step.milestone.clone();
+                    milestone_cells(ui, &step.key, &mut edited, today);
+                    if edited != step.milestone
+                        && let Some(m) = p.milestone_mut(&step.key)
+                    {
+                        *m = edited;
+                    }
+                    ui.end_row();
+                }
+            });
+    }
     if let Some(i) = remove_report {
         p.annual_reports.remove(i);
     }
+    custom_steps(ui, &mut p.custom_steps, today);
 
     ui.add_space(10.0);
     theme::card_title(ui, "Viva & award");
@@ -156,8 +172,18 @@ fn details(ui: &mut Ui, p: &mut PhdRecord) {
         ui.end_row();
 
         ui.label("Type");
-        combo(ui, "degree", &mut p.degree, &ResearchDegree::ALL, |d| d.label());
+        ui.horizontal(|ui| {
+            combo(ui, "degree", &mut p.degree, &ResearchDegree::ALL, |d| d.label());
+            ui.checkbox(&mut p.external, "External")
+                .on_hover_text("Registered at another university; you co-supervise");
+        });
         ui.end_row();
+
+        if p.external {
+            ui.label("University");
+            widgets::text_field(ui, &mut p.university, "Where the student is registered");
+            ui.end_row();
+        }
 
         ui.label("Status");
         combo(ui, "status", &mut p.status, &ResearchStatus::ALL, |s| s.label());
@@ -179,6 +205,23 @@ fn details(ui: &mut Ui, p: &mut PhdRecord) {
         widgets::text_field(ui, &mut p.supervisors, "Other members of the team");
         ui.end_row();
 
+        ui.label("Funder");
+        ui.horizontal(|ui| {
+            combo(ui, "funder", &mut p.funder, &Funder::ALL, |f| f.label());
+            if p.funder == Funder::Other {
+                widgets::text_field(ui, &mut p.funder_other, "Funder");
+            }
+        });
+        ui.end_row();
+
+        ui.label("Funding source");
+        widgets::text_field(ui, &mut p.funding_source, "e.g. studentship, scholarship");
+        ui.end_row();
+
+        // Fees and visas are this university's business, not for external students.
+        if p.external {
+            return;
+        }
         ui.label("Fee status");
         ui.horizontal(|ui| {
             for fee in [FeeStatus::National, FeeStatus::Overseas] {
@@ -210,18 +253,6 @@ fn details(ui: &mut Ui, p: &mut PhdRecord) {
             ui.end_row();
         }
 
-        ui.label("Funder");
-        ui.horizontal(|ui| {
-            combo(ui, "funder", &mut p.funder, &Funder::ALL, |f| f.label());
-            if p.funder == Funder::Other {
-                widgets::text_field(ui, &mut p.funder_other, "Funder");
-            }
-        });
-        ui.end_row();
-
-        ui.label("Funding source");
-        widgets::text_field(ui, &mut p.funding_source, "e.g. studentship, scholarship");
-        ui.end_row();
     });
 }
 
@@ -236,27 +267,100 @@ fn combo<T: Copy + PartialEq>(ui: &mut Ui, salt: &str, value: &mut T, all: &[T],
         });
 }
 
-/// The step's name, coloured by state, with its reminder date underneath.
-fn step_label(ui: &mut Ui, step: &PhdStep, today: NaiveDate) {
-    let m = &step.milestone;
-    let reminder = m.reminder(step.lead_months);
-    let color = match m.deadline {
+/// Green when done, red when overdue, amber once the reminder has passed.
+fn state_color(ui: &Ui, m: &Milestone, lead: Lead, today: NaiveDate) -> egui::Color32 {
+    match m.deadline {
         _ if m.done => theme::fg(ui, theme::GREEN),
         Some(due) if due < today => theme::fg(ui, theme::RED),
-        Some(_) if reminder.is_some_and(|r| r <= today) => theme::fg(ui, theme::AMBER),
+        Some(_) if m.reminder(lead).is_some_and(|r| r <= today) => theme::fg(ui, theme::AMBER),
         _ => ui.visuals().text_color(),
-    };
+    }
+}
+
+fn reminder_note(ui: &mut Ui, m: &Milestone, lead: Lead) {
+    if let Some(r) = m.reminder(lead).filter(|_| !m.done) {
+        ui.label(
+            RichText::new(format!("{} reminder {}", icons::BELL, r.format("%d %b %Y")))
+                .small()
+                .color(theme::muted(ui)),
+        );
+    }
+}
+
+/// The step's name, coloured by state, with its reminder date underneath.
+fn step_label(ui: &mut Ui, step: &PhdStep, today: NaiveDate) {
+    let color = state_color(ui, &step.milestone, step.lead, today);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         ui.label(RichText::new(&step.label).color(color));
-        if let Some(r) = reminder.filter(|_| !m.done) {
-            ui.label(
-                RichText::new(format!("{} reminder {}", icons::BELL, r.format("%d %b %Y")))
-                    .small()
-                    .color(theme::muted(ui)),
-            );
-        }
+        reminder_note(ui, &step.milestone, step.lead);
     });
+}
+
+/// Deadlines added by hand, each with its own reminder.
+fn custom_steps(ui: &mut Ui, steps: &mut Vec<CustomStep>, today: NaiveDate) {
+    let mut remove = None;
+    if !steps.is_empty() {
+        ui.add_space(6.0);
+        egui::Grid::new("phd-custom-steps")
+            .num_columns(4)
+            .striped(true)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                for h in ["Item", "Deadline", "Completed", "Remind me"] {
+                    ui.label(RichText::new(h).small().color(theme::muted(ui)));
+                }
+                ui.end_row();
+                for (i, c) in steps.iter_mut().enumerate() {
+                    let color = state_color(ui, &c.milestone, c.remind, today);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [180.0, 22.0],
+                                egui::TextEdit::singleline(&mut c.title)
+                                    .id_salt((c.id, "title"))
+                                    .hint_text("e.g. Qualifying exam")
+                                    .text_color(color),
+                            );
+                            if ui
+                                .push_id((c.id, "remove"), |ui| ui.small_button(icons::TRASH))
+                                .inner
+                                .on_hover_text("Remove this deadline")
+                                .clicked()
+                            {
+                                remove = Some(i);
+                            }
+                        });
+                        reminder_note(ui, &c.milestone, c.remind);
+                    });
+                    milestone_cells(ui, &format!("custom-{}", c.id), &mut c.milestone, today);
+                    ui.push_id((c.id, "lead"), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut c.remind.amount).range(0..=365));
+                            egui::ComboBox::from_id_salt("unit")
+                                .selected_text(c.remind.unit.label())
+                                .width(80.0)
+                                .show_ui(ui, |ui| {
+                                    for unit in LeadUnit::ALL {
+                                        ui.selectable_value(&mut c.remind.unit, unit, unit.label());
+                                    }
+                                });
+                            ui.label("before");
+                        })
+                        .response
+                        .on_hover_text("0 = no reminder");
+                    });
+                    ui.end_row();
+                }
+            });
+    }
+    if let Some(i) = remove {
+        steps.remove(i);
+    }
+    if ui.small_button(format!("{} Add deadline", icons::PLUS)).clicked() {
+        steps.push(CustomStep::default());
+    }
 }
 
 /// Deadline and completed cells of a milestone row.

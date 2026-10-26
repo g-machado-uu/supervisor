@@ -1,6 +1,6 @@
 # Supervisor
 
-A desktop app for keeping track of the students you supervise: final-year and MSc projects, PhD students, placement visits and studies advisees. It runs on Linux, Windows and macOS, and keeps everything in one encrypted file on your computer.
+A desktop app for keeping track of the students you supervise: final-year projects, PhD and MSc students, placement visits and studies advisees. It runs on Linux, Windows and macOS, and keeps everything in one encrypted file on your computer.
 This project is built with the help of Claude Opus 5.5.
 ![Dashboard](docs/screenshots/dashboard.png)
 
@@ -8,9 +8,10 @@ This project is built with the help of Claude Opus 5.5.
 
 - **Dashboard**: what's coming up, and what needs chasing (no reply, overdue coursework, PhD deadlines, visas about to end).
 - **Lists** for each group of students. Click a student to open their details on the right.
-- **Meetings**, one-off or repeating, online (Teams) or in a room. Mark each week as held, cancelled or moved.
+- **Meetings**, one-off or repeating, online (Teams or Google Meet, with the meeting link) or in a room. Mark each week as held, cancelled or moved.
 - **Coursework deadlines** are worked out from the teaching weeks you set in Settings.
-- **PhD students**: assessments, annual reports, submission and viva. Type in the deadlines from the university system and the app reminds you in time.
+- **Research students**, in four lists: PhD, PhD External, MSc and MSc External. Assessments, annual reports, submission and viva: type in the deadlines from the university system and the app reminds you in time.
+- **External students** (registered at another university) start with a blank list of assessments. Add their own deadlines and choose how long before each one to be reminded. You can do the same for any student, alongside the standard assessments.
 - **Placement visits**: requests, replies and whether the line manager is coming.
 - **Calendar** as a list or a month grid. Once a meeting's time has passed, mark it as held or postpone it right there (in the month grid, right-click it). Export any items to an `.ics` file for Outlook or Google Calendar, or save an invite file for one meeting to send to the student.
 

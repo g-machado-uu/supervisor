@@ -1,4 +1,4 @@
-//! Project supervision section (FYP, MSc, …) of the student detail panel.
+//! Project supervision section (BEng, MEng, …) of the student detail panel.
 
 use egui::{RichText, Ui};
 

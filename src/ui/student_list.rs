@@ -6,7 +6,7 @@ use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
 
 use crate::model::{
-    Database, FypRecord, Meeting, PhdRecord, ReplyStatus, SemesterContact, Settings, Student,
+    Database, FypRecord, Meeting, PhdRecord, ReplyStatus, ResearchGroup, SemesterContact, Settings, Student,
     Visit,
 };
 use crate::ui::{icons, theme, widgets};
@@ -15,7 +15,7 @@ use crate::ui::{icons, theme, widgets};
 pub enum Category {
     /// Project students on the courses shown in this sidebar list.
     Projects(String),
-    Phd,
+    Research(ResearchGroup),
     Placement,
     Advisee,
     All,
@@ -25,7 +25,7 @@ impl Category {
     pub fn title(&self) -> String {
         match self {
             Category::Projects(list) => format!("Project students – {list}"),
-            Category::Phd => "PhD Students".into(),
+            Category::Research(group) => format!("{} Students", group.label()),
             Category::Placement => "Placement Students".into(),
             Category::Advisee => "Studies Advisees".into(),
             Category::All => "All Students".into(),
@@ -39,7 +39,7 @@ impl Category {
                     .programme(&f.programme)
                     .is_some_and(|p| p.list_name() == list)
             }),
-            Category::Phd => s.phd.is_some(),
+            Category::Research(group) => s.phd.as_ref().is_some_and(|p| p.group() == *group),
             Category::Placement => s.placement.is_some(),
             Category::Advisee => s.advisee.is_some(),
             Category::All => true,
@@ -152,7 +152,7 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
             "Meetings",
             "Coursework",
         ],
-        Category::Phd => &["Name", "B Number", "Year", "Meetings", "Next deadline"],
+        Category::Research(_) => &["Name", "B Number", "Year", "Meetings", "Next deadline"],
         Category::Placement => &["Name", "B Number", "Company", "Visit 1", "Visit 2"],
         Category::Advisee => &["Name", "B Number", "Course", "Semester 1", "Semester 2"],
         Category::All => &["Name", "B Number", "Email", "Course", "Roles"],
@@ -242,7 +242,7 @@ fn table(
                         row.col(|ui| meetings_chip(ui, &f.meetings, &db.settings, today));
                         row.col(|ui| coursework_chip(ui, f, &db.settings, today));
                     }
-                    Category::Phd => {
+                    Category::Research(_) => {
                         let p = s.phd.as_ref().expect("filtered");
                         row.col(|ui| {
                             match p.year_of_study(today) {
@@ -389,7 +389,7 @@ fn next_deadline_chip(ui: &mut Ui, p: &PhdRecord, today: NaiveDate) {
     let due = step.milestone.deadline.expect("next_step has a deadline");
     let color = if due < today {
         theme::RED
-    } else if step.milestone.reminder(step.lead_months).is_some_and(|r| r <= today) {
+    } else if step.milestone.reminder(step.lead).is_some_and(|r| r <= today) {
         theme::AMBER
     } else {
         theme::ACCENT

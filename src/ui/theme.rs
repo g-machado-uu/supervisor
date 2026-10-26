@@ -298,14 +298,19 @@ pub fn card_title(ui: &mut Ui, title: &str) {
 /// Serif page title with a muted subtitle, and room for actions on the right.
 pub fn page_header(ui: &mut Ui, title: &str, subtitle: &str, right: impl FnOnce(&mut Ui)) {
     ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            ui.heading(title);
-            if !subtitle.is_empty() {
-                ui.label(RichText::new(subtitle).color(muted(ui)));
-            }
+        // The buttons first, so a long title is cut short rather than run under them.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            right(ui);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.add(egui::Label::new(RichText::new(title).heading()).truncate());
+                    if !subtitle.is_empty() {
+                        ui.label(RichText::new(subtitle).color(muted(ui)));
+                    }
+                });
+            });
         });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
     });
     ui.add_space(14.0);
 }

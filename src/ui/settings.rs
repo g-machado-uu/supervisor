@@ -342,7 +342,7 @@ fn module_editor(
     let mut remove = false;
     widgets::form_grid(ui, "module-grid", |ui| {
         ui.label("Code");
-        ui.add(egui::TextEdit::singleline(&mut module.code).desired_width(120.0));
+        ui.add_sized([200.0, 22.0], egui::TextEdit::singleline(&mut module.code));
         ui.end_row();
         ui.label("Name");
         widgets::text_field(ui, &mut module.name, "Module name");
@@ -391,7 +391,7 @@ fn module_editor(
             }
             for (i, cw) in module.courseworks.iter_mut().enumerate() {
                 ui.push_id(cw.id, |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut cw.title).desired_width(160.0));
+                    ui.add_sized([200.0, 22.0], egui::TextEdit::singleline(&mut cw.title));
                 });
                 ui.push_id((cw.id, "week"), |ui| {
                     ui.horizontal(|ui| {

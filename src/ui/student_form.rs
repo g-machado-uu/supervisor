@@ -17,7 +17,7 @@ impl Role {
     pub fn label(self) -> &'static str {
         match self {
             Role::Fyp => "Project supervision",
-            Role::Phd => "PhD supervision",
+            Role::Phd => "Research supervision",
             Role::Placement => "Placement",
             Role::Advisee => "Studies Advisee",
         }
@@ -67,7 +67,8 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
             theme::chip(ui, format!("{} {}", icons::BOOK_OPEN_TEXT, settings.programme_short(&f.programme)), theme::ACCENT);
         }
         if let Some(p) = &s.phd {
-            theme::chip(ui, format!("{} {}", icons::GRADUATION_CAP, p.degree.label()), theme::PLUM);
+            let ext = if p.external { " External" } else { "" };
+            theme::chip(ui, format!("{} {}{ext}", icons::GRADUATION_CAP, p.degree.label()), theme::PLUM);
         }
         if s.placement.is_some() {
             theme::chip(ui, format!("{} Placement", icons::BUILDINGS), theme::AMBER);
@@ -115,7 +116,7 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
                 if s.fyp.is_none() && ui.button(format!("{} Project supervision", icons::PLUS)).clicked() {
                     s.fyp = Some(FypRecord::default());
                 }
-                if s.phd.is_none() && ui.button(format!("{} PhD", icons::PLUS)).clicked() {
+                if s.phd.is_none() && ui.button(format!("{} Research (PhD / MSc)", icons::PLUS)).clicked() {
                     s.phd = Some(PhdRecord::default());
                 }
                 if s.placement.is_none() && ui.button(format!("{} Placement", icons::PLUS)).clicked() {

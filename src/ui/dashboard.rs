@@ -7,7 +7,7 @@ use chrono::{Datelike, Duration, Local, Months, NaiveDate, Timelike};
 use egui::{Align2, Color32, CornerRadius, FontId, RichText, Sense, Ui};
 use uuid::Uuid;
 
-use crate::model::{self, Attention, Database, Event, EventKind, Severity};
+use crate::model::{self, Attention, Database, Event, EventKind, ResearchGroup, Severity};
 use crate::ui::student_list::Category;
 use crate::ui::{icons, theme, widgets};
 
@@ -98,8 +98,14 @@ fn side_column(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, a
 /// One tile per list, as many per row as fit, stretched to fill the row.
 fn tiles(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, action: &mut DashAction) {
     let lists = db.settings.programme_lists().into_iter().map(Category::Projects);
+    // PhD always; the other research lists once they have students.
+    let research = ResearchGroup::ALL
+        .into_iter()
+        .map(Category::Research)
+        .filter(|c| *c == Category::Research(ResearchGroup::Phd) || c.count(db) > 0);
     let tiles: Vec<Category> = lists
-        .chain([Category::Phd, Category::Placement, Category::Advisee])
+        .chain(research)
+        .chain([Category::Placement, Category::Advisee])
         .collect();
     let width = ui.available_width();
     let fit = ((width + GAP) / (190.0 + GAP)).floor().clamp(1.0, tiles.len() as f32) as usize;
@@ -116,7 +122,7 @@ fn tiles(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, action:
             for cat in row {
                 let (icon, color, caption) = match cat {
                     Category::Projects(list) => (icons::BOOK_OPEN_TEXT, theme::ACCENT, format!("{list} projects")),
-                    Category::Phd => (icons::GRADUATION_CAP, theme::PLUM, "PhD students".into()),
+                    Category::Research(group) => (icons::GRADUATION_CAP, theme::PLUM, format!("{} students", group.label())),
                     Category::Placement => (icons::BUILDINGS, theme::AMBER, "Placements".into()),
                     Category::Advisee => (icons::CHAT_CIRCLE_TEXT, theme::GREEN, "Studies advisees".into()),
                     Category::All => (icons::USERS_THREE, theme::GREY, "All students".into()),
@@ -133,7 +139,7 @@ fn tiles(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, action:
                                     && match cat {
                                         Category::Placement => e.kind == EventKind::Visit,
                                         Category::Advisee => e.kind == EventKind::AdviseeMeeting,
-                                        Category::Phd => e.kind == EventKind::PhdMeeting,
+                                        Category::Research(_) => e.kind == EventKind::PhdMeeting,
                                         _ => e.kind == EventKind::FypMeeting,
                                     }
                             })
@@ -239,7 +245,7 @@ fn upcoming(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, acti
                             ui.label(RichText::new(when).small().color(muted));
                             ui.label(RichText::new(format!("{icon} {}", kind_name(e.kind))).small().color(theme::fg(ui, color)));
                             if e.online {
-                                ui.label(RichText::new(format!("{} Teams", icons::DESKTOP)).small().color(muted));
+                                ui.label(RichText::new(format!("{} {}", icons::DESKTOP, e.platform.label())).small().color(muted));
                             } else if !e.location.is_empty() {
                                 ui.label(RichText::new(format!("{} {}", icons::MAP_PIN, e.location)).small().color(muted));
                             }
@@ -262,7 +268,7 @@ fn kind_name(kind: EventKind) -> &'static str {
         EventKind::FypMeeting => "Project meeting",
         EventKind::Visit => "Placement visit",
         EventKind::AdviseeMeeting => "Advisee meeting",
-        EventKind::PhdMeeting => "PhD",
+        EventKind::PhdMeeting => "Research",
         EventKind::Deadline => "Deadline",
         EventKind::Reminder => "Reminder",
     }
@@ -402,7 +408,7 @@ fn mini_month(ui: &mut Ui, events: &[Event], today: NaiveDate, action: &mut Dash
                 (EventKind::FypMeeting, "Project"),
                 (EventKind::Visit, "Visit"),
                 (EventKind::AdviseeMeeting, "Advisee"),
-                (EventKind::PhdMeeting, "PhD"),
+                (EventKind::PhdMeeting, "Research"),
                 (EventKind::Deadline, "Deadline"),
                 (EventKind::Reminder, "Reminder"),
             ] {

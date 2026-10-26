@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use crate::ics;
 use crate::model::{
-    AdviseeRecord, Attention, CalItem, Database, Event, FypRecord, MeetingChange, PhdRecord, PlacementRecord, Student,
+    AdviseeRecord, Attention, CalItem, Database, Event, FypRecord, MeetingChange, PlacementRecord, ResearchGroup, Student,
 };
 use crate::storage::{self, KeyFile, Vault, VaultError, Written};
 use crate::ui::calendar::{self, CalAction, CalendarState};
@@ -141,6 +141,7 @@ struct NewStudent {
     fyp: bool,
     programme: String,
     phd: bool,
+    research: ResearchGroup,
     placement: bool,
     company: String,
     professional_email: String,
@@ -159,6 +160,7 @@ impl NewStudent {
             fyp: false,
             programme: first,
             phd: false,
+            research: ResearchGroup::Phd,
             placement: false,
             company: String::new(),
             professional_email: String::new(),
@@ -171,7 +173,10 @@ impl NewStudent {
                     n.programme = p.id.clone();
                 }
             }
-            Some(Category::Phd) => n.phd = true,
+            Some(Category::Research(group)) => {
+                n.phd = true;
+                n.research = *group;
+            }
             Some(Category::Placement) => n.placement = true,
             Some(Category::Advisee) => n.advisee = true,
             _ => {}
@@ -188,7 +193,7 @@ impl NewStudent {
             });
         }
         if self.phd {
-            s.phd = Some(PhdRecord::default());
+            s.phd = Some(self.research.new_record());
         }
         if self.placement {
             s.placement = Some(PlacementRecord {
@@ -612,7 +617,11 @@ impl Session {
                     nav(ui, View::List(cat), icons::BOOK_OPEN_TEXT, &list, Some(count));
                 }
                 section(ui, "RESEARCH");
-                nav(ui, View::List(Category::Phd), icons::GRADUATION_CAP, "PhD", Some(Category::Phd.count(&self.db)));
+                for group in ResearchGroup::ALL {
+                    let cat = Category::Research(group);
+                    let count = cat.count(&self.db);
+                    nav(ui, View::List(cat), icons::GRADUATION_CAP, group.label(), Some(count));
+                }
                 section(ui, "OTHER");
                 nav(ui, View::List(Category::Placement), icons::BUILDINGS, "Placement", Some(Category::Placement.count(&self.db)));
                 nav(ui, View::List(Category::Advisee), icons::CHAT_CIRCLE_TEXT, "Studies Advisees", Some(Category::Advisee.count(&self.db)));
@@ -892,7 +901,10 @@ impl Session {
         } else {
             ""
         };
-        let hint = if invite.event.online && !ics::valid_link(&self.db.settings.teams_link) {
+        let no_link = invite.event.online && ics::meeting_link(&invite.event, &self.db.settings).is_none();
+        let hint = if no_link && invite.event.platform == crate::model::Platform::GoogleMeet {
+            "upload it in Outlook, open the event, add the Google Meet link and Send"
+        } else if no_link {
             "upload it in Outlook, open the event, turn on Teams meeting and Send"
         } else {
             "upload it in Outlook, open the event and Send"
@@ -1206,7 +1218,7 @@ impl Session {
                 });
                 ui.add_space(8.0);
                 theme::card_title(ui, "Roles");
-                ui.checkbox(&mut n.fyp, "Project student (FYP / MSc)");
+                ui.checkbox(&mut n.fyp, "Project student (FYP)");
                 if n.fyp {
                     ui.indent("fyp-kind", |ui| {
                         for p in &self.db.settings.programmes {
@@ -1214,7 +1226,14 @@ impl Session {
                         }
                     });
                 }
-                ui.checkbox(&mut n.phd, "PhD student");
+                ui.checkbox(&mut n.phd, "Research student (PhD / MSc)");
+                if n.phd {
+                    ui.indent("research-kind", |ui| {
+                        for group in ResearchGroup::ALL {
+                            ui.radio_value(&mut n.research, group, group.label());
+                        }
+                    });
+                }
                 ui.checkbox(&mut n.placement, "Placement student");
                 if n.placement {
                     ui.indent("placement", |ui| {
@@ -1404,7 +1423,7 @@ mod ui_tests {
                         meetings: vec![
                             meeting(-10, true, "Settling in well."),
                             Meeting {
-                                teams: true,
+                                online: true,
                                 ..meeting(5, false, "Follow-on requested")
                             },
                         ],
@@ -1501,7 +1520,7 @@ mod ui_tests {
                         ..Default::default()
                     }],
                     meetings: vec![Meeting {
-                        teams: true,
+                        online: true,
                         repeat: Some(Repeat {
                             every_weeks: 2,
                             ..Default::default()
@@ -1608,7 +1627,7 @@ mod ui_tests {
             (View::List(Category::Projects("BEng".into())), "04_fyp_beng"),
             (View::List(Category::Placement), "05_placement"),
             (View::List(Category::Advisee), "06_advisees"),
-            (View::List(Category::Phd), "11_phd"),
+            (View::List(Category::Research(ResearchGroup::Phd)), "11_phd"),
             (View::Settings, "07_settings"),
         ] {
             session(&mut h).view = view;
@@ -1653,11 +1672,46 @@ mod ui_tests {
         let priya = id_of(&mut h, "Priya Raman");
         {
             let s = session(&mut h);
-            s.view = View::List(Category::Phd);
+            s.view = View::List(Category::Research(ResearchGroup::Phd));
             s.selected = Some(priya);
         }
         h.run_steps(2);
         shot(&mut h, "12_phd_detail");
+
+        // An external MSc: no standard assessments, its own deadline, a Google Meet.
+        {
+            let s = session(&mut h);
+            let mut p = ResearchGroup::MscExternal.new_record();
+            p.university = "UFERSA".into();
+            p.custom_steps.push(crate::model::CustomStep {
+                title: "Qualifying exam".into(),
+                milestone: crate::model::Milestone {
+                    deadline: Some(today + Days::days(10)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            p.meetings.push(crate::model::Meeting {
+                date: Some(today + Days::days(2)),
+                online: true,
+                platform: crate::model::Platform::GoogleMeet,
+                link: "https://meet.google.com/abc-defg-hij".into(),
+                ..Default::default()
+            });
+            let ana = Student {
+                name: "Ana Souza".into(),
+                phd: Some(p),
+                ..Default::default()
+            };
+            s.selected = Some(ana.id);
+            s.db.students.push(ana);
+            s.view = View::List(Category::Research(ResearchGroup::MscExternal));
+        }
+        h.set_size(egui::vec2(1360.0, 1800.0));
+        h.run_steps(3);
+        shot(&mut h, "13_external_detail");
+        h.set_size(egui::vec2(1360.0, 860.0));
+        h.run_steps(2);
 
         // Dark mode.
         session(&mut h).db.settings.dark_mode = true;

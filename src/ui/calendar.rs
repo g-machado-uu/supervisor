@@ -480,7 +480,7 @@ fn row(ui: &mut Ui, e: &Event, st: &mut CalendarState, now: NaiveDateTime, actio
                 theme::chip(ui, text, theme::GREEN);
             }
             if e.online {
-                ui.label(RichText::new(format!("{} Teams", icons::DESKTOP)).small().color(theme::muted(ui)));
+                ui.label(RichText::new(format!("{} {}", icons::DESKTOP, e.platform.label())).small().color(theme::muted(ui)));
             } else if !e.location.is_empty() {
                 ui.label(
                     RichText::new(format!("{} {}", icons::MAP_PIN, e.location))
@@ -678,7 +678,7 @@ fn day_cell(
                             hover.push_str("\nMoved");
                         }
                         if e.online {
-                            hover.push_str(&format!("\n{} Teams", icons::DESKTOP));
+                            hover.push_str(&format!("\n{} {}", icons::DESKTOP, e.platform.label()));
                         } else if !e.location.is_empty() {
                             hover.push_str(&format!("\n{} {}", icons::MAP_PIN, e.location));
                         }

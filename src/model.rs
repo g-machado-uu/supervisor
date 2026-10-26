@@ -79,6 +79,25 @@ impl VisitMode {
     }
 }
 
+/// Service used for an online meeting.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Platform {
+    #[default]
+    Teams,
+    GoogleMeet,
+}
+
+impl Platform {
+    pub const ALL: [Platform; 2] = [Platform::Teams, Platform::GoogleMeet];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Platform::Teams => "Teams",
+            Platform::GoogleMeet => "Google Meet",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Settings & modules
 // ---------------------------------------------------------------------------
@@ -149,7 +168,7 @@ impl Default for Module {
     }
 }
 
-/// A course whose project students are supervised (BEng, MSc, …).
+/// A course whose project students are supervised (BEng, MEng, …).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Programme {
@@ -200,8 +219,6 @@ pub fn default_programmes() -> Vec<Programme> {
             "MEng",
         ),
         p("Sust", "SUST (MEC526 + MEC528, China)", "SUST", "SUST"),
-        p("MScElectronics", "MSc Electronics", "MSc Elec", "MSc"),
-        p("MScMechatronics", "MSc Mechatronics", "MSc Mech", "MSc"),
     ]
 }
 
@@ -421,7 +438,12 @@ pub struct Meeting {
     pub time: Option<NaiveTime>,
     /// For one-off meetings; repeating ones track this per week.
     pub held: bool,
-    pub teams: bool,
+    /// Online (Teams or Google Meet) rather than in a room; older files call this `teams`.
+    #[serde(alias = "teams")]
+    pub online: bool,
+    pub platform: Platform,
+    /// Meeting link; Teams meetings without one use the link in Settings.
+    pub link: String,
     /// Room or place for in-person meetings.
     pub location: String,
     pub repeat: Option<Repeat>,
@@ -435,7 +457,9 @@ impl Default for Meeting {
             date: None,
             time: None,
             held: false,
-            teams: false,
+            online: false,
+            platform: Platform::Teams,
+            link: String::new(),
             location: String::new(),
             repeat: None,
             notes: String::new(),
@@ -511,9 +535,9 @@ impl Meeting {
         format!("meeting-{}-{}", self.id, planned.format("%Y%m%d"))
     }
 
-    /// Where it happens: empty for Teams meetings, which say so themselves.
+    /// Where it happens: empty for online meetings, which say so themselves.
     pub fn place(&self) -> String {
-        if self.teams {
+        if self.online {
             String::new()
         } else {
             self.location.trim().into()
@@ -749,11 +773,13 @@ pub enum ResearchDegree {
     MPhil,
     ProfDoc,
     MRes,
+    MSc,
 }
 
 impl ResearchDegree {
-    pub const ALL: [ResearchDegree; 4] = [
+    pub const ALL: [ResearchDegree; 5] = [
         ResearchDegree::PhD,
+        ResearchDegree::MSc,
         ResearchDegree::MPhil,
         ResearchDegree::ProfDoc,
         ResearchDegree::MRes,
@@ -765,6 +791,66 @@ impl ResearchDegree {
             ResearchDegree::MPhil => "MPhil",
             ResearchDegree::ProfDoc => "Professional doctorate",
             ResearchDegree::MRes => "MRes",
+            ResearchDegree::MSc => "MSc",
+        }
+    }
+
+    /// For event titles, e.g. "MSc supervision".
+    pub fn short(self) -> &'static str {
+        match self {
+            ResearchDegree::ProfDoc => "Prof Doc",
+            other => other.label(),
+        }
+    }
+
+    /// Master's degrees are listed under MSc, the others under PhD.
+    pub fn masters(self) -> bool {
+        matches!(self, ResearchDegree::MSc | ResearchDegree::MRes)
+    }
+}
+
+/// The research lists in the sidebar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResearchGroup {
+    Phd,
+    PhdExternal,
+    Msc,
+    MscExternal,
+}
+
+impl ResearchGroup {
+    pub const ALL: [ResearchGroup; 4] = [
+        ResearchGroup::Phd,
+        ResearchGroup::PhdExternal,
+        ResearchGroup::Msc,
+        ResearchGroup::MscExternal,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ResearchGroup::Phd => "PhD",
+            ResearchGroup::PhdExternal => "PhD External",
+            ResearchGroup::Msc => "MSc",
+            ResearchGroup::MscExternal => "MSc External",
+        }
+    }
+
+    pub fn external(self) -> bool {
+        matches!(self, ResearchGroup::PhdExternal | ResearchGroup::MscExternal)
+    }
+
+    /// A new record for this list. External students start without the
+    /// university's standard assessments.
+    pub fn new_record(self) -> PhdRecord {
+        let degree = match self {
+            ResearchGroup::Phd | ResearchGroup::PhdExternal => ResearchDegree::PhD,
+            ResearchGroup::Msc | ResearchGroup::MscExternal => ResearchDegree::MSc,
+        };
+        PhdRecord {
+            degree,
+            external: self.external(),
+            skip_standard: self.external(),
+            ..Default::default()
         }
     }
 }
@@ -910,9 +996,85 @@ pub struct Milestone {
 }
 
 impl Milestone {
-    /// The reminder date, `lead_months` before the deadline.
-    pub fn reminder(&self, lead_months: u32) -> Option<NaiveDate> {
-        self.deadline?.checked_sub_months(Months::new(lead_months))
+    /// The reminder date, `lead` before the deadline.
+    pub fn reminder(&self, lead: Lead) -> Option<NaiveDate> {
+        lead.before(self.deadline?)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LeadUnit {
+    Days,
+    #[default]
+    Weeks,
+    Months,
+}
+
+impl LeadUnit {
+    pub const ALL: [LeadUnit; 3] = [LeadUnit::Days, LeadUnit::Weeks, LeadUnit::Months];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LeadUnit::Days => "days",
+            LeadUnit::Weeks => "weeks",
+            LeadUnit::Months => "months",
+        }
+    }
+}
+
+/// How long before a deadline its reminder falls; 0 means no reminder.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(default)]
+pub struct Lead {
+    pub amount: u32,
+    pub unit: LeadUnit,
+}
+
+impl Default for Lead {
+    fn default() -> Self {
+        Self {
+            amount: 2,
+            unit: LeadUnit::Weeks,
+        }
+    }
+}
+
+impl Lead {
+    pub fn months(amount: u32) -> Self {
+        Self {
+            amount,
+            unit: LeadUnit::Months,
+        }
+    }
+
+    pub fn before(self, date: NaiveDate) -> Option<NaiveDate> {
+        match (self.amount, self.unit) {
+            (0, _) => None,
+            (n, LeadUnit::Days) => date.checked_sub_signed(Duration::days(i64::from(n))),
+            (n, LeadUnit::Weeks) => date.checked_sub_signed(Duration::weeks(i64::from(n))),
+            (n, LeadUnit::Months) => date.checked_sub_months(Months::new(n)),
+        }
+    }
+}
+
+/// A deadline added by hand (e.g. from another university), with its own reminder.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct CustomStep {
+    pub id: Uuid,
+    pub title: String,
+    pub milestone: Milestone,
+    pub remind: Lead,
+}
+
+impl Default for CustomStep {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            title: String::new(),
+            milestone: Milestone::default(),
+            remind: Lead::default(),
+        }
     }
 }
 
@@ -925,7 +1087,7 @@ pub struct PhdStep {
     pub label: String,
     pub milestone: Milestone,
     /// How long before the deadline the reminder falls.
-    pub lead_months: u32,
+    pub lead: Lead,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -938,6 +1100,10 @@ pub struct PhdRecord {
     pub status: ResearchStatus,
     pub mode: StudyMode,
     pub degree: ResearchDegree,
+    /// Registered at another university (co-supervised from here).
+    pub external: bool,
+    /// Their university, for external students.
+    pub university: String,
     pub fee_status: FeeStatus,
     pub visa: VisaType,
     /// Name of the visa when `visa` is `Other`.
@@ -966,39 +1132,66 @@ pub struct PhdRecord {
     pub outcome: VivaOutcome,
     pub amendments: Milestone,
     pub awarded_on: Option<NaiveDate>,
+    /// Leave out this university's standard assessments (initial,
+    /// confirmation, annual reports, …), e.g. for external students.
+    pub skip_standard: bool,
+    /// Deadlines added by hand.
+    pub custom_steps: Vec<CustomStep>,
     pub meetings: Vec<Meeting>,
 }
 
 impl PhdRecord {
-    /// Every step with a deadline, in the order of the degree. Reminder lead
-    /// times follow the university system (e.g. 3 months for the initial
-    /// assessment).
+    /// Every step with a deadline, in the order of the degree, then those
+    /// added by hand. Reminder lead times of the standard steps follow the
+    /// university system (e.g. 3 months for the initial assessment).
     pub fn steps(&self) -> Vec<PhdStep> {
         let step = |key: &str, label: &str, milestone: &Milestone, lead_months| PhdStep {
             key: key.into(),
             label: label.into(),
             milestone: milestone.clone(),
-            lead_months,
+            lead: Lead::months(lead_months),
         };
-        let mut steps = vec![
-            step("initial", "Initial assessment", &self.initial, 3),
-            step("confirmation", "Confirmation assessment", &self.confirmation, 4),
-            step("final", "Final assessment", &self.final_assessment, 7),
-        ];
-        for (i, report) in self.annual_reports.iter().enumerate() {
-            let label = match report.deadline {
-                Some(d) => format!("Annual report {}", d.year()),
-                None => format!("Annual report {}", i + 1),
-            };
-            steps.push(step(&format!("annual{}", i + 1), &label, report, 1));
+        let mut steps = Vec::new();
+        if !self.skip_standard {
+            steps.extend([
+                step("initial", "Initial assessment", &self.initial, 3),
+                step("confirmation", "Confirmation assessment", &self.confirmation, 4),
+                step("final", "Final assessment", &self.final_assessment, 7),
+            ]);
+            for (i, report) in self.annual_reports.iter().enumerate() {
+                let label = match report.deadline {
+                    Some(d) => format!("Annual report {}", d.year()),
+                    None => format!("Annual report {}", i + 1),
+                };
+                steps.push(step(&format!("annual{}", i + 1), &label, report, 1));
+            }
+            steps.extend([
+                step("examiners", "Appoint examiners", &self.examiners, 1),
+                step("intention", "Intention to submit", &self.intention, 1),
+                step("submission", "Thesis submission", &self.submission, 1),
+            ]);
         }
-        steps.extend([
-            step("examiners", "Appoint examiners", &self.examiners, 1),
-            step("intention", "Intention to submit", &self.intention, 1),
-            step("submission", "Thesis submission", &self.submission, 1),
-            step("amendments", "Amendments", &self.amendments, 1),
-        ]);
+        steps.push(step("amendments", "Amendments", &self.amendments, 1));
+        steps.extend(self.custom_steps.iter().map(|c| PhdStep {
+            key: format!("custom-{}", c.id),
+            label: match c.title.trim() {
+                "" => "Deadline".into(),
+                title => title.into(),
+            },
+            milestone: c.milestone.clone(),
+            lead: c.remind,
+        }));
         steps
+    }
+
+    /// Which research list the student is shown in.
+    pub fn group(&self) -> ResearchGroup {
+        match (self.degree.masters(), self.external) {
+            (false, false) => ResearchGroup::Phd,
+            (false, true) => ResearchGroup::PhdExternal,
+            (true, false) => ResearchGroup::Msc,
+            (true, true) => ResearchGroup::MscExternal,
+        }
     }
 
     /// Year of study (1-based) on `date`, counted from the start.
@@ -1021,6 +1214,11 @@ impl PhdRecord {
             "intention" => Some(&mut self.intention),
             "submission" => Some(&mut self.submission),
             "amendments" => Some(&mut self.amendments),
+            _ if key.starts_with("custom-") => self
+                .custom_steps
+                .iter_mut()
+                .find(|c| format!("custom-{}", c.id) == key)
+                .map(|c| &mut c.milestone),
             _ => {
                 let n: usize = key.strip_prefix("annual")?.parse().ok()?;
                 self.annual_reports.get_mut(n.checked_sub(1)?)
@@ -1168,8 +1366,12 @@ pub struct Event {
     pub kind: EventKind,
     pub title: String,
     pub done: bool,
-    /// A Teams meeting or an online visit.
+    /// An online meeting or visit.
     pub online: bool,
+    /// Service of an online item (online visits use Teams).
+    pub platform: Platform,
+    /// The meeting's own link, if it has one.
+    pub link: String,
     /// Room or company for in-person items; empty otherwise.
     pub location: String,
     /// For a week of a repeating meeting: the series UID and its planned date.
@@ -1261,7 +1463,9 @@ fn push_meeting(
             kind,
             title: title.clone(),
             done: occ.held,
-            online: m.teams,
+            online: m.online,
+            platform: m.platform,
+            link: m.link.trim().into(),
             location: m.place(),
             series,
             cancelled: occ.cancelled,
@@ -1368,6 +1572,8 @@ impl Database {
                             title: format!("{} {} due – {name}", module.code, cw.title),
                             done: status.is_some_and(|st| st.submitted),
                             online: false,
+                            platform: Platform::Teams,
+                            link: String::new(),
                             location: String::new(),
                             series: None,
                             cancelled: false,
@@ -1393,6 +1599,8 @@ impl Database {
                         ),
                         done: v.completed,
                         online: v.mode == VisitMode::Online,
+                        platform: Platform::Teams,
+                        link: String::new(),
                         location: match v.mode {
                             VisitMode::Online => String::new(),
                             VisitMode::FaceToFace => p.company.trim().into(),
@@ -1424,6 +1632,7 @@ impl Database {
     }
 
     fn phd_events(&self, s: &Student, p: &PhdRecord, name: &str, out: &mut Vec<Event>) {
+        let degree = p.degree.short();
         for m in &p.meetings {
             push_meeting(
                 out,
@@ -1431,7 +1640,7 @@ impl Database {
                 s,
                 m,
                 EventKind::PhdMeeting,
-                format!("PhD supervision – {name}"),
+                format!("{degree} supervision – {name}"),
             );
         }
         if let Some(date) = p.viva {
@@ -1442,9 +1651,11 @@ impl Database {
                 date,
                 time: p.viva_time,
                 kind: EventKind::PhdMeeting,
-                title: format!("PhD viva – {name}"),
+                title: format!("{degree} viva – {name}"),
                 done: p.outcome != VivaOutcome::Pending,
                 online: false,
+                platform: Platform::Teams,
+                link: String::new(),
                 location: location.into(),
                 series: None,
                 cancelled: false,
@@ -1467,6 +1678,8 @@ impl Database {
                 title,
                 done: step.milestone.done,
                 online: false,
+                platform: Platform::Teams,
+                link: String::new(),
                 location: String::new(),
                 series: None,
                 cancelled: false,
@@ -1475,14 +1688,14 @@ impl Database {
                 format!("phd-{}-{}", step.key, s.id),
                 due,
                 EventKind::Deadline,
-                format!("PhD {what} due – {name}"),
+                format!("{degree} {what} due – {name}"),
             ));
-            if let Some(remind) = step.milestone.reminder(step.lead_months) {
+            if let Some(remind) = step.milestone.reminder(step.lead) {
                 out.push(event(
                     format!("phd-{}-reminder-{}", step.key, s.id),
                     remind,
                     EventKind::Reminder,
-                    format!("Reminder: PhD {what} due {} – {name}", due.format("%d %b %Y")),
+                    format!("Reminder: {degree} {what} due {} – {name}", due.format("%d %b %Y")),
                 ));
             }
         }
@@ -1673,11 +1886,11 @@ impl Database {
                     };
                     if due < today {
                         push(s, Severity::Overdue, format!("{} overdue (due {due})", step.label));
-                    } else if m.reminder(step.lead_months).is_some_and(|r| r <= today) {
+                    } else if m.reminder(step.lead).is_some_and(|r| r <= today) {
                         push(s, Severity::Pending, format!("{} due {due}", step.label));
                     }
                 }
-                if let Some(end) = p.visa_end {
+                if let Some(end) = p.visa_end.filter(|_| !p.external) {
                     if end < today {
                         push(s, Severity::Overdue, format!("visa ended {end}"));
                     } else if end <= today + Duration::days(VISA_WARNING_DAYS) {
@@ -1742,8 +1955,7 @@ mod tests {
         assert_eq!(codes("Sust"), ["MEC526", "MEC528"]);
         assert_eq!(codes("MEng"), ["EEE840"]);
         assert_eq!(codes("MEngGermany"), ["EEE802"]);
-        assert!(codes("MScElectronics").is_empty());
-        assert_eq!(s.programme_lists(), ["BEng", "MEng", "SUST", "MSc"]);
+        assert_eq!(s.programme_lists(), ["BEng", "MEng", "SUST"]);
     }
 
     #[test]
@@ -1970,7 +2182,7 @@ mod tests {
         let mut db = Database::default();
         let meeting = Meeting {
             date: Some(d(2026, 10, 30)),
-            teams: true,
+            online: true,
             location: "MG.201".into(),
             ..Default::default()
         };
@@ -2011,7 +2223,7 @@ mod tests {
 
         assert!(db.invite(id, "meeting-unknown").is_none());
 
-        db.students[0].fyp.as_mut().unwrap().meetings[0].teams = false;
+        db.students[0].fyp.as_mut().unwrap().meetings[0].online = false;
         assert_eq!(
             db.invite(id, &meeting.uid()).unwrap().event.location,
             "MG.201"
@@ -2065,7 +2277,7 @@ mod tests {
         let reminders: Vec<(String, Option<NaiveDate>)> = p
             .steps()
             .iter()
-            .map(|s| (s.label.clone(), s.milestone.reminder(s.lead_months)))
+            .map(|s| (s.label.clone(), s.milestone.reminder(s.lead)))
             .collect();
         assert_eq!(
             reminders,
@@ -2149,5 +2361,77 @@ mod tests {
         assert!(db.students[0].phd.is_none());
         let p: PhdRecord = serde_json::from_str("{}").unwrap();
         assert_eq!(p, PhdRecord::default());
+    }
+
+    #[test]
+    fn older_teams_meetings_load_as_online() {
+        let m: Meeting = serde_json::from_str(r#"{"teams":true}"#).unwrap();
+        assert!(m.online);
+        assert_eq!(m.platform, Platform::Teams);
+    }
+
+    #[test]
+    fn external_students_start_blank_with_their_own_deadlines() {
+        let mut p = ResearchGroup::MscExternal.new_record();
+        assert_eq!((p.degree, p.external, p.group()), (ResearchDegree::MSc, true, ResearchGroup::MscExternal));
+        let keys = |p: &PhdRecord| p.steps().into_iter().map(|s| s.key).collect::<Vec<_>>();
+        assert_eq!(keys(&p), ["amendments"], "no standard assessments");
+        assert_eq!(ResearchGroup::Phd.new_record().group(), ResearchGroup::Phd);
+        assert!(keys(&ResearchGroup::Phd.new_record()).contains(&"initial".to_string()));
+
+        let exam = CustomStep {
+            title: "Qualifying exam".into(),
+            milestone: Milestone {
+                deadline: Some(d(2027, 4, 30)),
+                ..Default::default()
+            },
+            remind: Lead { amount: 10, unit: LeadUnit::Days },
+            ..Default::default()
+        };
+        let key = format!("custom-{}", exam.id);
+        p.custom_steps.push(exam);
+        let mut db = Database {
+            students: vec![Student {
+                name: "Ana".into(),
+                phd: Some(p),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let events = db.events();
+        let titles: Vec<_> = events.iter().map(|e| (e.date, e.title.as_str())).collect();
+        assert_eq!(
+            titles,
+            [
+                (d(2027, 4, 20), "Reminder: MSc qualifying exam due 30 Apr 2027 – Ana"),
+                (d(2027, 4, 30), "MSc qualifying exam due – Ana"),
+            ]
+        );
+        assert!(db.attention(d(2027, 4, 19)).is_empty());
+        assert_eq!(db.attention(d(2027, 4, 20)).len(), 1);
+
+        // Completed through the step key, like the standard steps.
+        db.students[0].phd.as_mut().unwrap().milestone_mut(&key).unwrap().done = true;
+        assert!(db.attention(d(2027, 5, 1)).is_empty());
+
+        // No reminder when the lead is 0.
+        assert_eq!(Lead { amount: 0, unit: LeadUnit::Weeks }.before(d(2027, 4, 30)), None);
+        assert_eq!(Lead::months(1).before(d(2027, 3, 31)), Some(d(2027, 2, 28)));
+    }
+
+    #[test]
+    fn external_students_have_no_visa_warnings() {
+        let mut p = example_phd();
+        p.visa_end = Some(d(2026, 12, 1));
+        p.external = true;
+        p.skip_standard = true;
+        let db = Database {
+            students: vec![Student {
+                phd: Some(p),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(db.attention(d(2026, 11, 20)).is_empty());
     }
 }
