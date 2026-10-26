@@ -562,6 +562,15 @@ impl Meeting {
         out
     }
 
+    /// The week planned for `planned`, with any changes made to it.
+    pub fn occurrence(&self, planned: NaiveDate) -> Occurrence {
+        self.repeat
+            .as_ref()
+            .and_then(|r| r.exceptions.iter().find(|o| o.planned == planned))
+            .cloned()
+            .unwrap_or_else(|| Occurrence::planned(planned))
+    }
+
     /// Store a week's changes; a week back to plain is forgotten.
     pub fn set_occurrence(&mut self, occurrence: Occurrence) {
         if let Some(repeat) = &mut self.repeat {
@@ -1074,6 +1083,16 @@ impl Student {
         fyp.chain(advisee).chain(phd)
     }
 
+    pub fn meetings_mut(&mut self) -> impl Iterator<Item = &mut Meeting> {
+        let fyp = self.fyp.iter_mut().flat_map(|f| &mut f.meetings);
+        let advisee = self
+            .advisee
+            .iter_mut()
+            .flat_map(|a| a.s1.meetings.iter_mut().chain(&mut a.s2.meetings));
+        let phd = self.phd.iter_mut().flat_map(|p| &mut p.meetings);
+        fyp.chain(advisee).chain(phd)
+    }
+
     pub fn display_name(&self) -> String {
         match (self.name.is_empty(), self.b_number.is_empty()) {
             (false, false) => format!("{} ({})", self.name, self.b_number),
@@ -1165,6 +1184,21 @@ impl Event {
             .as_ref()
             .is_some_and(|(_, planned)| *planned != self.date)
     }
+
+    /// The id of the meeting this is (a week of), if it is a meeting.
+    pub fn meeting_id(&self) -> Option<Uuid> {
+        let rest = self.uid.strip_prefix("meeting-")?;
+        Uuid::parse_str(rest.get(..36)?).ok()
+    }
+}
+
+/// A change the calendar can make to a meeting, or to one week of a
+/// repeating meeting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MeetingChange {
+    Held(bool),
+    /// Move it to this day and time.
+    Postpone(NaiveDate, Option<NaiveTime>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1251,6 +1285,39 @@ impl Database {
 
     pub fn student_mut(&mut self, id: Uuid) -> Option<&mut Student> {
         self.students.iter_mut().find(|s| s.id == id)
+    }
+
+    /// Apply `change` to the meeting behind `event`, or to that week of a
+    /// repeating meeting. Returns false if `event` isn't a meeting.
+    pub fn change_meeting(&mut self, event: &Event, change: MeetingChange) -> bool {
+        let Some(id) = event.meeting_id() else { return false };
+        let Some(m) = self
+            .student_mut(event.student_id)
+            .and_then(|s| s.meetings_mut().find(|m| m.id == id))
+        else {
+            return false;
+        };
+        match &event.series {
+            None => match change {
+                MeetingChange::Held(held) => m.held = held,
+                MeetingChange::Postpone(date, time) => {
+                    m.date = Some(date);
+                    m.time = time;
+                }
+            },
+            Some((_, planned)) => {
+                let mut week = m.occurrence(*planned);
+                match change {
+                    MeetingChange::Held(held) => week.held = held,
+                    MeetingChange::Postpone(date, time) => {
+                        week.moved_to = Some(date);
+                        week.time = time;
+                    }
+                }
+                m.set_occurrence(week);
+            }
+        }
+        true
     }
 
     pub fn b_number_taken(&self, b_number: &str, except: Option<Uuid>) -> bool {
@@ -1720,6 +1787,64 @@ mod tests {
             Settings::default_teaching_end(d(2026, 9, 23)),
             d(2026, 12, 11)
         );
+    }
+
+    #[test]
+    fn calendar_marks_meetings_held_and_postpones_them() {
+        let one_off = Meeting {
+            date: Some(d(2026, 10, 5)),
+            time: NaiveTime::from_hms_opt(14, 0, 0),
+            ..Default::default()
+        };
+        let weekly = Meeting {
+            date: Some(d(2026, 10, 6)),
+            repeat: Some(Repeat {
+                until: Some(d(2026, 11, 3)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut db = Database::default();
+        db.students.push(Student {
+            advisee: Some(AdviseeRecord {
+                s1: SemesterContact {
+                    meetings: vec![one_off.clone(), weekly.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            phd: Some(PhdRecord {
+                viva: Some(d(2026, 10, 7)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let find = |db: &Database, uid: &str| db.events().into_iter().find(|e| e.uid == uid).unwrap();
+
+        let e = find(&db, &one_off.uid());
+        assert_eq!(e.meeting_id(), Some(one_off.id));
+        assert!(db.change_meeting(&e, MeetingChange::Held(true)));
+        assert!(find(&db, &one_off.uid()).done);
+        let later = NaiveTime::from_hms_opt(15, 30, 0);
+        assert!(db.change_meeting(&e, MeetingChange::Postpone(d(2026, 10, 9), later)));
+        let moved = find(&db, &one_off.uid());
+        assert_eq!((moved.date, moved.time), (d(2026, 10, 9), later));
+
+        // One week of a repeating meeting: only that week changes.
+        let week = find(&db, &weekly.occurrence_uid(d(2026, 10, 13)));
+        assert!(db.change_meeting(&week, MeetingChange::Held(true)));
+        assert!(db.change_meeting(&week, MeetingChange::Postpone(d(2026, 10, 15), None)));
+        let week = find(&db, &weekly.occurrence_uid(d(2026, 10, 13)));
+        assert!(week.done && week.moved());
+        assert_eq!(week.date, d(2026, 10, 15));
+        assert!(!find(&db, &weekly.occurrence_uid(d(2026, 10, 20))).done);
+        assert!(db.change_meeting(&week, MeetingChange::Held(false)));
+        assert!(!find(&db, &weekly.occurrence_uid(d(2026, 10, 13))).done);
+
+        // Not meetings.
+        let viva = find(&db, &format!("phd-viva-{}", db.students[0].id));
+        assert_eq!(viva.meeting_id(), None);
+        assert!(!db.change_meeting(&viva, MeetingChange::Held(true)));
     }
 
     #[test]

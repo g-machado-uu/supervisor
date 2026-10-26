@@ -11,7 +11,9 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::ics;
-use crate::model::{AdviseeRecord, Attention, CalItem, Database, Event, FypRecord, PhdRecord, PlacementRecord, Student};
+use crate::model::{
+    AdviseeRecord, Attention, CalItem, Database, Event, FypRecord, MeetingChange, PhdRecord, PlacementRecord, Student,
+};
 use crate::storage::{self, KeyFile, Vault, VaultError, Written};
 use crate::ui::calendar::{self, CalAction, CalendarState};
 use crate::ui::dashboard::{self, DashAction};
@@ -726,6 +728,16 @@ impl Session {
                     CalAction::None => {}
                     CalAction::Open(id) => self.selected = Some(id),
                     CalAction::Export(uids) => self.export_selected(ui, &uids),
+                    CalAction::Change(event, change) => {
+                        if self.db.change_meeting(&event, change) {
+                            let done = match change {
+                                MeetingChange::Held(true) => "Marked as held".to_string(),
+                                MeetingChange::Held(false) => "Marked as not held".to_string(),
+                                MeetingChange::Postpone(date, _) => format!("Moved to {}", date.format("%a %d %b")),
+                            };
+                            self.notify(ui, done);
+                        }
+                    }
                 }
             }
             View::List(cat) => {
@@ -1859,5 +1871,81 @@ mod ui_tests {
         }
         wait_until(&mut h, "autosaved", all_saved);
         assert_eq!(name_in(&bak), "Later");
+    }
+
+    #[test]
+    fn calendar_marks_past_meetings_held_and_postpones_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let today = crate::ui::widgets::today();
+        let student = |name: &str, days: i64, hour: u32| Student {
+            name: name.into(),
+            fyp: Some(FypRecord {
+                programme: "BEng".into(),
+                meetings: vec![Meeting {
+                    date: Some(today + Days::days(days)),
+                    time: NaiveTime::from_hms_opt(hour, 0, 0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        {
+            let s = session(&mut h);
+            s.db.students.extend([student("Past Student", -2, 10), student("Late Student", -1, 9), student("Future Student", 3, 10)]);
+            s.view = View::Calendar;
+            s.calendar.range = crate::ui::calendar::Range::All;
+        }
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        let meeting = |h: &mut Harness<'_, SupervisorApp>, name: &str| {
+            let s = session(h);
+            s.db.students.iter().find(|s| s.name == name).unwrap().fyp.as_ref().unwrap().meetings[0].clone()
+        };
+
+        // Only meetings whose time has come offer Held and Postpone.
+        let held = format!("{} Held", icons::CHECK);
+        assert_eq!(h.get_all_by_label(&held).count(), 2);
+        shot(&mut h, "13_calendar_past_meetings");
+        h.get_all_by_label(&held).next().unwrap().click();
+        h.run_steps(2);
+        assert!(meeting(&mut h, "Past Student").held);
+        assert!(h.query_by_label("Marked as held").is_some());
+        assert_eq!(h.get_all_by_label(&held).count(), 1);
+
+        // Postpone, picking the day in the date picker inside the dialog.
+        h.get_by_label("Postpone…").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Postpone meeting").is_some());
+        let suggested = today - Days::days(1) + Days::days(7);
+        h.get_by_label_contains(&suggested.format("%a %d %b %Y").to_string()).click();
+        h.run_steps(2);
+        shot(&mut h, "14_postpone_dialog");
+        h.get_by_label(">").click();
+        h.run_steps(1);
+        h.get_by_label("Save").click();
+        h.run_steps(1);
+        h.get_by_label("Postpone").click();
+        h.run_steps(2);
+        let late = meeting(&mut h, "Late Student");
+        assert_eq!(late.date, Some(suggested + Days::days(1)));
+        assert_eq!(late.time, NaiveTime::from_hms_opt(9, 0, 0));
+        assert!(h.query_by_label("Postpone meeting").is_none());
+
+        // Month grid: right-click a past meeting to undo "held".
+        {
+            let s = session(&mut h);
+            s.calendar.layout = crate::ui::calendar::Layout::Month;
+            s.calendar.month = (today - Days::days(2)).with_day(1).unwrap();
+        }
+        h.run_steps(2);
+        h.get_by_label_contains("Past Student").click_secondary();
+        h.run_steps(2);
+        shot(&mut h, "15_month_meeting_menu");
+        h.get_by_label(&format!("{} Mark as not held", icons::X)).click();
+        h.run_steps(2);
+        assert!(!meeting(&mut h, "Past Student").held);
     }
 }

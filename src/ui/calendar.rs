@@ -3,11 +3,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use chrono::{Datelike, Duration, Months, NaiveDate};
+use chrono::{Datelike, Duration, Local, Months, NaiveDate, NaiveDateTime, NaiveTime};
 use egui::{RichText, Ui};
 use uuid::Uuid;
 
-use crate::model::{Database, Event, EventKind, Semester};
+use crate::model::{Database, Event, EventKind, MeetingChange, Semester};
 use crate::ui::{icons, theme, widgets};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,26 @@ pub struct CalendarState {
     week_heights: HashMap<NaiveDate, f32>,
     /// What those heights were measured for.
     heights_for: Option<ListKey>,
+    /// The "Postpone meeting" dialog, while open.
+    postpone: Option<Postpone>,
+}
+
+/// A meeting (or one week of a repeating one) being postponed, and to when.
+struct Postpone {
+    event: Event,
+    date: Option<NaiveDate>,
+    time: Option<NaiveTime>,
+}
+
+impl Postpone {
+    /// Suggests a week after it was planned, and not before tomorrow.
+    fn new(event: &Event, today: NaiveDate) -> Self {
+        Self {
+            date: Some((event.date + Duration::days(7)).max(today + Duration::days(1))),
+            time: event.time,
+            event: event.clone(),
+        }
+    }
 }
 
 /// The list's range, the kinds shown, the width, and the events (a new
@@ -62,6 +82,7 @@ impl Default for CalendarState {
             as_series: true,
             week_heights: HashMap::new(),
             heights_for: None,
+            postpone: None,
         }
     }
 }
@@ -71,6 +92,13 @@ pub enum CalAction {
     Open(Uuid),
     /// Export these event UIDs.
     Export(HashSet<String>),
+    /// Mark a meeting held or not, or postpone it.
+    Change(Event, MeetingChange),
+}
+
+/// A meeting whose time has come, so it can be marked held or postponed.
+fn started(e: &Event, now: NaiveDateTime) -> bool {
+    !e.cancelled && e.meeting_id().is_some() && e.date.and_time(e.time.unwrap_or(NaiveTime::MIN)) <= now
 }
 
 fn first_of_month(date: NaiveDate) -> NaiveDate {
@@ -113,7 +141,8 @@ pub fn show(
     with_guests: &mut bool,
 ) -> CalAction {
     let mut action = CalAction::None;
-    let today = widgets::today();
+    let now = Local::now().naive_local();
+    let today = now.date();
     // Forget selections of items that no longer exist (or were cancelled).
     let exists: HashSet<&str> = all
         .iter()
@@ -216,11 +245,80 @@ pub fn show(
                 st.heights_for = Some(key);
                 st.week_heights.clear();
             }
-            list(ui, db, st, &events, today, &mut action);
+            list(ui, db, st, &events, now, &mut action);
         }
-        Layout::Month => month(ui, db, st, &events, today, &mut action),
+        Layout::Month => month(ui, db, st, &events, now, &mut action),
     }
+    postpone_dialog(ui, st, &mut action);
     action
+}
+
+/// Right-click menu of a meeting whose time has come.
+fn meeting_menu(ui: &mut Ui, e: &Event, st: &mut CalendarState, today: NaiveDate, action: &mut CalAction) {
+    if e.done {
+        if ui.button(format!("{} Mark as not held", icons::X)).clicked() {
+            *action = CalAction::Change(e.clone(), MeetingChange::Held(false));
+            ui.close();
+        }
+    } else {
+        if ui.button(format!("{} Mark as held", icons::CHECK)).clicked() {
+            *action = CalAction::Change(e.clone(), MeetingChange::Held(true));
+            ui.close();
+        }
+        if ui.button(format!("{} Postpone…", icons::CALENDAR_BLANK)).clicked() {
+            st.postpone = Some(Postpone::new(e, today));
+            ui.close();
+        }
+    }
+    if ui.button(format!("{} Open student", icons::STUDENT)).clicked() {
+        *action = CalAction::Open(e.student_id);
+        ui.close();
+    }
+}
+
+/// Asks for the new day and time of the meeting being postponed.
+fn postpone_dialog(ui: &mut Ui, st: &mut CalendarState, action: &mut CalAction) {
+    let Some(p) = &mut st.postpone else { return };
+    let mut postpone = false;
+    let mut cancel = false;
+    let resp = egui::Modal::new(egui::Id::unique("postpone-meeting")).frame(theme::modal_frame(ui)).show(ui.ctx(), |ui| {
+        ui.set_width(440.0);
+        ui.horizontal(|ui| {
+            theme::icon_badge(ui, icons::CALENDAR_BLANK, theme::ACCENT, 40.0);
+            ui.label(theme::serif("Postpone meeting", 22.0));
+        });
+        ui.add_space(4.0);
+        ui.label(&p.event.title);
+        let planned = match p.event.time {
+            Some(t) => format!("{} at {}", p.event.date.format("%a %d %b %Y"), t.format("%H:%M")),
+            None => p.event.date.format("%a %d %b %Y").to_string(),
+        };
+        ui.label(RichText::new(format!("Was planned for {planned}")).small().color(theme::muted(ui)));
+        ui.add_space(8.0);
+        widgets::form_grid(ui, "postpone-grid", |ui| {
+            ui.label("New date");
+            widgets::opt_date(ui, "date", &mut p.date);
+            ui.end_row();
+            ui.label("Time");
+            widgets::opt_time(ui, "time", &mut p.time);
+            ui.end_row();
+        });
+        ui.add_space(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.add_enabled(p.date.is_some(), theme::primary_button("Postpone")).clicked() {
+                postpone = true;
+            }
+            if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 34.0))).clicked() {
+                cancel = true;
+            }
+        });
+    });
+    if postpone && let Some(date) = p.date {
+        *action = CalAction::Change(p.event.clone(), MeetingChange::Postpone(date, p.time));
+        st.postpone = None;
+    } else if cancel || resp.should_close() {
+        st.postpone = None;
+    }
 }
 
 fn list(
@@ -228,9 +326,10 @@ fn list(
     db: &Database,
     st: &mut CalendarState,
     events: &[&Event],
-    today: NaiveDate,
+    now: NaiveDateTime,
     action: &mut CalAction,
 ) {
+    let today = now.date();
     if events.is_empty() {
         theme::card(ui, "", |ui| {
             ui.vertical_centered(|ui| {
@@ -307,9 +406,7 @@ fn list(
                 });
                 ui.add_space(2.0);
                 for e in items {
-                    if row(ui, e, st) {
-                        *action = CalAction::Open(e.student_id);
-                    }
+                    row(ui, e, st, now, action);
                 }
                 });
                 st.week_heights.insert(monday, card.response.rect.height());
@@ -323,9 +420,10 @@ fn teaching_week_of(db: &Database, monday: NaiveDate) -> Option<(Semester, i64)>
     (0..5).find_map(|d| db.settings.teaching_week(monday + Duration::days(d)))
 }
 
-/// One item; returns true when its title was clicked.
-fn row(ui: &mut Ui, e: &Event, st: &mut CalendarState) -> bool {
-    let mut open = false;
+/// One item. Clicking its title opens the student; a meeting whose time has
+/// come can be marked held or postponed.
+fn row(ui: &mut Ui, e: &Event, st: &mut CalendarState, now: NaiveDateTime, action: &mut CalAction) {
+    let started = started(e, now);
     ui.push_id(&e.uid, |ui| {
         ui.horizontal_wrapped(|ui| {
             let mut on = st.selected.contains(&e.uid);
@@ -354,13 +452,15 @@ fn row(ui: &mut Ui, e: &Event, st: &mut CalendarState) -> bool {
             } else if e.done {
                 title = title.color(theme::muted(ui));
             }
-            if ui
+            let title = ui
                 .add(egui::Label::new(title).sense(egui::Sense::click()))
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Open student")
-                .clicked()
-            {
-                open = true;
+                .on_hover_text("Open student");
+            if title.clicked() {
+                *action = CalAction::Open(e.student_id);
+            }
+            if started {
+                title.context_menu(|ui| meeting_menu(ui, e, st, now.date(), action));
             }
             if e.series.is_some() {
                 ui.label(RichText::new(icons::REPEAT).color(theme::muted(ui)))
@@ -388,9 +488,24 @@ fn row(ui: &mut Ui, e: &Event, st: &mut CalendarState) -> bool {
                         .color(theme::muted(ui)),
                 );
             }
+            if started && !e.done {
+                if ui
+                    .small_button(format!("{} Held", icons::CHECK))
+                    .on_hover_text("Mark this meeting as held")
+                    .clicked()
+                {
+                    *action = CalAction::Change(e.clone(), MeetingChange::Held(true));
+                }
+                if ui
+                    .small_button("Postpone…")
+                    .on_hover_text("Move this meeting to another day")
+                    .clicked()
+                {
+                    st.postpone = Some(Postpone::new(e, now.date()));
+                }
+            }
         });
     });
-    open
 }
 
 /// Short text for a month cell: the student, or the coursework for deadlines.
@@ -420,7 +535,7 @@ fn month(
     db: &Database,
     st: &mut CalendarState,
     events: &[&Event],
-    today: NaiveDate,
+    now: NaiveDateTime,
     action: &mut CalAction,
 ) {
     let mut by_day: BTreeMap<NaiveDate, Vec<&Event>> = BTreeMap::new();
@@ -435,7 +550,10 @@ fn month(
     let col = ((ui.available_width() - week_col - gap * 8.0 - 16.0) / 7.0).max(90.0);
 
     ui.label(
-        RichText::new("Click an item to select it, double-click to open the student.")
+        RichText::new(
+            "Click an item to select it, double-click to open the student. \
+             Right-click a past meeting to mark it held or postpone it.",
+        )
             .small()
             .color(theme::muted(ui)),
     );
@@ -479,11 +597,7 @@ fn month(
                     for d in 0..7 {
                         let date = monday + Duration::days(d);
                         let items = by_day.get(&date).map_or(&[][..], Vec::as_slice);
-                        if let Some(student) =
-                            day_cell(ui, db, st, date, items, today, egui::vec2(col, height))
-                        {
-                            *action = CalAction::Open(student);
-                        }
+                        day_cell(ui, db, st, date, items, now, egui::vec2(col, height), action);
                     }
                 });
                 monday += Duration::days(7);
@@ -491,17 +605,19 @@ fn month(
         });
 }
 
-/// One day of the month grid. Returns the student of a double-clicked item.
+/// One day of the month grid. Double-clicking an item opens its student.
+#[allow(clippy::too_many_arguments)]
 fn day_cell(
     ui: &mut Ui,
     db: &Database,
     st: &mut CalendarState,
     date: NaiveDate,
     items: &[&Event],
-    today: NaiveDate,
+    now: NaiveDateTime,
     size: egui::Vec2,
-) -> Option<Uuid> {
-    let mut open = None;
+    action: &mut CalAction,
+) {
+    let today = now.date();
     let in_month = date.month() == st.month.month();
     let fill = if in_month {
         ui.visuals().window_fill
@@ -566,6 +682,10 @@ fn day_cell(
                         } else if !e.location.is_empty() {
                             hover.push_str(&format!("\n{} {}", icons::MAP_PIN, e.location));
                         }
+                        let started = started(e, now);
+                        if started && !e.done {
+                            hover.push_str("\nRight-click to mark it held or postpone it");
+                        }
                         let pill = egui::Button::new(text)
                             .truncate()
                             .min_size(egui::vec2(ui.available_width(), 0.0))
@@ -597,11 +717,13 @@ fn day_cell(
                             }
                         }
                         if resp.double_clicked() {
-                            open = Some(e.student_id);
+                            *action = CalAction::Open(e.student_id);
+                        }
+                        if started {
+                            resp.context_menu(|ui| meeting_menu(ui, e, st, today, action));
                         }
                     });
                 }
             });
         });
-    open
 }
