@@ -12,7 +12,7 @@ A desktop app for keeping track of the students you supervise: final-year and MS
 - **Coursework deadlines** are worked out from the teaching weeks you set in Settings.
 - **PhD students**: assessments, annual reports, submission and viva. Type in the deadlines from the university system and the app reminds you in time.
 - **Placement visits**: requests, replies and whether the line manager is coming.
-- **Calendar** as a list or a month grid. Export any items to an `.ics` file for Outlook or Google Calendar, or save an invite file for one meeting to send to the student.
+- **Calendar** as a list or a month grid. Once a meeting's time has passed, mark it as held or postpone it right there (in the month grid, right-click it). Export any items to an `.ics` file for Outlook or Google Calendar, or save an invite file for one meeting to send to the student.
 
 ![Student details](docs/screenshots/student.png)
 
