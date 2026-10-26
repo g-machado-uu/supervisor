@@ -331,5 +331,7 @@ fn brand(ui: &mut egui::Ui, align: Align) {
         ui.add_space(6.0);
         ui.label(theme::serif("Supervisor", 40.0));
         ui.label(RichText::new("Projects · Placements · Studies Advisees").color(theme::muted(ui)));
+        ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(theme::muted(ui)));
+
     });
 }
