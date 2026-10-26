@@ -4,6 +4,8 @@
 mod app;
 mod ics;
 mod model;
+#[cfg(test)]
+mod perf_tests;
 mod storage;
 mod ui;
 
