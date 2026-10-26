@@ -433,6 +433,12 @@ impl Vault {
         }
     }
 
+    /// Make the file as it is now the next `.bak`: the next save backs it
+    /// up first, as the first save after unlocking does.
+    pub fn mark_restore_point(&mut self) {
+        self.backed_up = false;
+    }
+
     /// Record a save finished by a [`Writer`].
     pub fn saved(&mut self, written: Written) {
         self.on_disk = Some(written.on_disk);

@@ -19,6 +19,7 @@ A desktop app for keeping track of the students you supervise: final-year and MS
 ## Your data
 
 - Everything is in **one encrypted file**, protected by your password. It saves automatically and keeps a backup of the file as it was when you unlocked it (`.bak`).
+- **Save** (click *Saved* at the bottom of the sidebar, or `Ctrl+S`) saves straight away without locking. The backup then keeps that version, so you can go back to it if later changes go wrong.
 - **There is no password recovery.** Remember the password and keep a backup of the file.
 - New passwords need **at least 12 characters**. A short sentence you'll remember works well.
 - Default location:

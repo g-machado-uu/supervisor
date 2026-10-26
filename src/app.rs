@@ -251,6 +251,9 @@ struct Session {
     derived: Option<Derived>,
     /// A save running in the background, and the `db_print` it started from.
     saving: Option<(Receiver<anyhow::Result<Written>>, [u8; 32])>,
+    /// Save was clicked: save without waiting for a pause in typing, then
+    /// make what is saved the restore point.
+    save_requested: bool,
     last_active: Instant,
     leaving: Option<Leave>,
     /// Lock or quit even though the latest changes aren't saved.
@@ -267,6 +270,7 @@ impl Session {
             db_print: storage::fingerprint(&db),
             derived: None,
             saving: None,
+            save_requested: false,
             vault,
             db,
             view: View::Dashboard,
@@ -333,16 +337,44 @@ impl Session {
                 // Edits made while it was saving stay pending for the next save.
                 if self.db_print == started_from {
                     self.saved(Ok(()));
+                    if self.save_requested {
+                        self.mark_restore_point(now);
+                    }
                 }
             }
             Err(e) => {
                 self.saved(Err(e));
-                if matches!(self.status, SaveStatus::Error(_)) {
+                match self.status {
                     // Back off before retrying.
-                    self.dirty_since = Some(now + 4.0);
+                    SaveStatus::Error(_) => self.dirty_since = Some(now + 4.0),
+                    // The conflict dialog takes over.
+                    SaveStatus::Conflict => self.save_requested = false,
+                    _ => {}
                 }
             }
         }
+    }
+
+    /// Save straight away (the Save button or Ctrl+S), and make what is saved
+    /// the restore point: the next save keeps it as the `.bak`.
+    fn save_now(&mut self, ctx: &egui::Context, now: f64) {
+        if matches!(self.status, SaveStatus::Conflict) {
+            return;
+        }
+        if self.dirty_since.is_none() && self.saving.is_none() {
+            self.mark_restore_point(now);
+        } else {
+            self.save_requested = true;
+            if self.dirty_since.is_some() {
+                self.save(ctx);
+            }
+        }
+    }
+
+    fn mark_restore_point(&mut self, now: f64) {
+        self.save_requested = false;
+        self.vault.mark_restore_point();
+        self.toast = Some(("Saved".into(), now));
     }
 
     /// Wait for a background save, before writing the file from this thread.
@@ -423,6 +455,7 @@ impl Session {
     fn ui(&mut self, ui: &mut Ui) -> Option<Leave> {
         let now = ui.input(|i| i.time);
         let mut lock = false;
+        let mut save_now = false;
         if ui.input(|i| !i.events.is_empty()) {
             self.last_active = Instant::now();
         }
@@ -433,8 +466,11 @@ impl Session {
         if ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::L))) {
             lock = true;
         }
+        if ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S))) {
+            save_now = true;
+        }
 
-        self.sidebar(ui, &mut lock);
+        self.sidebar(ui, &mut lock, &mut save_now);
         if self.view != View::Settings && self.selected.is_some() {
             self.detail_panel(ui);
         }
@@ -464,15 +500,17 @@ impl Session {
         }
         if lock {
             self.leave(ui.ctx(), Leave::Lock);
+        } else if save_now {
+            self.save_now(ui.ctx(), now);
         }
         if let Some(since) = self.dirty_since
             && !matches!(self.status, SaveStatus::Conflict)
             && self.saving.is_none()
         {
-            // Locking or quitting doesn't wait for a pause in typing, only
-            // for the back-off after a failed save.
-            let wait = match (&self.status, self.leaving) {
-                (SaveStatus::Pending, Some(_)) => 0.0,
+            // Locking, quitting and the Save button don't wait for a pause in
+            // typing, only for the back-off after a failed save.
+            let wait = match self.status {
+                SaveStatus::Pending if self.leaving.is_some() || self.save_requested => 0.0,
                 _ => AUTOSAVE_DELAY - (now - since),
             };
             if wait <= 0.0 {
@@ -511,7 +549,7 @@ impl Session {
             });
     }
 
-    fn sidebar(&mut self, ui: &mut Ui, lock: &mut bool) {
+    fn sidebar(&mut self, ui: &mut Ui, lock: &mut bool, save_now: &mut bool) {
         let frame = egui::Frame::new()
             .fill(theme::sidebar_fill(ui))
             .inner_margin(egui::Margin { left: 14, right: 14, top: 18, bottom: 14 });
@@ -596,19 +634,32 @@ impl Session {
                         {
                             *dark = !*dark;
                         }
+                        // The save status doubles as the Save button.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            match &self.status {
-                                SaveStatus::Saved => ui
-                                    .label(RichText::new(format!("{} Saved", icons::CLOUD_CHECK)).small().color(theme::fg(ui, theme::GREEN)))
-                                    .on_hover_text("All changes are saved and encrypted"),
-                                SaveStatus::Pending => ui.label(RichText::new("Saving…").small().color(theme::muted(ui))),
-                                SaveStatus::Error(e) => ui
-                                    .label(RichText::new(format!("{} Save failed", icons::WARNING)).small().color(theme::fg(ui, theme::RED)))
-                                    .on_hover_text(e),
-                                SaveStatus::Conflict => ui
-                                    .label(RichText::new(format!("{} Not saved", icons::WARNING)).small().color(theme::fg(ui, theme::RED)))
-                                    .on_hover_text("The data file was changed somewhere else"),
+                            let (text, color, hover) = match &self.status {
+                                SaveStatus::Conflict => {
+                                    ui.label(RichText::new(format!("{} Not saved", icons::WARNING)).small().color(theme::fg(ui, theme::RED)))
+                                        .on_hover_text("The data file was changed somewhere else");
+                                    return;
+                                }
+                                SaveStatus::Saved => (
+                                    format!("{} Saved", icons::FLOPPY_DISK),
+                                    theme::fg(ui, theme::GREEN),
+                                    "All changes are saved and encrypted.\nClick to save now and keep this version as the backup (Ctrl+S).".to_string(),
+                                ),
+                                SaveStatus::Pending => ("Saving…".to_string(), theme::muted(ui), "Click to save now (Ctrl+S)".to_string()),
+                                SaveStatus::Error(e) => (
+                                    format!("{} Save failed", icons::WARNING),
+                                    theme::fg(ui, theme::RED),
+                                    format!("{e}\nClick to try again."),
+                                ),
                             };
+                            let button = egui::Button::new(RichText::new(text).small().color(color))
+                                .frame_when_inactive(false)
+                                .corner_radius(egui::CornerRadius::same(10));
+                            if ui.add(button).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hover).clicked() {
+                                *save_now = true;
+                            }
                         });
                     });
                     ui.add_space(4.0);
@@ -1759,5 +1810,54 @@ mod ui_tests {
         h.run_steps(5);
         assert!(h.query_by_label(&week(last)).is_some(), "last week drawn once in view");
         assert!(h.query_by_label(&week(first)).is_none());
+    }
+
+    #[test]
+    fn save_button_saves_now_and_keeps_that_version_as_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let bak = dir.path().join("data.svt.bak");
+        let mut h = create_and_unlock(&path, false);
+        let name_in = |p: &std::path::Path| storage::read_database(p, PASSWORD, None).unwrap().settings.my_name;
+        let edit = |h: &mut Harness<'_, SupervisorApp>, name: &str| {
+            session(h).db.settings.my_name = name.into();
+            h.key_press(egui::Key::F20);
+        };
+
+        // Ctrl+S saves without waiting for a pause in typing: with no frames
+        // run after the key's own, an autosave can't have happened.
+        session(&mut h).db.settings.my_name = "Checkpoint".into();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+        h.step();
+        for _ in 0..100 {
+            if name_in(&path) == "Checkpoint" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(name_in(&path), "Checkpoint");
+        wait_until(&mut h, "saved", all_saved);
+        assert_eq!(name_in(&path), "Checkpoint");
+        assert_eq!(name_in(&bak), "", "the first save keeps the file as unlocked");
+
+        // The next save keeps the version saved by hand as the backup.
+        edit(&mut h, "Later");
+        for _ in 0..90 {
+            h.run_steps(1);
+        }
+        wait_until(&mut h, "autosaved", all_saved);
+        assert_eq!(name_in(&path), "Later");
+        assert_eq!(name_in(&bak), "Checkpoint");
+
+        // With nothing left to save, clicking Saved does the same.
+        h.get_by_label(&format!("{} Saved", icons::FLOPPY_DISK)).click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Saved").is_some(), "confirmed");
+        edit(&mut h, "Latest");
+        for _ in 0..90 {
+            h.run_steps(1);
+        }
+        wait_until(&mut h, "autosaved", all_saved);
+        assert_eq!(name_in(&bak), "Later");
     }
 }
