@@ -1,7 +1,7 @@
 # Supervisor
 
 A desktop app for keeping track of the students you supervise: final-year and MSc projects, PhD students, placement visits and studies advisees. It runs on Linux, Windows and macOS, and keeps everything in one encrypted file on your computer.
-
+This project is built with the help of Claude Opus 5.5.
 ![Dashboard](docs/screenshots/dashboard.png)
 
 ## What it does
@@ -19,7 +19,7 @@ A desktop app for keeping track of the students you supervise: final-year and MS
 ## Your data
 
 - Everything is in **one encrypted file**, protected by your password. It saves automatically and keeps a backup of the file as it was when you unlocked it (`.bak`).
-- **Save** (click *Saved* at the bottom of the sidebar, or `Ctrl+S`) saves straight away without locking. The backup then keeps that version, so you can go back to it if later changes go wrong.
+- **Save** (click _Saved_ at the bottom of the sidebar, or `Ctrl+S`) saves straight away without locking. The backup then keeps that version, so you can go back to it if later changes go wrong.
 - **There is no password recovery.** Remember the password and keep a backup of the file.
 - New passwords need **at least 12 characters**. A short sentence you'll remember works well.
 - Default location:
@@ -28,6 +28,7 @@ A desktop app for keeping track of the students you supervise: final-year and MS
   - macOS: `~/Library/Application Support/Supervisor/data.svt`
 
   You can open or create a file somewhere else (e.g. a synced folder) from the unlock screen.
+
 - **Lock** (bottom of the sidebar, or `Ctrl+L`) saves your changes and closes your data; you need your password to open it again. Supervisor also locks by itself after **10 minutes** without use. Change this in Settings › Security.
 - If saving fails (for example, a network drive is disconnected), Supervisor tells you and won't lock or close until your changes are saved, unless you choose to discard them.
 - A data file can be open in only one Supervisor window at a time. If it is changed somewhere else while you have it open (e.g. on another computer sharing the file), Supervisor asks before replacing that version, and keeps it as the `.bak`.
@@ -43,11 +44,11 @@ If your data file is in a synced or shared folder (OneDrive, Dropbox, a network 
 
 The key file is kept here:
 
-| Computer | Key file | To open the folder |
-| --- | --- | --- |
-| Linux | `~/.config/supervisor/key.bin` | In your file manager, press `Ctrl+H` to show hidden folders |
-| Windows | `%APPDATA%\Supervisor\config\key.bin` | Press `Win+R`, paste `%APPDATA%\Supervisor\config`, press Enter |
-| macOS | `~/Library/Preferences/Supervisor/key.bin` | In Finder, choose Go › Go to Folder… (`Shift+Cmd+G`) and paste `~/Library/Preferences/Supervisor` |
+| Computer | Key file                                   | To open the folder                                                                                |
+| -------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| Linux    | `~/.config/supervisor/key.bin`             | In your file manager, press `Ctrl+H` to show hidden folders                                       |
+| Windows  | `%APPDATA%\Supervisor\config\key.bin`      | Press `Win+R`, paste `%APPDATA%\Supervisor\config`, press Enter                                   |
+| macOS    | `~/Library/Preferences/Supervisor/key.bin` | In Finder, choose Go › Go to Folder… (`Shift+Cmd+G`) and paste `~/Library/Preferences/Supervisor` |
 
 Instead of using **Import key file…**, you can copy your backup into that folder yourself (create the folder if it isn't there) and rename it `key.bin`. On Linux, also run `chmod 600 ~/.config/supervisor/key.bin`.
 
@@ -91,7 +92,7 @@ This adds `supervisor` to `~/.local/bin` and puts it in your app launcher with i
 
 To update, build again and replace the exe. Your data is stored separately, so it isn't affected.
 
-To run it on another PC, only the exe is needed. If Windows warns *"Windows protected your PC"*, click *More info* → *Run anyway*. If it says *VCRUNTIME140.dll was not found*, install the [Visual C++ Redistributable](https://aka.ms/vc14/vc_redist.x64.exe).
+To run it on another PC, only the exe is needed. If Windows warns _"Windows protected your PC"_, click _More info_ → _Run anyway_. If it says _VCRUNTIME140.dll was not found_, install the [Visual C++ Redistributable](https://aka.ms/vc14/vc_redist.x64.exe).
 
 ### macOS
 
