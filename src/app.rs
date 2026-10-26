@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use crate::ics;
 use crate::model::{AdviseeRecord, Attention, CalItem, Database, Event, FypRecord, PhdRecord, PlacementRecord, Student};
-use crate::storage::{self, KeyFile, Vault, VaultError};
+use crate::storage::{self, KeyFile, Vault, VaultError, Written};
 use crate::ui::calendar::{self, CalAction, CalendarState};
 use crate::ui::dashboard::{self, DashAction};
 use crate::ui::lock::{LockScreen, Unlocked};
@@ -250,7 +250,7 @@ struct Session {
     /// Events and attention items for `db_print` and today.
     derived: Option<Derived>,
     /// A save running in the background, and the `db_print` it started from.
-    saving: Option<(Receiver<anyhow::Result<[u8; 32]>>, [u8; 32])>,
+    saving: Option<(Receiver<anyhow::Result<Written>>, [u8; 32])>,
     last_active: Instant,
     leaving: Option<Leave>,
     /// Lock or quit even though the latest changes aren't saved.
@@ -328,8 +328,8 @@ impl Session {
         let started_from = *started_from;
         self.saving = None;
         match result {
-            Ok(hash) => {
-                self.vault.saved(hash);
+            Ok(written) => {
+                self.vault.saved(written);
                 // Edits made while it was saving stay pending for the next save.
                 if self.db_print == started_from {
                     self.saved(Ok(()));

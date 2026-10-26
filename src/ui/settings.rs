@@ -202,7 +202,7 @@ pub fn show(
         theme::card(ui, "Security", |ui| {
             ui.label(format!("Data file: {data_path}"));
             ui.label(
-                RichText::new("Encrypted with Argon2id + XChaCha20-Poly1305. A backup of the previous save is kept alongside it (.bak).")
+                RichText::new("Encrypted with Argon2id + XChaCha20-Poly1305. Keeps a backup of the file as it was when you unlocked it (.bak).")
                     .small()
                     .color(theme::muted(ui)),
             );

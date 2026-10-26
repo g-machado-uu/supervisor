@@ -12,6 +12,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -136,7 +137,8 @@ impl KeyFile {
     }
 
     fn write(&self, path: &Path) -> Result<()> {
-        write_atomic(path, &self.0[..]).with_context(|| format!("writing {}", path.display()))
+        write_atomic(path, &self.0[..]).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
     }
 
     /// Stored in the header so a wrong key file is reported before Argon2
@@ -153,10 +155,39 @@ impl KeyFile {
 pub struct Vault {
     path: PathBuf,
     seal: Seal,
-    /// Hash of the file as last read or written, to notice other writers.
-    on_disk: Option<[u8; 32]>,
+    /// The file as last read or written, to notice other writers.
+    on_disk: Option<OnDisk>,
+    /// The `.bak` was written this session, so it holds the file as it was
+    /// when unlocked; later saves leave it alone.
+    backed_up: bool,
     /// Held while unlocked so a second window can't open the same file.
     _lock: Option<fs::File>,
+}
+
+/// What the data file was when last read or written. Its length and
+/// modified time are checked first; the file is read and hashed only when
+/// they differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OnDisk {
+    hash: [u8; 32],
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl OnDisk {
+    /// `meta` should be read before `bytes`, so a change in between makes
+    /// them disagree and the next save reads the file again.
+    fn of(bytes: &[u8], meta: &fs::Metadata) -> Self {
+        Self {
+            hash: hash(bytes),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
+
+    fn same_size_and_time(&self, meta: &fs::Metadata) -> bool {
+        self.modified.is_some() && self.len == meta.len() && self.modified == meta.modified().ok()
+    }
 }
 
 /// Everything re-keying replaces. A new one is saved with before it's swapped
@@ -336,6 +367,7 @@ impl Vault {
             path: path.to_path_buf(),
             seal: Seal::new(password, None, params)?,
             on_disk: None,
+            backed_up: false,
         };
         // Refuses if a file appeared there in the meantime.
         vault.save(db)?;
@@ -346,12 +378,14 @@ impl Vault {
     /// asks for one.
     pub fn open(path: &Path, password: &str, key_file: Option<&KeyFile>) -> Result<(Self, Database)> {
         let lock = lock_file(path)?;
-        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let read = || -> io::Result<_> { Ok((fs::metadata(path)?, fs::read(path)?)) };
+        let (meta, bytes) = read().with_context(|| format!("reading {}", path.display()))?;
         let (seal, db) = decrypt(&bytes, path, password, key_file)?;
         let vault = Self {
             path: path.to_path_buf(),
             seal,
-            on_disk: Some(hash(&bytes)),
+            on_disk: Some(OnDisk::of(&bytes, &meta)),
+            backed_up: false,
             _lock: lock,
         };
         Ok((vault, db))
@@ -365,20 +399,22 @@ impl Vault {
         self.seal.key_file.is_some()
     }
 
-    /// Encrypt and write atomically, keeping the previous file as `<name>.bak`.
-    /// Fails with [`VaultError::ChangedOnDisk`] rather than overwrite a file
-    /// that another window or computer has written since.
+    /// Encrypt and write atomically. The first save of a session keeps the
+    /// file as it was as `<name>.bak`. Fails with [`VaultError::ChangedOnDisk`]
+    /// rather than overwrite a file that another window or computer has
+    /// written since.
     pub fn save(&mut self, db: &Database) -> Result<()> {
         let bytes = self.seal(db)?;
-        let hash = self.writer().write(&bytes)?;
-        self.saved(hash);
+        let written = self.writer().write(&bytes)?;
+        self.saved(written);
         Ok(())
     }
 
     /// Save even though the file changed elsewhere; that version becomes the `.bak`.
     pub fn overwrite(&mut self, db: &Database) -> Result<()> {
         let bytes = self.seal(db)?;
-        self.on_disk = Some(self.writer().put(&bytes, false)?);
+        let written = self.writer().put(&bytes, false, true)?;
+        self.saved(written);
         Ok(())
     }
 
@@ -393,12 +429,14 @@ impl Vault {
         Writer {
             path: self.path.clone(),
             on_disk: self.on_disk,
+            backup: !self.backed_up,
         }
     }
 
-    /// Record a save finished by a [`Writer`]; `hash` is what it returned.
-    pub fn saved(&mut self, hash: [u8; 32]) {
-        self.on_disk = Some(hash);
+    /// Record a save finished by a [`Writer`].
+    pub fn saved(&mut self, written: Written) {
+        self.on_disk = Some(written.on_disk);
+        self.backed_up |= written.backed_up;
     }
 
     /// Whether `password` is the one the file is sealed with (no disk access).
@@ -426,10 +464,12 @@ impl Vault {
         }
         let next = Seal::new(password, key_file, self.seal.params.at_least_default())?;
         let bytes = sealed(&next, db)?;
-        self.on_disk = Some(self.writer().put(&bytes, true)?);
+        self.on_disk = Some(self.writer().put(&bytes, true, false)?.on_disk);
         self.seal = next;
-        // The backup is still sealed the old way; don't leave it behind.
+        // The backup is still sealed the old way; don't leave it behind. The
+        // next save backs up the file as it is now.
         let _ = fs::remove_file(sibling(&self.path, "bak"));
+        self.backed_up = false;
         Ok(())
     }
 }
@@ -461,36 +501,56 @@ fn sealed(seal: &Seal, db: &Database) -> Result<Vec<u8>> {
 /// sees ciphertext, so saving can run off the UI thread.
 pub struct Writer {
     path: PathBuf,
-    /// Hash of the file as last read or written, to notice other writers.
-    on_disk: Option<[u8; 32]>,
+    on_disk: Option<OnDisk>,
+    /// Keep the file as it is now as the `.bak` first.
+    backup: bool,
+}
+
+/// A finished [`Writer::write`], for [`Vault::saved`].
+pub struct Written {
+    on_disk: OnDisk,
+    backed_up: bool,
 }
 
 impl Writer {
-    /// Write `bytes` atomically, keeping the previous file as `<name>.bak`.
-    /// Fails with [`VaultError::ChangedOnDisk`] rather than overwrite a file
-    /// that another window or computer has written since. Returns the hash
-    /// of the new file, for [`Vault::saved`].
-    pub fn write(&self, bytes: &[u8]) -> Result<[u8; 32]> {
-        self.put(bytes, true)
+    /// Write `bytes` atomically, first keeping the file as `<name>.bak` if
+    /// this is the session's first save. Fails with
+    /// [`VaultError::ChangedOnDisk`] rather than overwrite a file that
+    /// another window or computer has written since.
+    pub fn write(&self, bytes: &[u8]) -> Result<Written> {
+        self.put(bytes, true, self.backup)
     }
 
-    fn put(&self, bytes: &[u8], check: bool) -> Result<[u8; 32]> {
+    fn put(&self, bytes: &[u8], check: bool, backup: bool) -> Result<Written> {
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             create_private_dir(dir)?;
         }
-        match fs::read(&self.path) {
-            Ok(old) => {
-                if check && Some(hash(&old)) != self.on_disk {
-                    return Err(VaultError::ChangedOnDisk.into());
+        let reading = || format!("reading {}", self.path.display());
+        let mut backed_up = false;
+        match fs::metadata(&self.path) {
+            Ok(meta) => {
+                // Same size and time as last written: unchanged, no need to read it.
+                let unchanged = self.on_disk.is_some_and(|d| d.same_size_and_time(&meta));
+                if backup || (check && !unchanged) {
+                    let old = fs::read(&self.path).with_context(reading)?;
+                    if check && Some(hash(&old)) != self.on_disk.map(|d| d.hash) {
+                        return Err(VaultError::ChangedOnDisk.into());
+                    }
+                    if backup {
+                        write_atomic(&sibling(&self.path, "bak"), &old).context("writing backup")?;
+                        backed_up = true;
+                    }
                 }
-                write_atomic(&sibling(&self.path, "bak"), &old).context("writing backup")?;
             }
             // Deleted or moved elsewhere: nothing to lose by writing it again.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("reading {}", self.path.display())),
+            Err(e) => return Err(e).with_context(reading),
         }
-        write_atomic(&self.path, bytes).context("replacing data file")?;
-        Ok(hash(bytes))
+        let meta = write_atomic(&self.path, bytes).context("replacing data file")?;
+        Ok(Written {
+            on_disk: OnDisk::of(bytes, &meta),
+            backed_up,
+        })
     }
 }
 
@@ -619,8 +679,10 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Write `bytes` to `path` through a new owner-only temp file with a random
 /// name, then rename it into place: a crash never leaves a half-written file,
-/// and a link planted at a fixed temp name can't redirect the write.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// and a link planted at a fixed temp name can't redirect the write. Returns
+/// the new file's metadata, taken before the rename (which keeps it), so
+/// another writer replacing the file straight after can't be mistaken for it.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<fs::Metadata> {
     let mut suffix = [0u8; 8];
     OsRng.fill_bytes(&mut suffix);
     let tmp = sibling(path, &format!("{}.tmp", hex(&suffix)));
@@ -632,17 +694,23 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()
     });
-    if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
+    let meta = match written
+        .and_then(|()| fs::metadata(&tmp))
+        .and_then(|meta| fs::rename(&tmp, path).map(|()| meta))
+    {
+        Ok(meta) => meta,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
     // Make the rename itself survive a crash.
     #[cfg(unix)]
     {
         let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
         let _ = fs::File::open(dir).and_then(|d| d.sync_all());
     }
-    Ok(())
+    Ok(meta)
 }
 
 /// Create `dir` (and parents) readable only by you. Existing folders are left alone.
@@ -824,12 +892,16 @@ mod tests {
         assert_eq!(read_u32(&raw, 5), KdfParams::default().m_cost_kib);
     }
 
-    /// A non-empty folder where the backup goes makes every save fail.
-    fn block_saves(path: &Path) -> PathBuf {
-        let bak = sibling(path, "bak");
-        let _ = fs::remove_file(&bak);
-        fs::create_dir_all(bak.join("blocker")).unwrap();
-        bak
+    /// A non-empty folder in place of the data file makes every save fail;
+    /// `unblock_saves` puts the file back.
+    fn block_saves(path: &Path) {
+        fs::rename(path, sibling(path, "aside")).unwrap();
+        fs::create_dir_all(path.join("blocker")).unwrap();
+    }
+
+    fn unblock_saves(path: &Path) {
+        fs::remove_dir_all(path).unwrap();
+        fs::rename(sibling(path, "aside"), path).unwrap();
     }
 
     #[test]
@@ -838,15 +910,57 @@ mod tests {
         let path = dir.path().join("data.svt");
         let mut db = sample();
         let mut vault = Vault::create_with_params(&path, "old", &db, FAST).unwrap();
-        let blocker = block_saves(&path);
+        block_saves(&path);
         assert!(vault.change_password("old", "new", &db).is_err());
         // The next autosave, once the disk works again, must still use the old password.
-        fs::remove_dir_all(blocker).unwrap();
+        unblock_saves(&path);
         db.students[0].name = "Changed".into();
         vault.save(&db).unwrap();
         assert!(vault.check_password("old").unwrap());
         assert_eq!(read_database(&path, "old", None).unwrap().students[0].name, "Changed");
         assert!(read_database(&path, "new", None).is_err());
+    }
+
+    #[test]
+    fn backup_is_the_file_as_unlocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let bak = sibling(&path, "bak");
+        let mut db = sample();
+        drop(Vault::create_with_params(&path, "pw", &db, FAST).unwrap());
+        let (mut vault, _) = Vault::open(&path, "pw", None).unwrap();
+        let as_unlocked = fs::read(&path).unwrap();
+
+        db.students[0].name = "First edit".into();
+        vault.save(&db).unwrap();
+        assert_eq!(fs::read(&bak).unwrap(), as_unlocked);
+
+        // Later saves leave the backup alone, and don't read the data file:
+        // they still work when it can't be read.
+        for name in ["Second edit", "Third edit"] {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o200)).unwrap();
+            }
+            db.students[0].name = name.into();
+            vault.save(&db).unwrap();
+        }
+        assert_eq!(fs::read(&bak).unwrap(), as_unlocked);
+        assert_eq!(read_database(&path, "pw", None).unwrap().students[0].name, "Third edit");
+
+        // Rewritten with the same bytes, as a sync client may do: not a conflict.
+        fs::write(&path, fs::read(&path).unwrap()).unwrap();
+        vault.save(&db).unwrap();
+
+        // Changed elsewhere: still caught, and kept as the backup when replaced.
+        fs::write(&path, b"someone else's version").unwrap();
+        assert_eq!(error_of(vault.save(&db)), Some(VaultError::ChangedOnDisk));
+        vault.overwrite(&db).unwrap();
+        assert_eq!(fs::read(&bak).unwrap(), b"someone else's version");
+        db.students[0].name = "After".into();
+        vault.save(&db).unwrap();
+        assert_eq!(fs::read(&bak).unwrap(), b"someone else's version", "still the other version");
     }
 
     #[test]
@@ -897,10 +1011,12 @@ mod tests {
         // Another computer (via a synced folder) writes the file.
         let mut theirs = sample();
         theirs.students[0].name = "Theirs".into();
+        let meta = fs::metadata(&path).unwrap();
         let mut other = Vault {
             path: path.clone(),
             seal: Seal::new("pw", None, FAST).unwrap(),
-            on_disk: Some(hash(&fs::read(&path).unwrap())),
+            on_disk: Some(OnDisk::of(&fs::read(&path).unwrap(), &meta)),
+            backed_up: true,
             _lock: None,
         };
         other.save(&theirs).unwrap();
@@ -959,9 +1075,9 @@ mod tests {
         let path = dir.path().join("data.svt");
         let db = sample();
         let mut vault = Vault::create_with_params(&path, "pw", &db, FAST).unwrap();
-        let blocker = block_saves(&path);
+        block_saves(&path);
         assert!(vault.set_key_file("pw", Some(KeyFile::generate()), &db).is_err());
-        fs::remove_dir_all(blocker).unwrap();
+        unblock_saves(&path);
         vault.save(&db).unwrap();
         assert!(!vault.uses_key_file());
         assert!(read_database(&path, "pw", None).is_ok());
