@@ -12,7 +12,7 @@ mod ui;
 fn main() -> eframe::Result {
     // Optional: path to a data file to open instead of the last-used one.
     let data_file = std::env::args_os().nth(1).map(std::path::PathBuf::from);
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Supervisor")
             .with_app_id("supervisor")
@@ -24,6 +24,13 @@ fn main() -> eframe::Result {
             ),
         ..Default::default()
     };
+    // On Wayland, eframe only draws when the compositor asks for a frame, so
+    // also waiting for vsync when presenting adds nothing. That wait is a
+    // known way for an app to hang with some drivers (NVIDIA): the window
+    // stops responding until force-quit.
+    if cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        options.wgpu_options.surface.present_mode = eframe::wgpu::PresentMode::AutoNoVsync;
+    }
     eframe::run_native(
         "Supervisor",
         options,
