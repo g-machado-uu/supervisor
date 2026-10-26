@@ -348,7 +348,17 @@ impl Session {
         self.toast(ui);
         self.dialogs(ui);
 
-        self.detect_changes(now);
+        // Every edit needs a click, key press or drag; frames from just moving
+        // the mouse or a blinking cursor skip the (whole-database) check.
+        let may_edit = ui.input(|i| {
+            i.pointer.any_down()
+                || i.events.iter().any(|e| {
+                    !matches!(e, egui::Event::PointerMoved(_) | egui::Event::MouseMoved(_))
+                })
+        });
+        if may_edit {
+            self.detect_changes(now);
+        }
         if self.applied_dark != Some(self.db.settings.dark_mode) {
             self.applied_dark = Some(self.db.settings.dark_mode);
             theme::apply(ui.ctx(), self.db.settings.dark_mode);
@@ -1524,6 +1534,8 @@ mod ui_tests {
         // Another computer saves the file (simulated by writing other bytes).
         std::fs::write(&path, b"someone else's version").unwrap();
         session(&mut h).db.settings.my_name = "Mine".into();
+        // Edits are only looked for on frames with input, as typing would give.
+        h.key_press(egui::Key::F20);
         for _ in 0..90 {
             h.run_steps(1);
         }
