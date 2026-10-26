@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use chrono::{Duration, NaiveDate, NaiveTime};
 
+use crate::app::Derived;
 use crate::model::*;
 use crate::storage::{self, Vault};
 
@@ -103,7 +104,16 @@ fn perf_timings() {
         let db = dataset(archived_years);
         println!("{} students, {} archived years:", db.students.len(), archived_years);
         time("change check (fingerprint)", 100, || storage::fingerprint(&db));
-        time("dashboard data", 100, || (db.events(), db.upcoming(today, 14), db.attention(today)));
+        time("dashboard data", 100, || {
+            let events = db.events();
+            (upcoming(&events, today, 14).len(), db.attention(today))
+        });
+        let print = storage::fingerprint(&db);
+        let mut cache = None;
+        time("dashboard data, cached", 100, || {
+            let d = Derived::of(&mut cache, &db, print, today);
+            (upcoming(&d.events, today, 14).len(), d.attention.len())
+        });
         time("events()", 100, || db.events());
         let dir = tempfile::tempdir().unwrap();
         let mut vault = Vault::create(&dir.path().join("data.svt"), "correct horse battery staple", &db).unwrap();

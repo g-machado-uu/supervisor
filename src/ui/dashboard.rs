@@ -7,7 +7,7 @@ use chrono::{Datelike, Duration, Local, Months, NaiveDate, Timelike};
 use egui::{Align2, Color32, CornerRadius, FontId, RichText, Sense, Ui};
 use uuid::Uuid;
 
-use crate::model::{Database, Event, EventKind, Severity};
+use crate::model::{self, Attention, Database, Event, EventKind, Severity};
 use crate::ui::student_list::Category;
 use crate::ui::{icons, theme, widgets};
 
@@ -22,7 +22,8 @@ pub enum DashAction {
 
 const GAP: f32 = 16.0;
 
-pub fn show(ui: &mut Ui, db: &Database) -> DashAction {
+/// `events` and `attention` are the lists derived from `db`, built once per change.
+pub fn show(ui: &mut Ui, db: &Database, events: &[Event], attention: &[Attention]) -> DashAction {
     let mut action = DashAction::None;
     let today = widgets::today();
 
@@ -51,11 +52,10 @@ pub fn show(ui: &mut Ui, db: &Database) -> DashAction {
         }
     });
 
-    let events = db.events();
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         // Keep the cards clear of the scroll bar.
         ui.set_max_width(ui.available_width() - 12.0);
-        tiles(ui, db, &events, today, &mut action);
+        tiles(ui, db, events, today, &mut action);
         ui.add_space(GAP);
 
         let width = ui.available_width();
@@ -67,10 +67,10 @@ pub fn show(ui: &mut Ui, db: &Database) -> DashAction {
                 ui.set_width(main);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = GAP;
-                    upcoming(ui, db, today, &mut action);
-                    attention(ui, db, today, &mut action);
+                    upcoming(ui, db, events, today, &mut action);
+                    needs_attention(ui, attention, &mut action);
                     if side == 0.0 {
-                        side_column(ui, db, &events, today, &mut action);
+                        side_column(ui, db, events, today, &mut action);
                     }
                 });
             });
@@ -79,7 +79,7 @@ pub fn show(ui: &mut Ui, db: &Database) -> DashAction {
                     ui.set_width(side);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = GAP;
-                        side_column(ui, db, &events, today, &mut action);
+                        side_column(ui, db, events, today, &mut action);
                     });
                 });
             }
@@ -209,9 +209,9 @@ fn date_badge(ui: &mut Ui, date: NaiveDate, color: Color32) {
     );
 }
 
-fn upcoming(ui: &mut Ui, db: &Database, today: NaiveDate, action: &mut DashAction) {
+fn upcoming(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, action: &mut DashAction) {
     let days = db.settings.upcoming_days;
-    let items = db.upcoming(today, days);
+    let items = model::upcoming(events, today, days);
     theme::card(ui, &format!("Upcoming · next {days} days"), |ui| {
         if items.is_empty() {
             empty(ui, icons::CALENDAR_CHECK, "Nothing scheduled.");
@@ -277,8 +277,7 @@ fn empty(ui: &mut Ui, icon: &str, text: &str) {
     });
 }
 
-fn attention(ui: &mut Ui, db: &Database, today: NaiveDate, action: &mut DashAction) {
-    let items = db.attention(today);
+fn needs_attention(ui: &mut Ui, items: &[Attention], action: &mut DashAction) {
     theme::card(ui, "Needs attention", |ui| {
         if items.is_empty() {
             ui.vertical_centered(|ui| {
@@ -288,7 +287,7 @@ fn attention(ui: &mut Ui, db: &Database, today: NaiveDate, action: &mut DashActi
                 ui.add_space(8.0);
             });
         }
-        for a in &items {
+        for a in items {
             let (icon, color, tag) = match a.severity {
                 Severity::Overdue => (icons::WARNING_CIRCLE, theme::RED, "overdue"),
                 Severity::Pending => (icons::HOURGLASS, theme::AMBER, "pending"),

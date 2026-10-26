@@ -1235,6 +1235,15 @@ fn push_meeting(
     }
 }
 
+/// Items of `events` in the next `days` days that are still to happen.
+pub fn upcoming(events: &[Event], today: NaiveDate, days: u32) -> Vec<&Event> {
+    let end = today + Duration::days(i64::from(days));
+    events
+        .iter()
+        .filter(|e| !e.done && !e.cancelled && e.date >= today && e.date <= end)
+        .collect()
+}
+
 impl Database {
     pub fn student(&self, id: Uuid) -> Option<&Student> {
         self.students.iter().find(|s| s.id == id)
@@ -1539,14 +1548,6 @@ impl Database {
         }
     }
 
-    pub fn upcoming(&self, today: NaiveDate, days: u32) -> Vec<Event> {
-        let end = today + Duration::days(i64::from(days));
-        self.events()
-            .into_iter()
-            .filter(|e| !e.done && !e.cancelled && e.date >= today && e.date <= end)
-            .collect()
-    }
-
     /// Things that need chasing, most urgent first.
     pub fn attention(&self, today: NaiveDate) -> Vec<Attention> {
         let mut out = Vec::new();
@@ -1793,8 +1794,8 @@ mod tests {
                 .iter()
                 .any(|e| e.moved() && e.date == d(2026, 11, 17))
         );
-        let upcoming = db.upcoming(d(2026, 11, 1), 30);
-        let meetings = upcoming
+        let all = db.events();
+        let meetings = upcoming(&all, d(2026, 11, 1), 30)
             .iter()
             .filter(|e| e.kind == EventKind::FypMeeting)
             .count();

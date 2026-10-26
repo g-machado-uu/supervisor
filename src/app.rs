@@ -1,14 +1,16 @@
 //! Application shell: lock state, navigation, autosave and dialogs.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use chrono::NaiveDate;
 use egui::{Id, RichText, Ui};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::ics;
-use crate::model::{AdviseeRecord, CalItem, Database, FypRecord, PhdRecord, PlacementRecord, Student};
+use crate::model::{AdviseeRecord, Attention, CalItem, Database, Event, FypRecord, PhdRecord, PlacementRecord, Student};
 use crate::storage::{self, KeyFile, Vault, VaultError};
 use crate::ui::calendar::{self, CalAction, CalendarState};
 use crate::ui::dashboard::{self, DashAction};
@@ -16,7 +18,7 @@ use crate::ui::lock::{LockScreen, Unlocked};
 use crate::ui::settings::{self, KeyFileForm, PasswordForm, SettingsAction};
 use crate::ui::student_form::{self, FormAction, Role};
 use crate::ui::student_list::{self, Category, ListState};
-use crate::ui::{icons, theme};
+use crate::ui::{icons, theme, widgets};
 
 const AUTOSAVE_DELAY: f64 = 1.0;
 
@@ -193,6 +195,32 @@ impl NewStudent {
     }
 }
 
+/// Lists the Dashboard and Calendar draw on every frame, rebuilt only when
+/// the data or the date changes.
+pub(crate) struct Derived {
+    print: [u8; 32],
+    today: NaiveDate,
+    pub events: Rc<[Event]>,
+    pub attention: Rc<[Attention]>,
+}
+
+impl Derived {
+    /// The lists for `db`, whose fingerprint is `print`, from `cache` if
+    /// that is still current.
+    pub(crate) fn of<'c>(cache: &'c mut Option<Self>, db: &Database, print: [u8; 32], today: NaiveDate) -> &'c Self {
+        let stale = cache.as_ref().is_none_or(|d| d.print != print || d.today != today);
+        if stale {
+            *cache = Some(Self {
+                print,
+                today,
+                events: db.events().into(),
+                attention: db.attention(today).into(),
+            });
+        }
+        cache.as_ref().expect("just filled")
+    }
+}
+
 struct Session {
     vault: Vault,
     db: Database,
@@ -212,6 +240,8 @@ struct Session {
     applied_dark: Option<bool>,
     /// Fingerprint of `db` when last checked, to spot edits.
     db_print: [u8; 32],
+    /// Events and attention items for `db_print` and today.
+    derived: Option<Derived>,
     last_active: Instant,
     leaving: Option<Leave>,
     /// Lock or quit even though the latest changes aren't saved.
@@ -226,6 +256,7 @@ impl Session {
         let Unlocked { vault, db, weak_password } = unlocked;
         Self {
             db_print: storage::fingerprint(&db),
+            derived: None,
             vault,
             db,
             view: View::Dashboard,
@@ -314,6 +345,12 @@ impl Session {
             Some(left) if !left.is_zero() => ctx.request_repaint_after(left),
             _ => self.leave(Leave::Lock),
         }
+    }
+
+    /// Events and attention items as of the last change check, which runs
+    /// on every frame that can edit.
+    fn derived(&mut self) -> &Derived {
+        Derived::of(&mut self.derived, &self.db, self.db_print, widgets::today())
     }
 
     fn notify(&mut self, ui: &Ui, msg: impl Into<String>) {
@@ -550,20 +587,25 @@ impl Session {
 
     fn central(&mut self, ui: &mut Ui) {
         match self.view.clone() {
-            View::Dashboard => match dashboard::show(ui, &self.db) {
-                DashAction::None => {}
-                DashAction::Open(id) => self.selected = Some(id),
-                DashAction::Goto(cat) => self.view = View::List(cat),
-                DashAction::ExportIcs => self.export_ics(ui),
-                DashAction::Month(month) => {
-                    self.calendar.layout = calendar::Layout::Month;
-                    self.calendar.month = month;
-                    self.view = View::Calendar;
+            View::Dashboard => {
+                let d = self.derived();
+                let (events, attention) = (Rc::clone(&d.events), Rc::clone(&d.attention));
+                match dashboard::show(ui, &self.db, &events, &attention) {
+                    DashAction::None => {}
+                    DashAction::Open(id) => self.selected = Some(id),
+                    DashAction::Goto(cat) => self.view = View::List(cat),
+                    DashAction::ExportIcs => self.export_ics(ui),
+                    DashAction::Month(month) => {
+                        self.calendar.layout = calendar::Layout::Month;
+                        self.calendar.month = month;
+                        self.view = View::Calendar;
+                    }
                 }
-            },
+            }
             View::Calendar => {
+                let events = Rc::clone(&self.derived().events);
                 let mut guests = self.db.settings.export_with_guests;
-                let action = calendar::show(ui, &self.db, &mut self.calendar, &mut guests);
+                let action = calendar::show(ui, &self.db, &events, &mut self.calendar, &mut guests);
                 self.db.settings.export_with_guests = guests;
                 match action {
                     CalAction::None => {}

@@ -92,16 +92,17 @@ fn shown(db: &Database, st: &CalendarState, e: &Event, today: NaiveDate) -> bool
     kind && in_range
 }
 
-/// `with_guests` is the stored "include students as guests" choice.
+/// `all` is `db.events()`, built once per change. `with_guests` is the
+/// stored "include students as guests" choice.
 pub fn show(
     ui: &mut Ui,
     db: &Database,
+    all: &[Event],
     st: &mut CalendarState,
     with_guests: &mut bool,
 ) -> CalAction {
     let mut action = CalAction::None;
     let today = widgets::today();
-    let all = db.events();
     // Forget selections of items that no longer exist (or were cancelled).
     let exists: HashSet<&str> = all
         .iter()
