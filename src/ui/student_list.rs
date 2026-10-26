@@ -111,7 +111,7 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
         })
         .collect();
     let mut rows = rows;
-    rows.sort_by_key(|s| s.name.to_lowercase());
+    rows.sort_by_cached_key(|s| s.name.to_lowercase());
 
     if rows.is_empty() {
         theme::card(ui, "", |ui| {

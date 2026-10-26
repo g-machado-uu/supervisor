@@ -1,7 +1,7 @@
 //! Calendar: meetings, visits and deadlines as a list grouped by week or as
 //! a month grid, with selection for exporting an .ics.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{Datelike, Duration, Months, NaiveDate};
 use egui::{RichText, Ui};
@@ -37,7 +37,16 @@ pub struct CalendarState {
     pub selected: HashSet<String>,
     /// Export a repeating meeting as one series rather than single weeks.
     pub as_series: bool,
+    /// Height of each week card in the list (by its Monday) when last drawn;
+    /// cards out of view take up that space without being drawn.
+    week_heights: HashMap<NaiveDate, f32>,
+    /// What those heights were measured for.
+    heights_for: Option<ListKey>,
 }
+
+/// The list's range, the kinds shown, the width, and the events (a new
+/// list after every edit, so its address and length change).
+type ListKey = (Range, [bool; 4], u32, usize, usize);
 
 impl Default for CalendarState {
     fn default() -> Self {
@@ -51,6 +60,8 @@ impl Default for CalendarState {
             reminders: true,
             selected: HashSet::new(),
             as_series: true,
+            week_heights: HashMap::new(),
+            heights_for: None,
         }
     }
 }
@@ -198,7 +209,15 @@ pub fn show(
     ui.add_space(10.0);
 
     match st.layout {
-        Layout::List => list(ui, db, st, &events, today, &mut action),
+        Layout::List => {
+            let kinds = [st.meetings, st.visits, st.deadlines, st.reminders];
+            let key = (st.range, kinds, ui.available_width() as u32, all.as_ptr() as usize, all.len());
+            if st.heights_for != Some(key) {
+                st.heights_for = Some(key);
+                st.week_heights.clear();
+            }
+            list(ui, db, st, &events, today, &mut action);
+        }
         Layout::Month => month(ui, db, st, &events, today, &mut action),
     }
     action
@@ -234,6 +253,15 @@ fn list(
         .auto_shrink(false)
         .show(ui, |ui| {
             for (monday, items) in weeks {
+                let width = ui.available_width();
+                if let Some(&height) = st.week_heights.get(&monday) {
+                    let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, height));
+                    if !ui.is_rect_visible(rect) {
+                        ui.allocate_space(egui::vec2(width, height));
+                        ui.add_space(10.0);
+                        continue;
+                    }
+                }
                 let sunday = monday + Duration::days(6);
                 let dates = format!("{} – {}", monday.format("%d %b"), sunday.format("%d %b %Y"));
                 let heading = match teaching_week_of(db, monday) {
@@ -249,7 +277,7 @@ fn list(
                     .filter(|e| !e.cancelled)
                     .map(|e| e.uid.as_str())
                     .collect();
-                theme::card_frame(ui).inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
+                let card = theme::card_frame(ui).inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let mut on = !selectable.is_empty()
@@ -284,6 +312,7 @@ fn list(
                     }
                 }
                 });
+                st.week_heights.insert(monday, card.response.rect.height());
                 ui.add_space(10.0);
             }
         });

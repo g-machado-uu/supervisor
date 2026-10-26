@@ -1701,4 +1701,63 @@ mod ui_tests {
         wait_until(&mut h, "second save", all_saved);
         assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Second");
     }
+
+    #[test]
+    fn calendar_list_draws_only_weeks_in_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let first = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let last = first + Days::weeks(59);
+        {
+            let s = session(&mut h);
+            s.db.students.push(Student {
+                name: "Weekly Student".into(),
+                fyp: Some(FypRecord {
+                    programme: "BEng".into(),
+                    meetings: vec![Meeting {
+                        date: Some(first),
+                        time: NaiveTime::from_hms_opt(10, 0, 0),
+                        repeat: Some(Repeat {
+                            until: Some(last),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            s.view = View::Calendar;
+            s.calendar.range = crate::ui::calendar::Range::All;
+        }
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        let week = |monday: chrono::NaiveDate| {
+            format!("{} – {}", monday.format("%d %b"), (monday + Days::days(6)).format("%d %b %Y"))
+        };
+        assert!(h.query_by_label(&week(first)).is_some(), "first week drawn");
+        assert!(h.query_by_label(&week(last)).is_none(), "weeks out of view not drawn");
+
+        // Selecting covers every week, drawn or not.
+        h.get_by_label("Select all shown").click();
+        h.run_steps(2);
+        assert_eq!(session(&mut h).calendar.selected.len(), 60);
+
+        // Scrolled to the end, the last week is drawn.
+        h.event(egui::Event::PointerMoved(egui::pos2(700.0, 500.0)));
+        for _ in 0..80 {
+            h.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -400.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run_steps(1);
+        }
+        h.run_steps(5);
+        assert!(h.query_by_label(&week(last)).is_some(), "last week drawn once in view");
+        assert!(h.query_by_label(&week(first)).is_none());
+    }
 }
