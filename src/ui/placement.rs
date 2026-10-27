@@ -23,6 +23,12 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<St
         ui.label("Line manager email");
         widgets::text_field(ui, &mut p.line_manager_email, "manager@company.com");
         ui.end_row();
+        ui.label("Second marker");
+        widgets::text_field(ui, &mut p.second_marker_name, "Name");
+        ui.end_row();
+        ui.label("Second marker email");
+        widgets::text_field(ui, &mut p.second_marker_email, "Email");
+        ui.end_row();
     });
 
     for (i, v) in p.visits.iter_mut().enumerate() {

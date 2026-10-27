@@ -425,6 +425,15 @@ impl Settings {
             .map_or_else(|| id.to_string(), |p| p.short.clone())
     }
 
+    /// Whether a course is taught at SUST: the built-in SUST course, or any
+    /// course shown in the SUST list.
+    pub fn is_sust(&self, id: &str) -> bool {
+        id == "Sust"
+            || self
+                .programme(id)
+                .is_some_and(|p| p.list_name().eq_ignore_ascii_case("SUST"))
+    }
+
     /// Sidebar lists of project students, in the order courses are defined.
     pub fn programme_lists(&self) -> Vec<String> {
         let mut lists: Vec<String> = Vec::new();
@@ -658,6 +667,11 @@ pub struct FypRecord {
     pub meetings: Vec<Meeting>,
     /// Keyed by `CourseworkTemplate::id`.
     pub coursework: HashMap<Uuid, CwStatus>,
+    /// Second marker, or the SUST supervisor for SUST students.
+    pub second_marker_name: String,
+    pub second_marker_email: String,
+    /// The student's own SUST email, when known.
+    pub sust_email: String,
 }
 
 impl Default for FypRecord {
@@ -669,6 +683,9 @@ impl Default for FypRecord {
             initial_contact_on: None,
             meetings: Vec::new(),
             coursework: HashMap::new(),
+            second_marker_name: String::new(),
+            second_marker_email: String::new(),
+            sust_email: String::new(),
         }
     }
 }
@@ -695,6 +712,8 @@ pub struct PlacementRecord {
     pub line_manager_name: String,
     pub line_manager_email: String,
     pub visits: [Visit; 2],
+    pub second_marker_name: String,
+    pub second_marker_email: String,
 }
 
 impl Default for PlacementRecord {
@@ -711,6 +730,8 @@ impl Default for PlacementRecord {
                     ..Default::default()
                 },
             ],
+            second_marker_name: String::new(),
+            second_marker_email: String::new(),
         }
     }
 }
@@ -2574,6 +2595,19 @@ mod tests {
 
         settings.sem1_start = None;
         assert_eq!(settings.template_deadline(&module, cw), None);
+    }
+
+    #[test]
+    fn sust_courses() {
+        let mut s = Settings::default();
+        assert!(s.is_sust("Sust"));
+        assert!(!s.is_sust("BEng"));
+        s.programmes.push(Programme {
+            id: "x".into(),
+            list: "sust".into(),
+            ..Default::default()
+        });
+        assert!(s.is_sust("x"));
     }
 
     #[test]

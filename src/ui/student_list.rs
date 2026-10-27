@@ -213,7 +213,10 @@ fn table(
                     if s.archived {
                         rt = rt.color(theme::muted(ui));
                     }
-                    ui.label(rt);
+                    let name = ui.label(rt);
+                    if let Some(title) = project_title(cat, s) {
+                        name.on_hover_text(title);
+                    }
                     if s.archived {
                         ui.label(RichText::new(icons::ARCHIVE).color(theme::muted(ui)))
                             .on_hover_text("Archived");
@@ -312,6 +315,19 @@ fn table(
                 }
             });
         });
+}
+
+/// The project or thesis title shown when hovering a name, if one is set.
+fn project_title<'a>(cat: &Category, s: &'a Student) -> Option<&'a str> {
+    let fyp = || s.fyp.as_ref().map(|f| f.project_title.as_str());
+    let phd = || s.phd.as_ref().map(|p| p.title.as_str());
+    let title = match cat {
+        Category::Projects(_) => fyp(),
+        Category::Research(_) => phd(),
+        Category::All => fyp().filter(|t| !t.trim().is_empty()).or_else(phd),
+        Category::Placement | Category::Advisee => None,
+    }?;
+    Some(title.trim()).filter(|t| !t.is_empty())
 }
 
 /// Next planned meeting on or after `today` and how many have been held,

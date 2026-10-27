@@ -27,6 +27,20 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings) -> Option<Str
         widgets::text_field(ui, &mut fyp.project_title, "Project title");
         ui.end_row();
 
+        let sust = settings.is_sust(&fyp.programme);
+        if sust {
+            ui.label("SUST email");
+            widgets::text_field(ui, &mut fyp.sust_email, "If known");
+            ui.end_row();
+        }
+        let marker = if sust { "SUST supervisor" } else { "Second marker" };
+        ui.label(marker);
+        widgets::text_field(ui, &mut fyp.second_marker_name, "Name");
+        ui.end_row();
+        ui.label(format!("{marker} email"));
+        widgets::text_field(ui, &mut fyp.second_marker_email, "Email");
+        ui.end_row();
+
         ui.label("Initial contact");
         ui.horizontal(|ui| {
             ui.checkbox(&mut fyp.initial_contact, "Made contact");

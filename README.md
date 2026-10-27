@@ -7,7 +7,8 @@ This project is built with the help of Claude Opus 5.5.
 ## What it does
 
 - **Dashboard**: what's coming up, and what needs chasing (no reply, overdue coursework, PhD deadlines, visas about to end, Brazilian grants about to end).
-- **Lists** for each group of students. Click a student to open their details on the right.
+- **Lists** for each group of students. Click a student to open their details on the right; hover a name to see the project or thesis title.
+- **Second markers** for project and placement students, with name and email. For SUST students this is the SUST supervisor, and there is a place for the student's SUST email.
 - **Meetings**, one-off or repeating, online (Teams, Google Meet or Zoom, with the meeting link) or in a room. Mark each week as held, cancelled or moved.
 - **Coursework deadlines** are worked out from the teaching weeks you set in Settings.
 - **Research students**, in four lists: PhD, PhD External, MSc and MSc External. Assessments, annual reports, submission and viva: type in the deadlines from the university system and the app reminds you in time.
