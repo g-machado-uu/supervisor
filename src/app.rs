@@ -904,6 +904,8 @@ impl Session {
         let no_link = invite.event.online && ics::meeting_link(&invite.event, &self.db.settings).is_none();
         let hint = if no_link && invite.event.platform == crate::model::Platform::GoogleMeet {
             "upload it in Outlook, open the event, add the Google Meet link and Send"
+        } else if no_link && invite.event.platform == crate::model::Platform::Zoom {
+            "upload it in Outlook, open the event, add the Zoom link and Send"
         } else if no_link {
             "upload it in Outlook, open the event, turn on Teams meeting and Send"
         } else {
@@ -2001,5 +2003,78 @@ mod ui_tests {
         h.get_by_label(&format!("{} Mark as not held", icons::X)).click();
         h.run_steps(2);
         assert!(!meeting(&mut h, "Past Student").held);
+    }
+
+    #[test]
+    fn external_student_on_a_brazilian_programme() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        let ana = {
+            let s = session(&mut h);
+            let mut p = ResearchGroup::PhdExternal.new_record();
+            p.university = "UFRN".into();
+            p.start = Some(start);
+            let ana = Student {
+                name: "Ana Souza".into(),
+                phd: Some(p),
+                ..Default::default()
+            };
+            let id = ana.id;
+            s.db.students.push(ana);
+            s.view = View::List(Category::Research(ResearchGroup::PhdExternal));
+            s.selected = Some(id);
+            id
+        };
+        h.set_size(egui::vec2(1360.0, 2400.0));
+        h.run_steps(3);
+        let phd = |h: &mut Harness<'_, SupervisorApp>| session(h).db.student(ana).unwrap().phd.clone().unwrap();
+        assert!(h.query_by_label("Standard assessments of this university").is_some());
+        assert!(h.query_by_label("GRANT").is_none());
+
+        h.get_by_label("On a Brazilian programme").click();
+        h.run_steps(3);
+        let p = phd(&mut h);
+        assert!(p.brazilian_programme() && !p.skip_standard);
+        assert_eq!(p.brazil.level, BrLevel::AcademicDoctorate);
+        // Card titles are shown in capitals.
+        for label in ["GRANT", "Standard stages of the Brazilian programme", "DEFENCE & AWARD", "Deadline extension"] {
+            assert!(h.query_by_label(label).is_some(), "{label}");
+        }
+        assert!(h.query_by_label("Standard assessments of this university").is_none());
+        assert!(h.query_by_label("Fee status").is_none());
+
+        h.get_by_label(&format!("{} Fill in suggested deadlines", icons::CALENDAR_CHECK)).click();
+        h.run_steps(3);
+        let p = phd(&mut h);
+        assert_eq!(p.brazil.defence_deadline.deadline, start.checked_add_months(chrono::Months::new(48)));
+        assert_eq!(p.annual_reports.len(), 3);
+        assert!(h.query_by_label("Thesis defence").is_some());
+        shot(&mut h, "16_brazilian_external_detail");
+
+        // A CAPES grant gets the usual 48 months; a Zoom meeting.
+        {
+            let p = session(&mut h).db.student_mut(ana).unwrap().phd.as_mut().unwrap();
+            p.brazil.grant.agency = "CAPES".into();
+            p.suggest_br(&BrRule::default_for(BrLevel::AcademicDoctorate));
+            p.meetings.push(Meeting {
+                date: Some(start),
+                online: true,
+                platform: Platform::Zoom,
+                ..Default::default()
+            });
+        }
+        h.run_steps(3);
+        assert!(h.query_by_label("Coordination for the Improvement of Higher Education Personnel").is_some());
+        assert!(h.query_by_label("Sun 28 Feb 2030").is_some() || h.query_by_label_contains("28 Feb 2030").is_some());
+        assert!(h.query_by_label("Zoom").is_some());
+        shot(&mut h, "17_brazilian_grant_and_zoom");
+
+        // Settings: the deadlines of each Brazilian level.
+        session(&mut h).view = View::Settings;
+        h.run_steps(3);
+        assert!(h.query_by_label("BRAZILIAN PROGRAMMES").is_some());
+        assert!(h.query_by_label("Professional doctorate").is_some());
     }
 }

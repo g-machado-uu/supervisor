@@ -230,6 +230,7 @@ pub fn meetings_editor(
                                 let hint = match m.platform {
                                     Platform::Teams => "Meeting link (optional; otherwise the one in Settings)",
                                     Platform::GoogleMeet => "https://meet.google.com/…",
+                                    Platform::Zoom => "https://…zoom.us/j/…",
                                 };
                                 text_field(ui, &mut m.link, hint);
                             });

@@ -6,12 +6,13 @@ This project is built with the help of Claude Opus 5.5.
 
 ## What it does
 
-- **Dashboard**: what's coming up, and what needs chasing (no reply, overdue coursework, PhD deadlines, visas about to end).
+- **Dashboard**: what's coming up, and what needs chasing (no reply, overdue coursework, PhD deadlines, visas about to end, Brazilian grants about to end).
 - **Lists** for each group of students. Click a student to open their details on the right.
-- **Meetings**, one-off or repeating, online (Teams or Google Meet, with the meeting link) or in a room. Mark each week as held, cancelled or moved.
+- **Meetings**, one-off or repeating, online (Teams, Google Meet or Zoom, with the meeting link) or in a room. Mark each week as held, cancelled or moved.
 - **Coursework deadlines** are worked out from the teaching weeks you set in Settings.
 - **Research students**, in four lists: PhD, PhD External, MSc and MSc External. Assessments, annual reports, submission and viva: type in the deadlines from the university system and the app reminds you in time.
 - **External students** (registered at another university) start with a blank list of assessments. Add their own deadlines and choose how long before each one to be reminded. You can do the same for any student, alongside the standard assessments.
+- **External students in Brazil**: tick *On a Brazilian programme* to get the levels (academic or professional master's and doctorate), the grant from CNPq, CAPES, FINEP, ANP, the 27 state foundations (FAPs) or other sources, with its length, extension and end date, the standard stages (course credits, language proficiency, qualifying exam, annual reports, sending the work to the committee, defence, final version) and the defence with its committee and result. *Fill in suggested deadlines* works them out from the enrolment date, using the months per level in Settings › Brazilian programmes.
 - **Placement visits**: requests, replies and whether the line manager is coming.
 - **Calendar** as a list or a month grid. Once a meeting's time has passed, mark it as held or postpone it right there (in the month grid, right-click it). Export any items to an `.ics` file for Outlook or Google Calendar, or save an invite file for one meeting to send to the student.
 

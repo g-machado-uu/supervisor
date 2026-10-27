@@ -1,12 +1,13 @@
 //! Settings: academic calendar, courses, module/coursework templates,
-//! invitations, security, key file and about.
+//! deadlines of Brazilian programmes, invitations, security, key file and
+//! about.
 
 use std::collections::HashMap;
 
 use egui::{RichText, Ui};
 use zeroize::Zeroizing;
 
-use crate::model::{CourseworkTemplate, Module, Programme, Semester, Settings};
+use crate::model::{BrLevel, BrRule, CourseworkTemplate, Module, Programme, Semester, Settings, default_br_rules};
 use crate::storage;
 use crate::ui::{icons, theme, widgets};
 
@@ -147,6 +148,11 @@ pub fn show(
             if ui.button("➕ Add module").clicked() {
                 settings.modules.push(Module::default());
             }
+        });
+
+        ui.add_space(8.0);
+        theme::card(ui, "Brazilian programmes", |ui| {
+            br_rules_editor(ui, &mut settings.br_rules);
         });
 
         ui.add_space(8.0);
@@ -478,4 +484,64 @@ fn courses_editor(ui: &mut Ui, programmes: &mut Vec<Programme>, in_use: &HashMap
     if ui.button("➕ Add course").clicked() {
         programmes.push(Programme::default());
     }
+}
+
+/// Months from enrolment to each stage, per Brazilian level; 0 = doesn't apply.
+fn br_rules_editor(ui: &mut Ui, rules: &mut Vec<BrRule>) {
+    // A level missing from the file: fill in its defaults.
+    for level in BrLevel::ALL {
+        if !rules.iter().any(|r| r.level == level) {
+            rules.push(BrRule::default_for(level));
+        }
+    }
+    let note = |ui: &mut Ui, text: &str| {
+        ui.add(
+            egui::Label::new(RichText::new(text).small().color(theme::muted(ui)))
+                .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+    };
+    note(
+        ui,
+        "For external students on a Brazilian programme: months from enrolment to each stage (0 = doesn't apply), \
+         used by “Fill in suggested deadlines”. Each programme sets its own in its regulations (regimento); \
+         these defaults are only a common starting point.",
+    );
+    egui::ScrollArea::horizontal().id_salt("br-rules-scroll").show(ui, |ui| {
+        egui::Grid::new("br-rules")
+            .num_columns(5)
+            .striped(true)
+            .spacing([14.0, 6.0])
+            .show(ui, |ui| {
+                for h in ["Level", "Credits", "Proficiency", "Qualifying exam", "Defence"] {
+                    ui.label(RichText::new(h).small().color(theme::muted(ui)));
+                }
+                ui.end_row();
+                for level in BrLevel::ALL {
+                    let Some(r) = rules.iter_mut().find(|r| r.level == level) else { continue };
+                    ui.label(level.label()).on_hover_text(level.portuguese());
+                    for (i, value) in [
+                        &mut r.credits_months,
+                        &mut r.proficiency_months,
+                        &mut r.qualification_months,
+                        &mut r.defence_months,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        ui.push_id((level.label(), i), |ui| {
+                            ui.add(egui::DragValue::new(value).range(0..=96).suffix(" months"));
+                        });
+                    }
+                    ui.end_row();
+                }
+            });
+    });
+    if ui.small_button("Restore defaults").clicked() {
+        *rules = default_br_rules();
+    }
+    note(
+        ui,
+        "Grants: master's up to 24 months and doctorate up to 48 (CAPES Portaria 76/2010, art. 10; CNPq and \
+         most FAPs). Extensions: up to 180 days for childbirth, adoption or guardianship (Law 14,925/2024).",
+    );
 }

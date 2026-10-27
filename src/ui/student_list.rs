@@ -293,7 +293,7 @@ fn table(
                                 );
                             }
                             if let Some(p) = &s.phd {
-                                theme::chip(ui, p.degree.label(), theme::PLUM);
+                                theme::chip(ui, p.degree_label(), theme::PLUM);
                             }
                             if s.placement.is_some() {
                                 theme::chip(ui, "Placement", theme::GREEN);

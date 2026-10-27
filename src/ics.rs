@@ -273,6 +273,7 @@ fn push_details(out: &mut String, item: &CalItem, settings: &Settings, invite: b
         let join = match e.platform {
             Platform::Teams => "Join on Microsoft Teams",
             Platform::GoogleMeet => "Join with Google Meet",
+            Platform::Zoom => "Join the Zoom meeting",
         };
         push_line(
             out,
@@ -340,6 +341,7 @@ fn location(e: &Event) -> Option<&str> {
         (true, _) => Some(match e.platform {
             Platform::Teams => "Microsoft Teams Meeting",
             Platform::GoogleMeet => "Google Meet",
+            Platform::Zoom => "Zoom Meeting",
         }),
         (false, false) => Some(&e.location),
         (false, true) => None,
@@ -613,9 +615,21 @@ mod tests {
 
         let meet = "https://meet.google.com/abc-defg-hij";
         e.link = meet.into();
-        let ics = unfold(&calendar(&[item(e)], &settings(""), true, &uk()));
+        let ics = unfold(&calendar(&[item(e.clone())], &settings(""), true, &uk()));
         assert!(ics.contains("DESCRIPTION:Join with Google Meet:\\n"));
         assert!(ics.contains(&format!("URL:{meet}")));
+
+        // Zoom: its own link only, never the Teams one.
+        e.platform = Platform::Zoom;
+        e.link = String::new();
+        let ics = unfold(&calendar(&[item(e.clone())], &settings(teams_link), true, &uk()));
+        assert!(ics.contains("LOCATION:Zoom Meeting"));
+        assert!(!ics.contains("URL:"), "the Teams link isn't used for Zoom");
+        let zoom = "https://ulster.zoom.us/j/123456789?pwd=abc";
+        e.link = zoom.into();
+        let ics = unfold(&calendar(&[item(e)], &settings(teams_link), true, &uk()));
+        assert!(ics.contains("DESCRIPTION:Join the Zoom meeting:\\n"));
+        assert!(ics.contains(&format!("URL:{zoom}")));
     }
 
     #[test]
