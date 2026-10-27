@@ -255,6 +255,10 @@ pub struct Settings {
     pub auto_lock_minutes: u32,
     /// Deadlines suggested for external students on Brazilian programmes.
     pub br_rules: Vec<BrRule>,
+    /// Show external students' registration numbers (sometimes a national
+    /// ID such as the CPF or National Insurance number) as dots until revealed.
+    pub hide_external_ids: bool,
+    pub reveal_needs_password: bool,
 }
 
 impl Default for Settings {
@@ -275,6 +279,8 @@ impl Default for Settings {
             export_with_guests: true,
             auto_lock_minutes: 10,
             br_rules: default_br_rules(),
+            hide_external_ids: true,
+            reveal_needs_password: false,
         }
     }
 }
@@ -1803,10 +1809,62 @@ pub fn id_label(external: bool) -> &'static str {
     if external { "Registration #" } else { "B Number" }
 }
 
+/// Whether `text` is a valid Brazilian CPF (11 digits with both check digits
+/// right), with or without dots and dash.
+pub fn is_cpf(text: &str) -> bool {
+    let digits: Vec<u32> = text.chars().filter_map(|c| c.to_digit(10)).collect();
+    let only_digits_and_marks = text.trim().chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-');
+    if digits.len() != 11 || !only_digits_and_marks || digits.iter().all(|d| *d == digits[0]) {
+        return false;
+    }
+    let check = |n: usize| {
+        let sum: u32 = digits[..n].iter().enumerate().map(|(i, d)| d * (n as u32 + 1 - i as u32)).sum();
+        (sum * 10 % 11) % 10
+    };
+    check(9) == digits[9] && check(10) == digits[10]
+}
+
+/// Whether `text` is shaped like a UK National Insurance number: two
+/// letters, six digits and A–D, with or without spaces (e.g. QQ 12 34 56 C).
+pub fn is_ni_number(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    chars.len() == 9
+        && chars[..2].iter().all(char::is_ascii_alphabetic)
+        && chars[2..8].iter().all(char::is_ascii_digit)
+        && matches!(chars[8].to_ascii_uppercase(), 'A'..='D')
+}
+
+/// A number hidden behind dots: shaped like a CPF when it is one, otherwise
+/// one dot per character (at least 6, at most 12).
+pub fn masked(number: &str) -> String {
+    let text = number.trim();
+    if text.is_empty() {
+        String::new()
+    } else if is_cpf(text) {
+        "•••.•••.•••-••".into()
+    } else {
+        "•".repeat(text.chars().count().clamp(6, 12))
+    }
+}
+
 impl Student {
     /// Registered at another university (an external research student).
     pub fn external(&self) -> bool {
         self.phd.as_ref().is_some_and(|p| p.external)
+    }
+
+    /// The registration number is shown as dots until revealed.
+    pub fn number_hidden(&self, settings: &Settings) -> bool {
+        settings.hide_external_ids && self.external() && !self.b_number.trim().is_empty()
+    }
+
+    /// The number as shown in lists: dots while it is hidden.
+    pub fn shown_number(&self, settings: &Settings) -> String {
+        if self.number_hidden(settings) {
+            masked(&self.b_number)
+        } else {
+            self.b_number.clone()
+        }
     }
 
     /// Every meeting across the project, advisee and PhD roles.
@@ -1830,11 +1888,15 @@ impl Student {
         fyp.chain(advisee).chain(phd)
     }
 
+    /// Name and B number, for titles, calendar files and messages. An
+    /// external student's registration number may be a national ID, so it
+    /// is never part of it.
     pub fn display_name(&self) -> String {
-        match (self.name.is_empty(), self.b_number.is_empty()) {
-            (false, false) => format!("{} ({})", self.name, self.b_number),
+        let number = if self.external() { "" } else { self.b_number.as_str() };
+        match (self.name.is_empty(), number.is_empty()) {
+            (false, false) => format!("{} ({number})", self.name),
             (false, true) => self.name.clone(),
-            (true, false) => self.b_number.clone(),
+            (true, false) => number.into(),
             (true, true) => "(unnamed student)".into(),
         }
     }
@@ -3140,6 +3202,57 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(settings.br_rule(BrLevel::ProfessionalDoctorate).qualification_months, 30);
+    }
+
+    #[test]
+    fn national_ids_are_recognised_and_masked() {
+        assert!(is_cpf("529.982.247-25") && is_cpf("52998224725"));
+        assert!(!is_cpf("529.982.247-26"), "wrong check digit");
+        assert!(!is_cpf("111.111.111-11") && !is_cpf("B00123456"));
+        assert!(is_ni_number("QQ 12 34 56 C") && is_ni_number("qq123456a"));
+        assert!(!is_ni_number("QQ123456E") && !is_ni_number("B00123456"));
+        assert_eq!(masked("529.982.247-25"), "•••.•••.•••-••");
+        assert_eq!(masked("2024"), "••••••");
+        assert_eq!(masked("  "), "");
+    }
+
+    #[test]
+    fn external_registration_numbers_stay_private() {
+        let mut settings = Settings::default();
+        assert!(settings.hide_external_ids && !settings.reveal_needs_password);
+        let mut s = Student {
+            name: "Ana".into(),
+            b_number: "529.982.247-25".into(),
+            phd: Some(ResearchGroup::PhdExternal.new_record()),
+            ..Default::default()
+        };
+        assert!(s.number_hidden(&settings));
+        assert_eq!(s.shown_number(&settings), "•••.•••.•••-••");
+        // Never in titles, so never in calendar or invite files.
+        assert_eq!(s.display_name(), "Ana");
+        s.phd.as_mut().unwrap().meetings.push(Meeting {
+            date: Some(d(2026, 10, 30)),
+            ..Default::default()
+        });
+        let db = Database {
+            students: vec![s.clone()],
+            ..Default::default()
+        };
+        assert!(db.events().iter().all(|e| !e.title.contains("529")));
+
+        settings.hide_external_ids = false;
+        assert!(!s.number_hidden(&settings));
+        assert_eq!(s.shown_number(&settings), "529.982.247-25");
+        // This university's students keep their B number, shown and in titles.
+        s.phd.as_mut().unwrap().external = false;
+        s.b_number = "B00123456".into();
+        settings.hide_external_ids = true;
+        assert!(!s.number_hidden(&settings));
+        assert_eq!(s.display_name(), "Ana (B00123456)");
+
+        // Older files hide them too.
+        let db: Database = serde_json::from_str(r#"{"settings":{"academic_year":"2026/27"}}"#).unwrap();
+        assert!(db.settings.hide_external_ids && !db.settings.reveal_needs_password);
     }
 
     #[test]

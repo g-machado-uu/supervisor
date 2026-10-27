@@ -220,7 +220,7 @@ fn table(
                     }
                 });
                 row.col(|ui| {
-                    ui.label(RichText::new(&s.b_number).color(theme::muted(ui)));
+                    ui.label(RichText::new(s.shown_number(&db.settings)).color(theme::muted(ui)));
                 });
                 match cat {
                     Category::Projects(_) => {

@@ -1,6 +1,6 @@
 //! Settings: academic calendar, courses, module/coursework templates,
-//! deadlines of Brazilian programmes, invitations, security, key file and
-//! about.
+//! deadlines of Brazilian programmes, invitations, privacy, security, key
+//! file and about.
 
 use std::collections::HashMap;
 
@@ -201,6 +201,26 @@ pub fn show(
                 RichText::new("Exports meetings, visits and coursework deadlines for Outlook / Google Calendar. The exported file is not encrypted.")
                     .small()
                     .color(theme::muted(ui)),
+            );
+        });
+
+        ui.add_space(8.0);
+        theme::card(ui, "Privacy", |ui| {
+            ui.checkbox(&mut settings.hide_external_ids, "Hide the registration numbers of external students");
+            ui.add_enabled_ui(settings.hide_external_ids, |ui| {
+                ui.checkbox(&mut settings.reveal_needs_password, "Ask for the password to reveal a registration number");
+            });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "An external student's registration number may be a national ID, such as a Brazilian CPF \
+                         or a National Insurance number. With this option it is shown as dots in lists and in the \
+                         student's details until you click “Reveal”. It is never put in calendar or invite files.",
+                    )
+                    .small()
+                    .color(theme::muted(ui)),
+                )
+                .wrap_mode(egui::TextWrapMode::Wrap),
             );
         });
 

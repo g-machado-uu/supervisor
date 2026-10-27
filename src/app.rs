@@ -136,6 +136,13 @@ enum Confirm {
     RemoveRole(Uuid, Role),
 }
 
+/// Asks for the password before showing a hidden registration number.
+struct RevealPrompt {
+    student: Uuid,
+    password: Zeroizing<String>,
+    error: Option<String>,
+}
+
 struct NewStudent {
     student: Student,
     fyp: bool,
@@ -245,6 +252,9 @@ struct Session {
     dirty_since: Option<f64>,
     status: SaveStatus,
     new_student: Option<NewStudent>,
+    /// The student whose hidden registration number is shown.
+    revealed: Option<Uuid>,
+    reveal_prompt: Option<RevealPrompt>,
     confirm: Option<Confirm>,
     password_form: PasswordForm,
     key_form: KeyFileForm,
@@ -287,6 +297,8 @@ impl Session {
             dirty_since: None,
             status: SaveStatus::Saved,
             new_student: None,
+            revealed: None,
+            reveal_prompt: None,
             confirm: None,
             password_form: PasswordForm::default(),
             key_form: KeyFileForm::default(),
@@ -477,6 +489,10 @@ impl Session {
             save_now = true;
         }
 
+        // A revealed registration number is hidden again once another student is opened.
+        if self.revealed.is_some() && self.revealed != self.selected {
+            self.revealed = None;
+        }
         self.sidebar(ui, &mut lock, &mut save_now);
         if self.view != View::Settings && self.selected.is_some() {
             self.detail_panel(ui);
@@ -685,6 +701,7 @@ impl Session {
             .db
             .student(id)
             .is_some_and(|s| self.db.b_number_taken(&s.b_number, Some(id)));
+        let revealed = self.revealed == Some(id);
         let Database { settings, students, .. } = &mut self.db;
         let Some(student) = students.iter_mut().find(|s| s.id == id) else {
             self.selected = None;
@@ -700,7 +717,7 @@ impl Session {
             .min_size(420.0)
             .frame(frame)
             .show(ui, |ui| {
-                action = student_form::show(ui, student, settings, dup);
+                action = student_form::show(ui, student, settings, dup, revealed);
             });
         match action {
             FormAction::None => {}
@@ -708,6 +725,15 @@ impl Session {
             FormAction::Delete => self.confirm = Some(Confirm::DeleteStudent(id)),
             FormAction::RemoveRole(role) => self.confirm = Some(Confirm::RemoveRole(id, role)),
             FormAction::Invite(uid) => self.save_invite(ui, id, &uid),
+            FormAction::Reveal if self.db.settings.reveal_needs_password => {
+                self.reveal_prompt = Some(RevealPrompt {
+                    student: id,
+                    password: Zeroizing::new(String::new()),
+                    error: None,
+                });
+            }
+            FormAction::Reveal => self.revealed = Some(id),
+            FormAction::Hide => self.revealed = None,
         }
     }
 
@@ -1266,6 +1292,64 @@ impl Session {
             }
         }
 
+        if let Some(prompt) = &mut self.reveal_prompt {
+            let name = self.db.student(prompt.student).map(|s| s.display_name()).unwrap_or_default();
+            let mut submit = false;
+            let mut cancel = false;
+            let resp = egui::Modal::new(Id::unique("reveal")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
+                ui.set_width(420.0);
+                ui.horizontal(|ui| {
+                    theme::icon_badge(ui, icons::EYE, theme::ACCENT, 40.0);
+                    ui.label(theme::serif("Reveal registration number", 22.0));
+                });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(format!("Type your password to see the registration number of {name}."))
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+                ui.add_space(6.0);
+                let field = crate::ui::widgets::password_field(
+                    ui,
+                    egui::TextEdit::singleline(&mut *prompt.password)
+                        .hint_text("Password")
+                        .desired_width(f32::INFINITY),
+                );
+                if !field.has_focus() && prompt.password.is_empty() && prompt.error.is_none() {
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if let Some(e) = &prompt.error {
+                    ui.colored_label(theme::fg(ui, theme::RED), e);
+                }
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(theme::primary_button("Reveal")).clicked() {
+                        submit = true;
+                    }
+                    if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 34.0))).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if submit && !prompt.password.is_empty() {
+                match self.vault.check_password(&prompt.password) {
+                    Ok(true) => {
+                        self.revealed = Some(prompt.student);
+                        self.reveal_prompt = None;
+                    }
+                    Ok(false) => {
+                        prompt.error = Some("Wrong password.".into());
+                        prompt.password = Zeroizing::new(String::new());
+                    }
+                    Err(e) => prompt.error = Some(format!("{e:#}")),
+                }
+            } else if cancel || resp.should_close() {
+                self.reveal_prompt = None;
+            }
+        }
+
         if let Some(confirm) = &self.confirm {
             let (title, body) = match confirm {
                 Confirm::DeleteStudent(id) => (
@@ -1333,7 +1417,7 @@ mod ui_tests {
     use chrono::{Datelike, Duration as Days, NaiveTime};
     use egui::accesskit::Role as AkRole;
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     const PASSWORD: &str = "test-password-123";
 
@@ -2093,5 +2177,89 @@ mod ui_tests {
         h.run_steps(3);
         assert!(h.query_by_label("B NUMBER").is_some() && h.query_by_label("B Number").is_some());
         assert!(h.query_by_label("REGISTRATION #").is_none() && h.query_by_label("Registration #").is_none());
+    }
+
+    fn all_text(h: &Harness<'_, SupervisorApp>) -> String {
+        h.root()
+            .children_recursive()
+            .flat_map(|n| [n.accesskit_node().label(), n.accesskit_node().value()])
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn external_registration_number_is_hidden_until_revealed() {
+        const CPF: &str = "529.982.247-25";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let external = |name: &str, number: &str| Student {
+            name: name.into(),
+            b_number: number.into(),
+            phd: Some(ResearchGroup::PhdExternal.new_record()),
+            ..Default::default()
+        };
+        let (ana, joao) = {
+            let s = session(&mut h);
+            let (ana, joao) = (external("Ana Souza", CPF), external("João Lima", "QQ123456C"));
+            let ids = (ana.id, joao.id);
+            s.db.students.extend([ana, joao]);
+            s.view = View::List(Category::Research(ResearchGroup::PhdExternal));
+            s.selected = Some(ids.0);
+            ids
+        };
+        h.run_steps(3);
+        assert!(!all_text(&h).contains(CPF), "the CPF is nowhere on screen");
+        assert!(!all_text(&h).contains("QQ123456C"));
+        // In the list, under the name and in the details.
+        assert_eq!(h.query_all_by_label("•••.•••.•••-••").count(), 3);
+        shot(&mut h, "18_registration_hidden");
+
+        // Without the password option, one click reveals it.
+        h.get_by_label(&format!("{} Reveal", icons::EYE)).click();
+        h.run_steps(2);
+        assert!(all_text(&h).contains(CPF));
+        assert!(h.query_by_label_contains("This is a CPF").is_some());
+        assert!(!all_text(&h).contains("QQ123456C"), "only this student's number");
+        // Opening another student hides it again.
+        session(&mut h).selected = Some(joao);
+        h.run_steps(2);
+        session(&mut h).selected = Some(ana);
+        h.run_steps(2);
+        assert!(!all_text(&h).contains(CPF), "hidden again after switching students");
+
+        // With the option on, revealing asks for the password.
+        session(&mut h).db.settings.reveal_needs_password = true;
+        h.run_steps(1);
+        h.get_by_label(&format!("{} Reveal", icons::EYE)).click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Reveal registration number").is_some());
+        shot(&mut h, "19_reveal_with_password");
+        let field = h.get_by_role(AkRole::PasswordInput);
+        field.focus();
+        field.type_text("wrong-password-000");
+        h.run_steps(1);
+        h.get_by_label("Reveal").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Wrong password.").is_some());
+        assert!(!all_text(&h).contains(CPF));
+        let field = h.get_by_role(AkRole::PasswordInput);
+        field.focus();
+        field.type_text(PASSWORD);
+        h.run_steps(1);
+        h.get_by_label("Reveal").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Reveal registration number").is_none(), "dialog closed");
+        assert!(all_text(&h).contains(CPF));
+        h.get_by_label(&format!("{} Hide", icons::EYE_SLASH)).click();
+        h.run_steps(2);
+        assert!(!all_text(&h).contains(CPF));
+
+        // Turning the option off shows the numbers everywhere.
+        session(&mut h).db.settings.hide_external_ids = false;
+        h.run_steps(2);
+        assert!(all_text(&h).contains(CPF) && all_text(&h).contains("QQ123456C"));
+        assert!(h.query_by_label_contains("National Insurance").is_none(), "João isn't open");
     }
 }
