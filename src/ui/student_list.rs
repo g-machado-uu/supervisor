@@ -152,6 +152,9 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
             "Meetings",
             "Coursework",
         ],
+        Category::Research(group) if group.external() => {
+            &["Name", "Registration #", "Year", "Meetings", "Next deadline"]
+        }
         Category::Research(_) => &["Name", "B Number", "Year", "Meetings", "Next deadline"],
         Category::Placement => &["Name", "B Number", "Company", "Visit 1", "Visit 2"],
         Category::Advisee => &["Name", "B Number", "Course", "Semester 1", "Semester 2"],

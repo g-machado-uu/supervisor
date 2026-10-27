@@ -89,11 +89,17 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         theme::card(ui, "Details", |ui| {
             widgets::form_grid(ui, "details-grid", |ui| {
-                ui.label("B Number");
+                let external = s.external();
+                ui.label(crate::model::id_label(external));
                 ui.vertical(|ui| {
-                    widgets::text_field(ui, &mut s.b_number, "B00123456");
+                    let (hint, number) = if external {
+                        ("Registration number at their university", "registration number")
+                    } else {
+                        ("B00123456", "B number")
+                    };
+                    widgets::text_field(ui, &mut s.b_number, hint);
                     if duplicate_b {
-                        ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} Another student has this B number", icons::WARNING));
+                        ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} Another student has this {number}", icons::WARNING));
                     }
                 });
                 ui.end_row();

@@ -1797,7 +1797,18 @@ impl Default for Student {
     }
 }
 
+/// What the student number is called: this university's B number, or the
+/// registration number at an external student's own university.
+pub fn id_label(external: bool) -> &'static str {
+    if external { "Registration #" } else { "B Number" }
+}
+
 impl Student {
+    /// Registered at another university (an external research student).
+    pub fn external(&self) -> bool {
+        self.phd.as_ref().is_some_and(|p| p.external)
+    }
+
     /// Every meeting across the project, advisee and PhD roles.
     pub fn meetings(&self) -> impl Iterator<Item = &Meeting> {
         let fyp = self.fyp.iter().flat_map(|f| &f.meetings);

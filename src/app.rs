@@ -1198,11 +1198,13 @@ impl Session {
                     });
                 });
                 ui.add_space(10.0);
+                let external = n.phd && n.research.external();
                 crate::ui::widgets::form_grid(ui, "new-grid", |ui| {
                     let s = &mut n.student;
-                    ui.label("B Number");
+                    ui.label(crate::model::id_label(external));
                     ui.vertical(|ui| {
-                        crate::ui::widgets::text_field(ui, &mut s.b_number, "B00123456");
+                        let hint = if external { "Registration number at their university" } else { "B00123456" };
+                        crate::ui::widgets::text_field(ui, &mut s.b_number, hint);
                         if dup {
                             ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} Already exists", icons::WARNING));
                         }
@@ -2032,6 +2034,11 @@ mod ui_tests {
         let phd = |h: &mut Harness<'_, SupervisorApp>| session(h).db.student(ana).unwrap().phd.clone().unwrap();
         assert!(h.query_by_label("Standard assessments of this university").is_some());
         assert!(h.query_by_label("GRANT").is_none());
+        // Their own university's number, in the list header and the details.
+        // (list headers are shown in capitals).
+        assert!(h.query_by_label("REGISTRATION #").is_some());
+        assert!(h.query_by_label("Registration #").is_some());
+        assert!(h.query_by_label("B NUMBER").is_none() && h.query_by_label("B Number").is_none());
 
         h.get_by_label("On a Brazilian programme").click();
         h.run_steps(3);
@@ -2076,5 +2083,15 @@ mod ui_tests {
         h.run_steps(3);
         assert!(h.query_by_label("BRAZILIAN PROGRAMMES").is_some());
         assert!(h.query_by_label("Professional doctorate").is_some());
+
+        // Not external any more: back to the B number.
+        {
+            let s = session(&mut h);
+            s.db.student_mut(ana).unwrap().phd.as_mut().unwrap().external = false;
+            s.view = View::List(Category::Research(ResearchGroup::Phd));
+        }
+        h.run_steps(3);
+        assert!(h.query_by_label("B NUMBER").is_some() && h.query_by_label("B Number").is_some());
+        assert!(h.query_by_label("REGISTRATION #").is_none() && h.query_by_label("Registration #").is_none());
     }
 }
