@@ -2,7 +2,7 @@
 
 use egui::{Align, Layout, RichText, Ui};
 
-use crate::model::{AdviseeRecord, FypRecord, PhdRecord, PlacementRecord, Settings, Student};
+use crate::model::{AdviseeRecord, FypRecord, PhdRecord, PlacementRecord, Settings, Student, is_cpf, is_ni_number, masked};
 use crate::ui::{advisee, fyp, icons, phd, placement, theme, widgets};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,18 +31,25 @@ pub enum FormAction {
     RemoveRole(Role),
     /// Save an invite file for the meeting or visit with this UID.
     Invite(String),
+    /// Show the hidden registration number of this student.
+    Reveal,
+    /// Hide it again.
+    Hide,
 }
 
-pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool) -> FormAction {
+/// `revealed`: the hidden registration number of this student is shown.
+pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool, revealed: bool) -> FormAction {
     let mut action = FormAction::None;
+    let hidden = s.number_hidden(settings) && !revealed;
     ui.horizontal(|ui| {
         theme::avatar(ui, &s.name, 52.0);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(theme::serif(if s.name.is_empty() { "New student" } else { &s.name }, 24.0));
             let mut sub = vec![];
-            if !s.b_number.is_empty() {
-                sub.push(s.b_number.as_str());
+            let number = if hidden { masked(&s.b_number) } else { s.b_number.clone() };
+            if !number.is_empty() {
+                sub.push(number.as_str());
             }
             if !s.course.is_empty() {
                 sub.push(s.course.as_str());
@@ -67,8 +74,12 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
             theme::chip(ui, format!("{} {}", icons::BOOK_OPEN_TEXT, settings.programme_short(&f.programme)), theme::ACCENT);
         }
         if let Some(p) = &s.phd {
-            let ext = if p.external { " External" } else { "" };
-            theme::chip(ui, format!("{} {}{ext}", icons::GRADUATION_CAP, p.degree.label()), theme::PLUM);
+            let ext = match (p.external, p.brazilian_programme()) {
+                (true, true) => " External · Brazil",
+                (true, false) => " External",
+                (false, _) => "",
+            };
+            theme::chip(ui, format!("{} {}{ext}", icons::GRADUATION_CAP, p.degree_label()), theme::PLUM);
         }
         if s.placement.is_some() {
             theme::chip(ui, format!("{} Placement", icons::BUILDINGS), theme::AMBER);
@@ -85,11 +96,53 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         theme::card(ui, "Details", |ui| {
             widgets::form_grid(ui, "details-grid", |ui| {
-                ui.label("B Number");
+                let external = s.external();
+                ui.label(crate::model::id_label(external));
                 ui.vertical(|ui| {
-                    widgets::text_field(ui, &mut s.b_number, "B00123456");
+                    let (hint, number) = if external {
+                        ("Registration number at their university", "registration number")
+                    } else {
+                        ("B00123456", "B number")
+                    };
+                    if hidden {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(masked(&s.b_number)).monospace());
+                            let hover = if settings.reveal_needs_password {
+                                "Show the registration number (asks for your password)"
+                            } else {
+                                "Show the registration number"
+                            };
+                            if ui.button(format!("{} Reveal", icons::EYE)).on_hover_text(hover).clicked() {
+                                action = FormAction::Reveal;
+                            }
+                        });
+                    } else if s.number_hidden(settings) {
+                        ui.horizontal(|ui| {
+                            let width = (ui.available_width() - 90.0).max(120.0);
+                            ui.add(egui::TextEdit::singleline(&mut s.b_number).hint_text(hint).desired_width(width));
+                            if ui.button(format!("{} Hide", icons::EYE_SLASH)).clicked() {
+                                action = FormAction::Hide;
+                            }
+                        });
+                    } else {
+                        widgets::text_field(ui, &mut s.b_number, hint);
+                    }
+                    let id = if is_cpf(&s.b_number) {
+                        Some("This is a CPF")
+                    } else if is_ni_number(&s.b_number) {
+                        Some("This looks like a National Insurance number")
+                    } else {
+                        None
+                    };
+                    if let Some(id) = id.filter(|_| external) {
+                        ui.label(
+                            RichText::new(format!("{} {id} – avoid sharing it", icons::KEY))
+                                .small()
+                                .color(theme::muted(ui)),
+                        );
+                    }
                     if duplicate_b {
-                        ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} Another student has this B number", icons::WARNING));
+                        ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} Another student has this {number}", icons::WARNING));
                     }
                 });
                 ui.end_row();

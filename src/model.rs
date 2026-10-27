@@ -10,6 +10,10 @@ pub const DB_VERSION: u32 = 1;
 
 /// How long before a PhD student's visa ends to flag it on the dashboard.
 const VISA_WARNING_DAYS: i64 = 90;
+/// How long before a Brazilian grant ends to flag it on the dashboard...
+const GRANT_WARNING_DAYS: i64 = 90;
+/// ...and for how long after it ended.
+const GRANT_ENDED_DAYS: i64 = 30;
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -85,15 +89,17 @@ pub enum Platform {
     #[default]
     Teams,
     GoogleMeet,
+    Zoom,
 }
 
 impl Platform {
-    pub const ALL: [Platform; 2] = [Platform::Teams, Platform::GoogleMeet];
+    pub const ALL: [Platform; 3] = [Platform::Teams, Platform::GoogleMeet, Platform::Zoom];
 
     pub fn label(self) -> &'static str {
         match self {
             Platform::Teams => "Teams",
             Platform::GoogleMeet => "Google Meet",
+            Platform::Zoom => "Zoom",
         }
     }
 }
@@ -247,6 +253,12 @@ pub struct Settings {
     pub export_with_guests: bool,
     /// Lock after this many minutes without input; 0 = never.
     pub auto_lock_minutes: u32,
+    /// Deadlines suggested for external students on Brazilian programmes.
+    pub br_rules: Vec<BrRule>,
+    /// Show external students' registration numbers (sometimes a national
+    /// ID such as the CPF or National Insurance number) as dots until revealed.
+    pub hide_external_ids: bool,
+    pub reveal_needs_password: bool,
 }
 
 impl Default for Settings {
@@ -266,6 +278,9 @@ impl Default for Settings {
             teams_link: String::new(),
             export_with_guests: true,
             auto_lock_minutes: 10,
+            br_rules: default_br_rules(),
+            hide_external_ids: true,
+            reveal_needs_password: false,
         }
     }
 }
@@ -420,6 +435,15 @@ impl Settings {
         }
         lists
     }
+
+    /// Deadline rules of a Brazilian level, or the defaults if not in the file.
+    pub fn br_rule(&self, level: BrLevel) -> BrRule {
+        self.br_rules
+            .iter()
+            .find(|r| r.level == level)
+            .cloned()
+            .unwrap_or_else(|| BrRule::default_for(level))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +462,7 @@ pub struct Meeting {
     pub time: Option<NaiveTime>,
     /// For one-off meetings; repeating ones track this per week.
     pub held: bool,
-    /// Online (Teams or Google Meet) rather than in a room; older files call this `teams`.
+    /// Online (Teams, Google Meet or Zoom) rather than in a room; older files call this `teams`.
     #[serde(alias = "teams")]
     pub online: bool,
     pub platform: Platform,
@@ -1047,6 +1071,13 @@ impl Lead {
         }
     }
 
+    pub fn weeks(amount: u32) -> Self {
+        Self {
+            amount,
+            unit: LeadUnit::Weeks,
+        }
+    }
+
     pub fn before(self, date: NaiveDate) -> Option<NaiveDate> {
         match (self.amount, self.unit) {
             (0, _) => None,
@@ -1090,6 +1121,360 @@ pub struct PhdStep {
     pub lead: Lead,
 }
 
+// ---------------------------------------------------------------------------
+// Brazilian programmes (external MSc and PhD students)
+// ---------------------------------------------------------------------------
+
+/// Stricto sensu levels of a Brazilian postgraduate programme.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum BrLevel {
+    #[default]
+    AcademicMasters,
+    ProfessionalMasters,
+    AcademicDoctorate,
+    ProfessionalDoctorate,
+}
+
+impl BrLevel {
+    pub const ALL: [BrLevel; 4] = [
+        BrLevel::AcademicMasters,
+        BrLevel::ProfessionalMasters,
+        BrLevel::AcademicDoctorate,
+        BrLevel::ProfessionalDoctorate,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrLevel::AcademicMasters => "Academic master's",
+            BrLevel::ProfessionalMasters => "Professional master's",
+            BrLevel::AcademicDoctorate => "Academic doctorate",
+            BrLevel::ProfessionalDoctorate => "Professional doctorate",
+        }
+    }
+
+    /// The name used in Brazil, as a hint.
+    pub fn portuguese(self) -> &'static str {
+        match self {
+            BrLevel::AcademicMasters => "Mestrado acadêmico",
+            BrLevel::ProfessionalMasters => "Mestrado profissional",
+            BrLevel::AcademicDoctorate => "Doutorado acadêmico",
+            BrLevel::ProfessionalDoctorate => "Doutorado profissional",
+        }
+    }
+
+    /// For event titles, e.g. "MSc supervision".
+    pub fn short(self) -> &'static str {
+        match self {
+            BrLevel::AcademicMasters => "MSc",
+            BrLevel::ProfessionalMasters => "Prof MSc",
+            BrLevel::AcademicDoctorate => "PhD",
+            BrLevel::ProfessionalDoctorate => "Prof Doc",
+        }
+    }
+
+    pub fn masters(self) -> bool {
+        matches!(self, BrLevel::AcademicMasters | BrLevel::ProfessionalMasters)
+    }
+
+    /// The work that ends the course.
+    pub fn work(self) -> &'static str {
+        match self {
+            BrLevel::AcademicMasters => "dissertation",
+            BrLevel::ProfessionalMasters => "final project",
+            BrLevel::AcademicDoctorate | BrLevel::ProfessionalDoctorate => "thesis",
+        }
+    }
+
+    /// The closest degree of this university, which picks the sidebar list.
+    pub fn degree(self) -> ResearchDegree {
+        match self {
+            BrLevel::AcademicMasters | BrLevel::ProfessionalMasters => ResearchDegree::MSc,
+            BrLevel::AcademicDoctorate => ResearchDegree::PhD,
+            BrLevel::ProfessionalDoctorate => ResearchDegree::ProfDoc,
+        }
+    }
+
+    pub fn from_degree(degree: ResearchDegree) -> Self {
+        match degree {
+            ResearchDegree::ProfDoc => BrLevel::ProfessionalDoctorate,
+            d if d.masters() => BrLevel::AcademicMasters,
+            _ => BrLevel::AcademicDoctorate,
+        }
+    }
+
+    /// Usual length of a grant in months: up to 24 for a master's and 48 for
+    /// a doctorate (CAPES Portaria 76/2010 art. 10, CNPq and most FAPs).
+    pub fn typical_grant_months(self) -> u32 {
+        if self.masters() { 24 } else { 48 }
+    }
+}
+
+/// Deadlines of a Brazilian level, in months from enrolment; 0 = doesn't
+/// apply. Each programme's regulations (regimento) set its own, so these are
+/// only a common starting point and can be changed in Settings.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct BrRule {
+    pub level: BrLevel,
+    /// Complete the course credits.
+    pub credits_months: u32,
+    /// Foreign-language proficiency exam.
+    pub proficiency_months: u32,
+    /// Qualifying exam.
+    pub qualification_months: u32,
+    pub defence_months: u32,
+}
+
+impl Default for BrRule {
+    fn default() -> Self {
+        Self::default_for(BrLevel::AcademicMasters)
+    }
+}
+
+impl BrRule {
+    pub fn default_for(level: BrLevel) -> Self {
+        let (credits, proficiency, qualification, defence) = match level {
+            BrLevel::AcademicMasters => (12, 12, 12, 24),
+            BrLevel::ProfessionalMasters => (12, 12, 15, 24),
+            BrLevel::AcademicDoctorate => (24, 24, 24, 48),
+            BrLevel::ProfessionalDoctorate => (24, 24, 30, 48),
+        };
+        Self {
+            level,
+            credits_months: credits,
+            proficiency_months: proficiency,
+            qualification_months: qualification,
+            defence_months: defence,
+        }
+    }
+}
+
+pub fn default_br_rules() -> Vec<BrRule> {
+    BrLevel::ALL.into_iter().map(BrRule::default_for).collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AgencyKind {
+    Federal,
+    /// A state research foundation (FAP).
+    State,
+    Other,
+}
+
+/// A Brazilian body that funds postgraduate scholarships.
+pub struct Agency {
+    /// Stored on grants.
+    pub id: &'static str,
+    pub name: &'static str,
+    pub kind: AgencyKind,
+    /// State (UF) of a FAP.
+    pub uf: &'static str,
+}
+
+const fn agency(id: &'static str, name: &'static str, kind: AgencyKind, uf: &'static str) -> Agency {
+    Agency { id, name, kind, uf }
+}
+
+/// Federal agencies, the 27 state research foundations (FAPs, one per
+/// state, as listed by CONFAP) and other sources.
+pub const AGENCIES: &[Agency] = &[
+    agency("CNPq", "National Council for Scientific and Technological Development", AgencyKind::Federal, ""),
+    agency("CAPES", "Coordination for the Improvement of Higher Education Personnel", AgencyKind::Federal, ""),
+    agency("FINEP", "Funding Authority for Studies and Projects", AgencyKind::Federal, ""),
+    agency("ANP", "National Petroleum Agency – PRH-ANP human resources programme", AgencyKind::Federal, ""),
+    agency("FAPAC", "Acre Research Foundation", AgencyKind::State, "AC"),
+    agency("FAPEAL", "Alagoas State Research Foundation", AgencyKind::State, "AL"),
+    agency("FAPEAP", "Amapá Research Foundation", AgencyKind::State, "AP"),
+    agency("FAPEAM", "Amazonas State Research Foundation", AgencyKind::State, "AM"),
+    agency("FAPESB", "Bahia State Research Foundation", AgencyKind::State, "BA"),
+    agency("FUNCAP", "Ceará Foundation for Scientific and Technological Development", AgencyKind::State, "CE"),
+    agency("FAPDF", "Federal District Research Foundation", AgencyKind::State, "DF"),
+    agency("FAPES", "Espírito Santo Research and Innovation Foundation", AgencyKind::State, "ES"),
+    agency("FAPEG", "Goiás State Research Foundation", AgencyKind::State, "GO"),
+    agency("FAPEMA", "Maranhão Foundation for Research and Scientific Development", AgencyKind::State, "MA"),
+    agency("FAPEMAT", "Mato Grosso State Research Foundation", AgencyKind::State, "MT"),
+    agency("FUNDECT", "Mato Grosso do Sul Foundation for Education, Science and Technology", AgencyKind::State, "MS"),
+    agency("FAPEMIG", "Minas Gerais State Research Foundation", AgencyKind::State, "MG"),
+    agency("FAPESPA", "Amazon Research Foundation of Pará", AgencyKind::State, "PA"),
+    agency("FAPESQ", "Paraíba State Research Foundation", AgencyKind::State, "PB"),
+    agency("Araucária", "Araucária Foundation (Paraná)", AgencyKind::State, "PR"),
+    agency("FACEPE", "Pernambuco Science and Technology Foundation", AgencyKind::State, "PE"),
+    agency("FAPEPI", "Piauí State Research Foundation", AgencyKind::State, "PI"),
+    agency("FAPERJ", "Carlos Chagas Filho Research Foundation of Rio de Janeiro", AgencyKind::State, "RJ"),
+    agency("FAPERN", "Rio Grande do Norte State Research Foundation", AgencyKind::State, "RN"),
+    agency("FAPERGS", "Rio Grande do Sul State Research Foundation", AgencyKind::State, "RS"),
+    agency("FAPERO", "Rondônia Research Foundation", AgencyKind::State, "RO"),
+    agency("FAPERR", "Roraima State Research Foundation", AgencyKind::State, "RR"),
+    agency("FAPESC", "Santa Catarina Research and Innovation Foundation", AgencyKind::State, "SC"),
+    agency("FAPESP", "São Paulo Research Foundation", AgencyKind::State, "SP"),
+    agency("FAPITEC", "Sergipe Foundation for Research and Technological Innovation", AgencyKind::State, "SE"),
+    agency("FAPT", "Tocantins Research Foundation", AgencyKind::State, "TO"),
+    agency("Institutional", "A grant from the student's own university", AgencyKind::Other, ""),
+    agency("Company", "Company or partnership agreement", AgencyKind::Other, ""),
+    agency("Other", "Other source", AgencyKind::Other, ""),
+];
+
+pub fn agency_by_id(id: &str) -> Option<&'static Agency> {
+    AGENCIES.iter().find(|a| a.id == id)
+}
+
+/// "thesis" → "Thesis".
+fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+}
+
+/// Why a grant or the course deadlines were extended.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ExtensionReason {
+    #[default]
+    None,
+    /// Birth, adoption or guardianship (Lei 13.536/2017, amended by Lei 14.925/2024).
+    Parental,
+    Health,
+    /// Decided by the programme's board (colegiado).
+    Board,
+    Other,
+}
+
+impl ExtensionReason {
+    pub const ALL: [ExtensionReason; 5] = [
+        ExtensionReason::None,
+        ExtensionReason::Parental,
+        ExtensionReason::Health,
+        ExtensionReason::Board,
+        ExtensionReason::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ExtensionReason::None => "—",
+            ExtensionReason::Parental => "Parental leave (Law 14,925/2024)",
+            ExtensionReason::Health => "Health",
+            ExtensionReason::Board => "Programme board decision",
+            ExtensionReason::Other => "Other reason",
+        }
+    }
+
+    /// A hint on how long the extension may be.
+    pub fn hint(self) -> &'static str {
+        match self {
+            ExtensionReason::Parental => {
+                "Law 14,925/2024 allows grants to be extended by up to 180 days (6 months) for childbirth, adoption or guardianship."
+            }
+            ExtensionReason::Health => {
+                "At CAPES (Portaria 76/2010), a suspension for serious illness, childbirth or breastfeeding lasts up to 6 months and doesn't count towards the grant period."
+            }
+            _ => "",
+        }
+    }
+}
+
+/// A Brazilian scholarship (bolsa): who pays, which scheme, and for how long.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Grant {
+    /// `Agency::id`; empty when there is no grant.
+    pub agency: String,
+    /// Name of the source when `agency` is "Other".
+    pub agency_other: String,
+    /// E.g. "Demanda Social", "PROEX", "GM", "GD".
+    pub modality: String,
+    /// Process number at the agency.
+    pub process: String,
+    pub start: Option<NaiveDate>,
+    /// Planned length in months; 0 = not set.
+    pub months: u32,
+    /// Months added by an extension.
+    pub extension_months: u32,
+    pub extension_reason: ExtensionReason,
+}
+
+impl Grant {
+    pub fn active(&self) -> bool {
+        !self.agency.is_empty()
+    }
+
+    /// Last day of the grant: start + months + extension, minus a day.
+    pub fn end(&self) -> Option<NaiveDate> {
+        if !self.active() || self.months == 0 {
+            return None;
+        }
+        self.start?
+            .checked_add_months(Months::new(self.months + self.extension_months))?
+            .pred_opt()
+    }
+
+    /// "CAPES", or the name typed in for another source.
+    pub fn agency_label(&self) -> String {
+        match self.agency.as_str() {
+            "Other" if !self.agency_other.trim().is_empty() => self.agency_other.trim().into(),
+            "" => "No grant".into(),
+            id => id.into(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DefenceOutcome {
+    #[default]
+    Pending,
+    Approved,
+    ApprovedWithCorrections,
+    Resubmit,
+    Failed,
+}
+
+impl DefenceOutcome {
+    pub const ALL: [DefenceOutcome; 5] = [
+        DefenceOutcome::Pending,
+        DefenceOutcome::Approved,
+        DefenceOutcome::ApprovedWithCorrections,
+        DefenceOutcome::Resubmit,
+        DefenceOutcome::Failed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DefenceOutcome::Pending => "Not yet known",
+            DefenceOutcome::Approved => "Approved",
+            DefenceOutcome::ApprovedWithCorrections => "Approved with corrections",
+            DefenceOutcome::Resubmit => "Revise and defend again",
+            DefenceOutcome::Failed => "Not approved",
+        }
+    }
+
+    /// A final version has to be handed in after the defence.
+    pub fn corrections(self) -> bool {
+        matches!(self, DefenceOutcome::ApprovedWithCorrections | DefenceOutcome::Resubmit)
+    }
+}
+
+/// What a Brazilian programme adds to a research record: its level, grant,
+/// stages and defence. Dates shared with the UK record (start, annual
+/// reports, submission, the defence date, final version) stay on `PhdRecord`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct BrazilRecord {
+    pub level: BrLevel,
+    /// Postgraduate programme (PPG).
+    pub programme: String,
+    /// Months added to the course deadlines by an extension (prorrogação).
+    pub extension_months: u32,
+    pub extension_reason: ExtensionReason,
+    pub grant: Grant,
+    pub credits: Milestone,
+    pub proficiency: Milestone,
+    pub qualification: Milestone,
+    /// The deadline for the defence.
+    pub defence_deadline: Milestone,
+    /// Examining committee (banca).
+    pub committee: String,
+    pub outcome: DefenceOutcome,
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[serde(default)]
 pub struct PhdRecord {
@@ -1104,6 +1489,10 @@ pub struct PhdRecord {
     pub external: bool,
     /// Their university, for external students.
     pub university: String,
+    /// An external student on a Brazilian programme: `brazil` then gives
+    /// the level, grant, stages and defence.
+    pub brazilian: bool,
+    pub brazil: BrazilRecord,
     pub fee_status: FeeStatus,
     pub visa: VisaType,
     /// Name of the visa when `visa` is `Other`.
@@ -1143,35 +1532,58 @@ pub struct PhdRecord {
 impl PhdRecord {
     /// Every step with a deadline, in the order of the degree, then those
     /// added by hand. Reminder lead times of the standard steps follow the
-    /// university system (e.g. 3 months for the initial assessment).
+    /// university system (e.g. 3 months for the initial assessment); for
+    /// Brazilian programmes, the stages of a mestrado or doutorado.
     pub fn steps(&self) -> Vec<PhdStep> {
-        let step = |key: &str, label: &str, milestone: &Milestone, lead_months| PhdStep {
+        let step = |key: &str, label: &str, milestone: &Milestone, lead| PhdStep {
             key: key.into(),
             label: label.into(),
             milestone: milestone.clone(),
-            lead: Lead::months(lead_months),
+            lead,
         };
+        let annual_reports = self.annual_reports.iter().enumerate().map(|(i, report)| {
+            let label = match report.deadline {
+                Some(d) => format!("Annual report {}", d.year()),
+                None => format!("Annual report {}", i + 1),
+            };
+            step(&format!("annual{}", i + 1), &label, report, Lead::months(1))
+        });
         let mut steps = Vec::new();
-        if !self.skip_standard {
-            steps.extend([
-                step("initial", "Initial assessment", &self.initial, 3),
-                step("confirmation", "Confirmation assessment", &self.confirmation, 4),
-                step("final", "Final assessment", &self.final_assessment, 7),
-            ]);
-            for (i, report) in self.annual_reports.iter().enumerate() {
-                let label = match report.deadline {
-                    Some(d) => format!("Annual report {}", d.year()),
-                    None => format!("Annual report {}", i + 1),
-                };
-                steps.push(step(&format!("annual{}", i + 1), &label, report, 1));
+        match (self.skip_standard, self.brazilian_programme()) {
+            (true, _) => {}
+            (false, true) => {
+                let br = &self.brazil;
+                let work = capitalised(br.level.work());
+                steps.extend([
+                    step("credits", "Course credits", &br.credits, Lead::months(2)),
+                    step("proficiency", "Language proficiency", &br.proficiency, Lead::months(2)),
+                    step("qualification", "Qualifying exam", &br.qualification, Lead::months(3)),
+                ]);
+                steps.extend(annual_reports);
+                steps.extend([
+                    step("submission", &format!("{work} to the committee"), &self.submission, Lead::months(1)),
+                    step("defence", &format!("{work} defence"), &br.defence_deadline, Lead::months(4)),
+                ]);
             }
-            steps.extend([
-                step("examiners", "Appoint examiners", &self.examiners, 1),
-                step("intention", "Intention to submit", &self.intention, 1),
-                step("submission", "Thesis submission", &self.submission, 1),
-            ]);
+            (false, false) => {
+                steps.extend([
+                    step("initial", "Initial assessment", &self.initial, Lead::months(3)),
+                    step("confirmation", "Confirmation assessment", &self.confirmation, Lead::months(4)),
+                    step("final", "Final assessment", &self.final_assessment, Lead::months(7)),
+                ]);
+                steps.extend(annual_reports);
+                steps.extend([
+                    step("examiners", "Appoint examiners", &self.examiners, Lead::months(1)),
+                    step("intention", "Intention to submit", &self.intention, Lead::months(1)),
+                    step("submission", "Thesis submission", &self.submission, Lead::months(1)),
+                ]);
+            }
         }
-        steps.push(step("amendments", "Amendments", &self.amendments, 1));
+        steps.push(if self.brazilian_programme() {
+            step("amendments", "Final version", &self.amendments, Lead::weeks(2))
+        } else {
+            step("amendments", "Amendments", &self.amendments, Lead::months(1))
+        });
         steps.extend(self.custom_steps.iter().map(|c| PhdStep {
             key: format!("custom-{}", c.id),
             label: match c.title.trim() {
@@ -1184,13 +1596,131 @@ impl PhdRecord {
         steps
     }
 
+    /// External and on a Brazilian programme (the box only counts for
+    /// external students).
+    pub fn brazilian_programme(&self) -> bool {
+        self.external && self.brazilian
+    }
+
+    /// The Brazilian grant, if the student is on a Brazilian programme and has one.
+    pub fn brazilian_grant(&self) -> Option<&Grant> {
+        Some(&self.brazil.grant).filter(|g| self.brazilian_programme() && g.active())
+    }
+
     /// Which research list the student is shown in.
     pub fn group(&self) -> ResearchGroup {
-        match (self.degree.masters(), self.external) {
+        let masters = if self.brazilian_programme() {
+            self.brazil.level.masters()
+        } else {
+            self.degree.masters()
+        };
+        match (masters, self.external) {
             (false, false) => ResearchGroup::Phd,
             (false, true) => ResearchGroup::PhdExternal,
             (true, false) => ResearchGroup::Msc,
             (true, true) => ResearchGroup::MscExternal,
+        }
+    }
+
+    /// The degree's name, or the Brazilian level.
+    pub fn degree_label(&self) -> &'static str {
+        if self.brazilian_programme() {
+            self.brazil.level.label()
+        } else {
+            self.degree.label()
+        }
+    }
+
+    /// For event titles, e.g. "MSc supervision".
+    pub fn degree_short(&self) -> &'static str {
+        if self.brazilian_programme() {
+            self.brazil.level.short()
+        } else {
+            self.degree.short()
+        }
+    }
+
+    /// The viva, or the defence, has a result.
+    pub fn examined(&self) -> bool {
+        if self.brazilian_programme() {
+            self.brazil.outcome != DefenceOutcome::Pending
+        } else {
+            self.outcome != VivaOutcome::Pending
+        }
+    }
+
+    /// Tick or untick "Brazilian programme". Ticking brings in the standard
+    /// stages of the course (external students otherwise start without
+    /// any) and a level matching the degree.
+    pub fn set_brazilian(&mut self, brazilian: bool) {
+        if brazilian == self.brazilian {
+            return;
+        }
+        self.brazilian = brazilian;
+        self.skip_standard = !brazilian;
+        if brazilian {
+            self.brazil.level = BrLevel::from_degree(self.degree);
+        }
+    }
+
+    pub fn set_br_level(&mut self, level: BrLevel) {
+        self.brazil.level = level;
+        self.degree = level.degree();
+    }
+
+    /// The defence deadline the rules give: enrolment + months of the
+    /// level + any extension.
+    pub fn br_rule_deadline(&self, rule: &BrRule) -> Option<NaiveDate> {
+        (rule.defence_months > 0)
+            .then(|| {
+                self.start?
+                    .checked_add_months(Months::new(rule.defence_months + self.brazil.extension_months))
+            })
+            .flatten()
+    }
+
+    /// Fills the empty Brazilian deadlines from the start (enrolment) and
+    /// the rules of the level; dates already set are kept. Annual reports
+    /// are added for each full year before the defence deadline.
+    pub fn suggest_br(&mut self, rule: &BrRule) {
+        let Some(start) = self.start else { return };
+        let at = |months: u32| (months > 0).then(|| start.checked_add_months(Months::new(months))).flatten();
+        let defence = self.br_rule_deadline(rule);
+        let br = &mut self.brazil;
+        for (m, months) in [
+            (&mut br.credits, rule.credits_months),
+            (&mut br.proficiency, rule.proficiency_months),
+            (&mut br.qualification, rule.qualification_months),
+        ] {
+            if m.deadline.is_none() {
+                m.deadline = at(months);
+            }
+        }
+        if br.defence_deadline.deadline.is_none() {
+            br.defence_deadline.deadline = defence;
+        }
+        let defence = br.defence_deadline.deadline;
+        if self.submission.deadline.is_none() {
+            self.submission.deadline = defence.and_then(|d| d.checked_sub_months(Months::new(1)));
+        }
+        if self.annual_reports.is_empty()
+            && let Some(end) = defence
+        {
+            let mut year = 1;
+            while let Some(date) = at(12 * year).filter(|d| *d < end) {
+                self.annual_reports.push(Milestone {
+                    deadline: Some(date),
+                    ..Default::default()
+                });
+                year += 1;
+            }
+        }
+        let grant = &mut self.brazil.grant;
+        if grant.active() && grant.start.is_none() {
+            grant.start = Some(start);
+        }
+        if grant.active() && grant.months == 0 {
+            grant.months = self.brazil.level.typical_grant_months();
         }
     }
 
@@ -1214,6 +1744,10 @@ impl PhdRecord {
             "intention" => Some(&mut self.intention),
             "submission" => Some(&mut self.submission),
             "amendments" => Some(&mut self.amendments),
+            "credits" => Some(&mut self.brazil.credits),
+            "proficiency" => Some(&mut self.brazil.proficiency),
+            "qualification" => Some(&mut self.brazil.qualification),
+            "defence" => Some(&mut self.brazil.defence_deadline),
             _ if key.starts_with("custom-") => self
                 .custom_steps
                 .iter_mut()
@@ -1269,7 +1803,70 @@ impl Default for Student {
     }
 }
 
+/// What the student number is called: this university's B number, or the
+/// registration number at an external student's own university.
+pub fn id_label(external: bool) -> &'static str {
+    if external { "Registration #" } else { "B Number" }
+}
+
+/// Whether `text` is a valid Brazilian CPF (11 digits with both check digits
+/// right), with or without dots and dash.
+pub fn is_cpf(text: &str) -> bool {
+    let digits: Vec<u32> = text.chars().filter_map(|c| c.to_digit(10)).collect();
+    let only_digits_and_marks = text.trim().chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-');
+    if digits.len() != 11 || !only_digits_and_marks || digits.iter().all(|d| *d == digits[0]) {
+        return false;
+    }
+    let check = |n: usize| {
+        let sum: u32 = digits[..n].iter().enumerate().map(|(i, d)| d * (n as u32 + 1 - i as u32)).sum();
+        (sum * 10 % 11) % 10
+    };
+    check(9) == digits[9] && check(10) == digits[10]
+}
+
+/// Whether `text` is shaped like a UK National Insurance number: two
+/// letters, six digits and A–D, with or without spaces (e.g. QQ 12 34 56 C).
+pub fn is_ni_number(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    chars.len() == 9
+        && chars[..2].iter().all(char::is_ascii_alphabetic)
+        && chars[2..8].iter().all(char::is_ascii_digit)
+        && matches!(chars[8].to_ascii_uppercase(), 'A'..='D')
+}
+
+/// A number hidden behind dots: shaped like a CPF when it is one, otherwise
+/// one dot per character (at least 6, at most 12).
+pub fn masked(number: &str) -> String {
+    let text = number.trim();
+    if text.is_empty() {
+        String::new()
+    } else if is_cpf(text) {
+        "•••.•••.•••-••".into()
+    } else {
+        "•".repeat(text.chars().count().clamp(6, 12))
+    }
+}
+
 impl Student {
+    /// Registered at another university (an external research student).
+    pub fn external(&self) -> bool {
+        self.phd.as_ref().is_some_and(|p| p.external)
+    }
+
+    /// The registration number is shown as dots until revealed.
+    pub fn number_hidden(&self, settings: &Settings) -> bool {
+        settings.hide_external_ids && self.external() && !self.b_number.trim().is_empty()
+    }
+
+    /// The number as shown in lists: dots while it is hidden.
+    pub fn shown_number(&self, settings: &Settings) -> String {
+        if self.number_hidden(settings) {
+            masked(&self.b_number)
+        } else {
+            self.b_number.clone()
+        }
+    }
+
     /// Every meeting across the project, advisee and PhD roles.
     pub fn meetings(&self) -> impl Iterator<Item = &Meeting> {
         let fyp = self.fyp.iter().flat_map(|f| &f.meetings);
@@ -1291,11 +1888,15 @@ impl Student {
         fyp.chain(advisee).chain(phd)
     }
 
+    /// Name and B number, for titles, calendar files and messages. An
+    /// external student's registration number may be a national ID, so it
+    /// is never part of it.
     pub fn display_name(&self) -> String {
-        match (self.name.is_empty(), self.b_number.is_empty()) {
-            (false, false) => format!("{} ({})", self.name, self.b_number),
+        let number = if self.external() { "" } else { self.b_number.as_str() };
+        match (self.name.is_empty(), number.is_empty()) {
+            (false, false) => format!("{} ({number})", self.name),
             (false, true) => self.name.clone(),
-            (true, false) => self.b_number.clone(),
+            (true, false) => number.into(),
             (true, true) => "(unnamed student)".into(),
         }
     }
@@ -1632,7 +2233,7 @@ impl Database {
     }
 
     fn phd_events(&self, s: &Student, p: &PhdRecord, name: &str, out: &mut Vec<Event>) {
-        let degree = p.degree.short();
+        let degree = p.degree_short();
         for m in &p.meetings {
             push_meeting(
                 out,
@@ -1645,14 +2246,15 @@ impl Database {
         }
         if let Some(date) = p.viva {
             let location = p.viva_location.trim();
+            let viva = if p.brazilian_programme() { "defence" } else { "viva" };
             out.push(Event {
                 uid: format!("phd-viva-{}", s.id),
                 student_id: s.id,
                 date,
                 time: p.viva_time,
                 kind: EventKind::PhdMeeting,
-                title: format!("{degree} viva – {name}"),
-                done: p.outcome != VivaOutcome::Pending,
+                title: format!("{degree} {viva} – {name}"),
+                done: p.examined(),
                 online: false,
                 platform: Platform::Teams,
                 link: String::new(),
@@ -1698,6 +2300,23 @@ impl Database {
                     format!("Reminder: {degree} {what} due {} – {name}", due.format("%d %b %Y")),
                 ));
             }
+        }
+        if let Some(end) = p.brazilian_grant().and_then(Grant::end) {
+            out.push(Event {
+                uid: format!("phd-grant-end-{}", s.id),
+                student_id: s.id,
+                date: end,
+                time: None,
+                kind: EventKind::Deadline,
+                title: format!("{degree} {} grant ends – {name}", p.brazil.grant.agency_label()),
+                done: false,
+                online: false,
+                platform: Platform::Teams,
+                link: String::new(),
+                location: String::new(),
+                series: None,
+                cancelled: false,
+            });
         }
     }
 
@@ -1895,6 +2514,16 @@ impl Database {
                         push(s, Severity::Overdue, format!("visa ended {end}"));
                     } else if end <= today + Duration::days(VISA_WARNING_DAYS) {
                         push(s, Severity::Pending, format!("visa ends {end}"));
+                    }
+                }
+                if let Some(grant) = p.brazilian_grant()
+                    && let Some(end) = grant.end()
+                {
+                    let who = grant.agency_label();
+                    if end < today && today - end <= Duration::days(GRANT_ENDED_DAYS) {
+                        push(s, Severity::Pending, format!("{who} grant ended {end}"));
+                    } else if end >= today && end <= today + Duration::days(GRANT_WARNING_DAYS) {
+                        push(s, Severity::Pending, format!("{who} grant ends {end}"));
                     }
                 }
             }
@@ -2417,6 +3046,213 @@ mod tests {
         // No reminder when the lead is 0.
         assert_eq!(Lead { amount: 0, unit: LeadUnit::Weeks }.before(d(2027, 4, 30)), None);
         assert_eq!(Lead::months(1).before(d(2027, 3, 31)), Some(d(2027, 2, 28)));
+    }
+
+    /// An external doctorate in Brazil started on 1 Mar 2026, with a CAPES
+    /// grant and the default rules.
+    fn example_brazilian() -> PhdRecord {
+        let mut p = ResearchGroup::PhdExternal.new_record();
+        p.set_brazilian(true);
+        p.start = Some(d(2026, 3, 1));
+        p.brazil.grant.agency = "CAPES".into();
+        p.suggest_br(&BrRule::default_for(BrLevel::AcademicDoctorate));
+        p
+    }
+
+    #[test]
+    fn brazilian_programmes_suggest_their_own_stages() {
+        let p = example_brazilian();
+        assert!(p.brazilian_programme() && !p.skip_standard, "ticking brings in the stages");
+        assert_eq!((p.brazil.level, p.group()), (BrLevel::AcademicDoctorate, ResearchGroup::PhdExternal));
+        let deadlines: Vec<(String, Option<NaiveDate>)> =
+            p.steps().iter().map(|s| (s.label.clone(), s.milestone.deadline)).collect();
+        assert_eq!(
+            deadlines,
+            [
+                ("Course credits", Some(d(2028, 3, 1))),
+                ("Language proficiency", Some(d(2028, 3, 1))),
+                ("Qualifying exam", Some(d(2028, 3, 1))),
+                ("Annual report 2027", Some(d(2027, 3, 1))),
+                ("Annual report 2028", Some(d(2028, 3, 1))),
+                ("Annual report 2029", Some(d(2029, 3, 1))),
+                ("Thesis to the committee", Some(d(2030, 2, 1))),
+                ("Thesis defence", Some(d(2030, 3, 1))),
+                ("Final version", None),
+            ]
+            .map(|(label, date)| (label.to_string(), date))
+        );
+        for step in p.steps() {
+            assert!(p.clone().milestone_mut(&step.key).is_some(), "{}", step.key);
+        }
+        // CAPES: 48 months for a doctorate, ending the day before.
+        assert_eq!(p.brazil.grant.months, 48);
+        assert_eq!(p.brazil.grant.start, Some(d(2026, 3, 1)));
+        assert_eq!(p.brazil.grant.end(), Some(d(2030, 2, 28)));
+
+        // A parental-leave extension adds to the grant and to the course.
+        let mut q = p.clone();
+        q.brazil.grant.extension_months = 6;
+        q.brazil.extension_months = 6;
+        assert_eq!(q.brazil.grant.end(), Some(d(2030, 8, 31)));
+        let rule = BrRule::default_for(q.brazil.level);
+        assert_eq!(q.br_rule_deadline(&rule), Some(d(2030, 9, 1)));
+
+        // Dates already set are kept.
+        q.brazil.qualification.deadline = Some(d(2027, 12, 15));
+        q.suggest_br(&rule);
+        assert_eq!(q.brazil.qualification.deadline, Some(d(2027, 12, 15)));
+        assert_eq!(q.annual_reports.len(), 3);
+    }
+
+    #[test]
+    fn brazilian_level_picks_the_list_and_titles() {
+        let mut p = ResearchGroup::MscExternal.new_record();
+        p.set_brazilian(true);
+        assert_eq!(p.brazil.level, BrLevel::AcademicMasters);
+        p.set_br_level(BrLevel::ProfessionalMasters);
+        assert_eq!((p.degree, p.group()), (ResearchDegree::MSc, ResearchGroup::MscExternal));
+        assert_eq!((p.degree_label(), p.degree_short()), ("Professional master's", "Prof MSc"));
+        let labels: Vec<String> = p.steps().into_iter().map(|s| s.label).collect();
+        assert!(labels.contains(&"Final project defence".to_string()), "{labels:?}");
+        p.set_br_level(BrLevel::AcademicDoctorate);
+        assert_eq!(p.group(), ResearchGroup::PhdExternal);
+
+        // The box only counts for external students; unticking goes back to
+        // an external student without standard assessments.
+        p.external = false;
+        assert!(!p.brazilian_programme());
+        assert_eq!(p.degree_label(), "PhD");
+        assert!(p.steps().iter().any(|s| s.key == "initial"));
+        p.external = true;
+        p.set_brazilian(false);
+        assert!(p.skip_standard);
+        assert_eq!(p.steps().into_iter().map(|s| s.key).collect::<Vec<_>>(), ["amendments"]);
+    }
+
+    #[test]
+    fn brazilian_events_grants_and_attention() {
+        let mut p = example_brazilian();
+        p.viva = Some(d(2030, 2, 20));
+        let mut db = Database {
+            students: vec![Student {
+                name: "Ana".into(),
+                phd: Some(p),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let id = db.students[0].id;
+        let events = db.events();
+        let title = |uid: String| events.iter().find(|e| e.uid == uid).map(|e| e.title.clone());
+        assert_eq!(title(format!("phd-viva-{id}")).as_deref(), Some("PhD defence – Ana"));
+        assert_eq!(title(format!("phd-defence-{id}")).as_deref(), Some("PhD thesis defence due – Ana"));
+        assert_eq!(title(format!("phd-grant-end-{id}")).as_deref(), Some("PhD CAPES grant ends – Ana"));
+        assert_eq!(
+            title(format!("phd-qualification-reminder-{id}")).as_deref(),
+            Some("Reminder: PhD qualifying exam due 01 Mar 2028 – Ana")
+        );
+
+        // Grant ending within 90 days, or ended in the last 30.
+        let grant = |db: &Database, today| {
+            db.attention(today)
+                .into_iter()
+                .filter(|a| a.message.contains("grant"))
+                .map(|a| a.message)
+                .collect::<Vec<_>>()
+        };
+        assert!(grant(&db, d(2029, 11, 29)).is_empty());
+        assert_eq!(grant(&db, d(2029, 12, 1)), ["Ana – CAPES grant ends 2030-02-28"]);
+        assert_eq!(grant(&db, d(2030, 3, 30)), ["Ana – CAPES grant ended 2030-02-28"]);
+        assert!(grant(&db, d(2030, 4, 1)).is_empty());
+
+        // The defence has a result once its own outcome is set.
+        let viva = |db: &Database| db.events().into_iter().find(|e| e.uid == format!("phd-viva-{id}")).unwrap();
+        assert!(!viva(&db).done);
+        db.students[0].phd.as_mut().unwrap().brazil.outcome = DefenceOutcome::Approved;
+        assert!(viva(&db).done);
+
+        // Not on a Brazilian programme any more: no grant, a viva again.
+        db.students[0].phd.as_mut().unwrap().brazilian = false;
+        let events = db.events();
+        assert!(events.iter().all(|e| !e.uid.starts_with("phd-grant-end")));
+        assert!(events.iter().any(|e| e.title == "PhD viva – Ana"));
+        assert!(grant(&db, d(2029, 12, 1)).is_empty());
+    }
+
+    #[test]
+    fn brazilian_records_round_trip_and_older_files_load() {
+        let mut db = Database::default();
+        db.students.push(Student {
+            phd: Some(example_brazilian()),
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&db).unwrap();
+        assert_eq!(serde_json::from_str::<Database>(&json).unwrap(), db);
+
+        // Files from before: no Brazilian fields, no rules in Settings.
+        let json = r#"{"version":1,"settings":{"academic_year":"2026/27"},
+            "students":[{"name":"Old","phd":{"external":true,"skip_standard":true}}]}"#;
+        let db: Database = serde_json::from_str(json).unwrap();
+        let p = db.students[0].phd.as_ref().unwrap();
+        assert!(!p.brazilian && !p.brazilian_programme());
+        assert_eq!(p.brazil, BrazilRecord::default());
+        assert_eq!(db.settings.br_rules, default_br_rules());
+        let settings = Settings {
+            br_rules: Vec::new(),
+            ..Default::default()
+        };
+        assert_eq!(settings.br_rule(BrLevel::ProfessionalDoctorate).qualification_months, 30);
+    }
+
+    #[test]
+    fn national_ids_are_recognised_and_masked() {
+        assert!(is_cpf("529.982.247-25") && is_cpf("52998224725"));
+        assert!(!is_cpf("529.982.247-26"), "wrong check digit");
+        assert!(!is_cpf("111.111.111-11") && !is_cpf("B00123456"));
+        assert!(is_ni_number("QQ 12 34 56 C") && is_ni_number("qq123456a"));
+        assert!(!is_ni_number("QQ123456E") && !is_ni_number("B00123456"));
+        assert_eq!(masked("529.982.247-25"), "•••.•••.•••-••");
+        assert_eq!(masked("2024"), "••••••");
+        assert_eq!(masked("  "), "");
+    }
+
+    #[test]
+    fn external_registration_numbers_stay_private() {
+        let mut settings = Settings::default();
+        assert!(settings.hide_external_ids && !settings.reveal_needs_password);
+        let mut s = Student {
+            name: "Ana".into(),
+            b_number: "529.982.247-25".into(),
+            phd: Some(ResearchGroup::PhdExternal.new_record()),
+            ..Default::default()
+        };
+        assert!(s.number_hidden(&settings));
+        assert_eq!(s.shown_number(&settings), "•••.•••.•••-••");
+        // Never in titles, so never in calendar or invite files.
+        assert_eq!(s.display_name(), "Ana");
+        s.phd.as_mut().unwrap().meetings.push(Meeting {
+            date: Some(d(2026, 10, 30)),
+            ..Default::default()
+        });
+        let db = Database {
+            students: vec![s.clone()],
+            ..Default::default()
+        };
+        assert!(db.events().iter().all(|e| !e.title.contains("529")));
+
+        settings.hide_external_ids = false;
+        assert!(!s.number_hidden(&settings));
+        assert_eq!(s.shown_number(&settings), "529.982.247-25");
+        // This university's students keep their B number, shown and in titles.
+        s.phd.as_mut().unwrap().external = false;
+        s.b_number = "B00123456".into();
+        settings.hide_external_ids = true;
+        assert!(!s.number_hidden(&settings));
+        assert_eq!(s.display_name(), "Ana (B00123456)");
+
+        // Older files hide them too.
+        let db: Database = serde_json::from_str(r#"{"settings":{"academic_year":"2026/27"}}"#).unwrap();
+        assert!(db.settings.hide_external_ids && !db.settings.reveal_needs_password);
     }
 
     #[test]

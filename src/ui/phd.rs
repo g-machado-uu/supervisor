@@ -1,16 +1,17 @@
 //! Research section of the student detail panel: project details, the dates
 //! from the university system (or added by hand) with their reminders, the
-//! viva and meetings.
+//! viva and meetings. External students on a Brazilian programme get its
+//! grant, stages and defence instead (see `brazil`).
 
 use chrono::{Months, NaiveDate};
 use egui::{RichText, Ui};
 use uuid::Uuid;
 
 use crate::model::{
-    CustomStep, FeeStatus, Funder, Lead, LeadUnit, Milestone, PhdRecord, PhdStep, ResearchDegree,
-    ResearchStatus, Settings, StudyMode, VisaType, VivaOutcome,
+    CustomStep, DefenceOutcome, FeeStatus, Funder, Lead, LeadUnit, Milestone, PhdRecord, PhdStep,
+    ResearchDegree, ResearchStatus, Settings, StudyMode, VisaType, VivaOutcome,
 };
-use crate::ui::{icons, theme, widgets};
+use crate::ui::{brazil, icons, theme, widgets};
 
 /// Usual length of a full-time project.
 const FULL_TIME_MONTHS: u32 = 36;
@@ -20,17 +21,24 @@ pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, student_id: Uui
     let mut invite = None;
     let today = widgets::today();
     details(ui, p);
+    let br = p.brazilian_programme();
+
+    if br {
+        ui.add_space(10.0);
+        theme::card_title(ui, "Grant");
+        brazil::grant_editor(ui, &mut p.brazil.grant, p.brazil.level);
+    }
 
     ui.add_space(10.0);
     theme::card_title(ui, "Project dates");
     widgets::form_grid(ui, "phd-dates", |ui| {
-        ui.label("Project start");
+        ui.label(if br { "Project start (enrolment)" } else { "Project start" });
         widgets::opt_date(ui, "start", &mut p.start);
         ui.end_row();
         ui.label("Project end");
         ui.horizontal(|ui| {
             widgets::opt_date(ui, "end", &mut p.end);
-            if let (None, Some(start), StudyMode::FullTime) = (p.end, p.start, p.mode)
+            if let (None, Some(start), StudyMode::FullTime, false) = (p.end, p.start, p.mode, br)
                 && ui
                     .small_button(format!("{FULL_TIME_MONTHS} months from start"))
                     .clicked()
@@ -44,25 +52,34 @@ pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, student_id: Uui
             ui.label(format!("Year {year}"));
             ui.end_row();
         }
+        if br {
+            brazil::extension_row(ui, p);
+        }
     });
 
     ui.add_space(10.0);
     theme::card_title(ui, "Assessments & deadlines");
-    let mut standard = !p.skip_standard;
-    if ui
-        .checkbox(&mut standard, "Standard assessments of this university")
-        .on_hover_text("Initial, confirmation and final assessments, annual reports, examiners and submission")
-        .changed()
-    {
-        p.skip_standard = !standard;
-    }
-    let hint = if p.skip_standard {
-        "Add the deadlines from the student's university and choose when to be reminded."
+    if br {
+        brazil::stages_header(ui, p, &settings.br_rule(p.brazil.level));
     } else {
-        "Type the deadlines from the university system. Reminders are worked out from them."
-    };
-    ui.label(RichText::new(hint).small().color(theme::muted(ui)));
+        let mut standard = !p.skip_standard;
+        if ui
+            .checkbox(&mut standard, "Standard assessments of this university")
+            .on_hover_text("Initial, confirmation and final assessments, annual reports, examiners and submission")
+            .changed()
+        {
+            p.skip_standard = !standard;
+        }
+        let hint = if p.skip_standard {
+            "Add the deadlines from the student's university and choose when to be reminded."
+        } else {
+            "Type the deadlines from the university system. Reminders are worked out from them."
+        };
+        ui.label(RichText::new(hint).small().color(theme::muted(ui)));
+    }
     let steps = p.steps();
+    // The annual reports are added from the row before this step.
+    let add_report_before = if br { "submission" } else { "examiners" };
     let mut remove_report = None;
     if !p.skip_standard {
         egui::Grid::new("phd-steps")
@@ -78,13 +95,13 @@ pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, student_id: Uui
                     .iter()
                     .filter(|s| s.key != "amendments" && !s.key.starts_with("custom-"))
                 {
-                    if step.key == "examiners" {
+                    if step.key == add_report_before {
                         if ui.small_button(format!("{} Annual report", icons::PLUS)).clicked() {
                             p.annual_reports.push(next_annual_report(p));
                         }
                         ui.end_row();
                     }
-                    if step.key == "submission" {
+                    if step.key == "submission" && !br {
                         ui.label("Earliest submission");
                         widgets::opt_date(ui, "earliest", &mut p.earliest_submission);
                         ui.end_row();
@@ -119,15 +136,34 @@ pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, student_id: Uui
     custom_steps(ui, &mut p.custom_steps, today);
 
     ui.add_space(10.0);
+    let invite_viva = if br {
+        defence(ui, p, &steps, today)
+    } else {
+        viva(ui, p, &steps, today)
+    };
+    if invite_viva {
+        invite = Some(format!("phd-viva-{student_id}"));
+    }
+
+    ui.add_space(10.0);
+    theme::card_title(ui, "Supervision meetings");
+    if let Some(uid) = widgets::meetings_editor(ui, "phd-meetings", &mut p.meetings, None, settings) {
+        invite = Some(uid);
+    }
+    invite
+}
+
+/// The viva, its outcome, amendments and award. Returns true to save an
+/// invite for the viva.
+fn viva(ui: &mut Ui, p: &mut PhdRecord, steps: &[PhdStep], today: NaiveDate) -> bool {
+    let mut invite = false;
     theme::card_title(ui, "Viva & award");
     widgets::form_grid(ui, "phd-viva", |ui| {
         ui.label("Viva date / time");
         ui.horizontal(|ui| {
             widgets::opt_date(ui, "viva", &mut p.viva);
             widgets::opt_time(ui, "viva-time", &mut p.viva_time);
-            if widgets::invite_button(ui, p.viva.is_some()) {
-                invite = Some(format!("phd-viva-{student_id}"));
-            }
+            invite |= widgets::invite_button(ui, p.viva.is_some());
         });
         ui.end_row();
         ui.label("Viva location");
@@ -156,12 +192,47 @@ pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, student_id: Uui
         widgets::opt_date(ui, "awarded", &mut p.awarded_on);
         ui.end_row();
     });
+    invite
+}
 
-    ui.add_space(10.0);
-    theme::card_title(ui, "Supervision meetings");
-    if let Some(uid) = widgets::meetings_editor(ui, "phd-meetings", &mut p.meetings, None, settings) {
-        invite = Some(uid);
-    }
+/// The defence of a Brazilian programme: date, committee, result, final
+/// version and award. Returns true to save an invite for the defence.
+fn defence(ui: &mut Ui, p: &mut PhdRecord, steps: &[PhdStep], today: NaiveDate) -> bool {
+    let mut invite = false;
+    theme::card_title(ui, "Defence & award");
+    widgets::form_grid(ui, "phd-defence", |ui| {
+        ui.label("Defence date / time");
+        ui.horizontal(|ui| {
+            widgets::opt_date(ui, "viva", &mut p.viva);
+            widgets::opt_time(ui, "viva-time", &mut p.viva_time);
+            invite |= widgets::invite_button(ui, p.viva.is_some());
+        });
+        ui.end_row();
+        ui.label("Location");
+        widgets::text_field(ui, &mut p.viva_location, "Room, auditorium or link");
+        ui.end_row();
+        ui.label("Committee");
+        widgets::text_field(ui, &mut p.brazil.committee, "Members of the examining committee (banca)");
+        ui.end_row();
+        ui.label("Outcome");
+        combo(ui, "br-outcome", &mut p.brazil.outcome, &DefenceOutcome::ALL, |o| o.label());
+        ui.end_row();
+        let final_version = steps.iter().find(|s| s.key == "amendments");
+        if let Some(step) = final_version.filter(|s| p.brazil.outcome.corrections() || s.milestone.deadline.is_some()) {
+            ui.horizontal(|ui| step_label(ui, step, today));
+            ui.horizontal(|ui| {
+                let mut edited = step.milestone.clone();
+                milestone_cells(ui, &step.key, &mut edited, today);
+                if edited != step.milestone {
+                    p.amendments = edited;
+                }
+            });
+            ui.end_row();
+        }
+        ui.label("Awarded on");
+        widgets::opt_date(ui, "awarded", &mut p.awarded_on);
+        ui.end_row();
+    });
     invite
 }
 
@@ -173,7 +244,11 @@ fn details(ui: &mut Ui, p: &mut PhdRecord) {
 
         ui.label("Type");
         ui.horizontal(|ui| {
-            combo(ui, "degree", &mut p.degree, &ResearchDegree::ALL, |d| d.label());
+            if p.brazilian_programme() {
+                brazil::level_combo(ui, p);
+            } else {
+                combo(ui, "degree", &mut p.degree, &ResearchDegree::ALL, |d| d.label());
+            }
             ui.checkbox(&mut p.external, "External")
                 .on_hover_text("Registered at another university; you co-supervise");
         });
@@ -182,6 +257,24 @@ fn details(ui: &mut Ui, p: &mut PhdRecord) {
         if p.external {
             ui.label("University");
             widgets::text_field(ui, &mut p.university, "Where the student is registered");
+            ui.end_row();
+
+            ui.label("Brazil");
+            let mut brazilian = p.brazilian;
+            if ui
+                .checkbox(&mut brazilian, "On a Brazilian programme")
+                .on_hover_text("A mestrado or doutorado in Brazil: its levels, grants, stages and defence")
+                .changed()
+            {
+                p.set_brazilian(brazilian);
+            }
+            ui.end_row();
+        }
+        let br = p.brazilian_programme();
+
+        if br {
+            ui.label("Programme");
+            widgets::text_field(ui, &mut p.brazil.programme, "Postgraduate programme (PPG)");
             ui.end_row();
         }
 
@@ -197,14 +290,18 @@ fn details(ui: &mut Ui, p: &mut PhdRecord) {
         });
         ui.end_row();
 
-        ui.label("Chair of supervisors");
+        ui.label(if br { "Main supervisor" } else { "Chair of supervisors" });
         widgets::text_field(ui, &mut p.chair, "Name");
         ui.end_row();
 
-        ui.label("Supervisors");
+        ui.label(if br { "Co-supervisors" } else { "Supervisors" });
         widgets::text_field(ui, &mut p.supervisors, "Other members of the team");
         ui.end_row();
 
+        // A Brazilian programme has its grant card instead.
+        if br {
+            return;
+        }
         ui.label("Funder");
         ui.horizontal(|ui| {
             combo(ui, "funder", &mut p.funder, &Funder::ALL, |f| f.label());
@@ -256,7 +353,7 @@ fn details(ui: &mut Ui, p: &mut PhdRecord) {
     });
 }
 
-fn combo<T: Copy + PartialEq>(ui: &mut Ui, salt: &str, value: &mut T, all: &[T], label: impl Fn(T) -> &'static str) {
+pub fn combo<T: Copy + PartialEq>(ui: &mut Ui, salt: &str, value: &mut T, all: &[T], label: impl Fn(T) -> &'static str) {
     egui::ComboBox::from_id_salt(salt)
         .selected_text(label(*value))
         .width(200.0)
@@ -377,9 +474,15 @@ fn milestone_cells(ui: &mut Ui, key: &str, m: &mut Milestone, today: NaiveDate) 
     });
 }
 
-/// A new annual report a year after the last one (or with no date).
+/// A new annual report a year after the last one (or with no date). On a
+/// Brazilian programme the first is a year after enrolment.
 fn next_annual_report(p: &PhdRecord) -> Milestone {
-    let last = p.annual_reports.iter().rev().find_map(|r| r.deadline);
+    let last = p
+        .annual_reports
+        .iter()
+        .rev()
+        .find_map(|r| r.deadline)
+        .or(p.start.filter(|_| p.brazilian_programme()));
     Milestone {
         deadline: last.and_then(|d| d.checked_add_months(Months::new(12))),
         ..Default::default()

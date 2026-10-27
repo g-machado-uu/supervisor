@@ -152,6 +152,9 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
             "Meetings",
             "Coursework",
         ],
+        Category::Research(group) if group.external() => {
+            &["Name", "Registration #", "Year", "Meetings", "Next deadline"]
+        }
         Category::Research(_) => &["Name", "B Number", "Year", "Meetings", "Next deadline"],
         Category::Placement => &["Name", "B Number", "Company", "Visit 1", "Visit 2"],
         Category::Advisee => &["Name", "B Number", "Course", "Semester 1", "Semester 2"],
@@ -217,7 +220,7 @@ fn table(
                     }
                 });
                 row.col(|ui| {
-                    ui.label(RichText::new(&s.b_number).color(theme::muted(ui)));
+                    ui.label(RichText::new(s.shown_number(&db.settings)).color(theme::muted(ui)));
                 });
                 match cat {
                     Category::Projects(_) => {
@@ -293,7 +296,7 @@ fn table(
                                 );
                             }
                             if let Some(p) = &s.phd {
-                                theme::chip(ui, p.degree.label(), theme::PLUM);
+                                theme::chip(ui, p.degree_label(), theme::PLUM);
                             }
                             if s.placement.is_some() {
                                 theme::chip(ui, "Placement", theme::GREEN);
