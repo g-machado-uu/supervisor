@@ -175,7 +175,7 @@ pub fn show(
                     widgets::text_field(ui, &mut settings.teams_link, "Reusable Teams meeting link");
                     let link = settings.teams_link.trim();
                     if !link.is_empty() && !crate::ics::valid_link(link) {
-                        ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} Paste the full link, starting with https://", icons::WARNING));
+                        ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} This doesn't look like a link", icons::WARNING));
                     }
                 });
                 ui.end_row();
@@ -194,11 +194,17 @@ pub fn show(
 
         ui.add_space(8.0);
         theme::card(ui, "Calendar", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Weeks start on");
+                ui.selectable_value(&mut settings.week_starts_sunday, false, "Monday");
+                ui.selectable_value(&mut settings.week_starts_sunday, true, "Sunday");
+            });
+            ui.add_space(6.0);
             if ui.button(format!("{} Export calendar (.ics)…", icons::EXPORT)).clicked() {
                 action = SettingsAction::ExportIcs;
             }
             ui.label(
-                RichText::new("Exports meetings, visits and coursework deadlines for Outlook / Google Calendar. The exported file is not encrypted.")
+                RichText::new("Exports meetings, visits and coursework deadlines for Outlook / Google Calendar. The exported file is not encrypted. To bring events in from another calendar, use Import on the Calendar page.")
                     .small()
                     .color(theme::muted(ui)),
             );

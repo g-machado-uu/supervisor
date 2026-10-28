@@ -1,5 +1,6 @@
 //! Application shell: lock state, navigation, autosave and dialogs.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -19,7 +20,7 @@ use crate::ui::calendar::{self, CalAction, CalendarState};
 use crate::ui::dashboard::{self, DashAction};
 use crate::ui::lock::{LockScreen, Unlocked};
 use crate::ui::settings::{self, KeyFileForm, PasswordForm, SettingsAction};
-use crate::ui::student_form::{self, FormAction, Role};
+use crate::ui::student_form::{self, FormAction, Role, Shown};
 use crate::ui::student_list::{self, Category, ListState};
 use crate::ui::{icons, theme, widgets};
 
@@ -255,6 +256,15 @@ struct Session {
     /// The student whose hidden registration number is shown.
     revealed: Option<Uuid>,
     reveal_prompt: Option<RevealPrompt>,
+    /// Privacy mode, switched on the dashboard: names and numbers are
+    /// hidden there, in the lists, the calendar and every student's details.
+    private: bool,
+    /// The student whose details are shown in privacy mode.
+    peek: Option<Uuid>,
+    /// Students whose details are hidden outside privacy mode.
+    hidden: HashSet<Uuid>,
+    /// The student whose coursework marks are shown.
+    marks_shown: Option<Uuid>,
     confirm: Option<Confirm>,
     password_form: PasswordForm,
     key_form: KeyFileForm,
@@ -299,6 +309,10 @@ impl Session {
             new_student: None,
             revealed: None,
             reveal_prompt: None,
+            private: false,
+            peek: None,
+            hidden: HashSet::new(),
+            marks_shown: None,
             confirm: None,
             password_form: PasswordForm::default(),
             key_form: KeyFileForm::default(),
@@ -489,9 +503,12 @@ impl Session {
             save_now = true;
         }
 
-        // A revealed registration number is hidden again once another student is opened.
-        if self.revealed.is_some() && self.revealed != self.selected {
-            self.revealed = None;
+        // A revealed registration number, marks, or details in privacy mode
+        // are hidden again once another student is opened.
+        for shown in [&mut self.revealed, &mut self.marks_shown, &mut self.peek] {
+            if shown.is_some() && *shown != self.selected {
+                *shown = None;
+            }
         }
         self.sidebar(ui, &mut lock, &mut save_now);
         if self.view != View::Settings && self.selected.is_some() {
@@ -701,7 +718,12 @@ impl Session {
             .db
             .student(id)
             .is_some_and(|s| self.db.b_number_taken(&s.b_number, Some(id)));
-        let revealed = self.revealed == Some(id);
+        let mut shown = Shown {
+            details: if self.private { self.peek == Some(id) } else { !self.hidden.contains(&id) },
+            marks: self.marks_shown == Some(id),
+            number: self.revealed == Some(id),
+        };
+        let before = shown;
         let Database { settings, students, .. } = &mut self.db;
         let Some(student) = students.iter_mut().find(|s| s.id == id) else {
             self.selected = None;
@@ -717,14 +739,31 @@ impl Session {
             .min_size(420.0)
             .frame(frame)
             .show(ui, |ui| {
-                action = student_form::show(ui, student, settings, dup, revealed);
+                action = student_form::show(ui, student, settings, dup, &mut shown);
             });
+        if shown.details != before.details {
+            if self.private {
+                self.peek = shown.details.then_some(id);
+            } else if shown.details {
+                self.hidden.remove(&id);
+            } else {
+                self.hidden.insert(id);
+            }
+            if !shown.details {
+                self.marks_shown = None;
+                self.revealed = None;
+            }
+        }
+        if shown.marks != before.marks {
+            self.marks_shown = shown.marks.then_some(id);
+        }
         match action {
             FormAction::None => {}
             FormAction::Close => self.selected = None,
             FormAction::Delete => self.confirm = Some(Confirm::DeleteStudent(id)),
             FormAction::RemoveRole(role) => self.confirm = Some(Confirm::RemoveRole(id, role)),
-            FormAction::Invite(uid) => self.save_invite(ui, id, &uid),
+            FormAction::Share(widgets::Share::File(uid)) => self.save_invite(ui, id, &uid),
+            FormAction::Share(widgets::Share::Google(uid)) => self.open_in_google(ui, id, &uid),
             FormAction::Reveal if self.db.settings.reveal_needs_password => {
                 self.reveal_prompt = Some(RevealPrompt {
                     student: id,
@@ -742,8 +781,14 @@ impl Session {
             View::Dashboard => {
                 let d = self.derived();
                 let (events, attention) = (Rc::clone(&d.events), Rc::clone(&d.attention));
-                match dashboard::show(ui, &self.db, &events, &attention) {
+                match dashboard::show(ui, &self.db, &events, &attention, self.private) {
                     DashAction::None => {}
+                    DashAction::Privacy => {
+                        self.private = !self.private;
+                        self.peek = None;
+                        self.marks_shown = None;
+                        self.revealed = None;
+                    }
                     DashAction::Open(id) => self.selected = Some(id),
                     DashAction::Goto(cat) => self.view = View::List(cat),
                     DashAction::ExportIcs => self.export_ics(ui),
@@ -757,6 +802,7 @@ impl Session {
             View::Calendar => {
                 let events = Rc::clone(&self.derived().events);
                 let mut guests = self.db.settings.export_with_guests;
+                self.calendar.private = self.private;
                 let action = calendar::show(ui, &self.db, &events, &mut self.calendar, &mut guests);
                 self.db.settings.export_with_guests = guests;
                 match action {
@@ -769,9 +815,43 @@ impl Session {
                                 MeetingChange::Held(true) => "Marked as held".to_string(),
                                 MeetingChange::Held(false) => "Marked as not held".to_string(),
                                 MeetingChange::Postpone(date, _) => format!("Moved to {}", date.format("%a %d %b")),
+                                MeetingChange::Cancelled(true) => "Week cancelled".to_string(),
+                                MeetingChange::Cancelled(false) => "Week restored".to_string(),
                             };
                             self.notify(ui, done);
                         }
+                    }
+                    CalAction::Move(event, date) => {
+                        if self.db.move_event(&event, date) {
+                            self.notify(ui, format!("Moved to {}", date.format("%a %d %b")));
+                        }
+                    }
+                    CalAction::Edit(event, details) => {
+                        if self.db.edit_event(&event, &details) {
+                            self.notify(ui, "Saved");
+                        }
+                    }
+                    CalAction::Delete(events, whole_series) => {
+                        let done = events.iter().filter(|e| self.db.delete_event(e, whole_series)).count();
+                        let msg = match (done, events.first()) {
+                            (1, Some(e)) if e.series.is_some() && !whole_series => "Week cancelled – right-click it to restore".to_string(),
+                            (1, _) => "Deleted".to_string(),
+                            (n, _) => format!("Deleted {n} items"),
+                        };
+                        self.notify(ui, msg);
+                    }
+                    CalAction::Google(event) => {
+                        let uid = event.series.as_ref().map_or(event.uid.clone(), |(series, _)| series.clone());
+                        self.open_in_google(ui, event.student_id, &uid);
+                    }
+                    CalAction::PickImport => self.pick_import(ui),
+                    CalAction::Import(choices) => {
+                        let n = self.db.import(choices);
+                        self.notify(ui, match n {
+                            0 => "Nothing imported".to_string(),
+                            1 => "Imported 1 event".to_string(),
+                            n => format!("Imported {n} events"),
+                        });
                     }
                 }
             }
@@ -784,6 +864,7 @@ impl Session {
                         search: &mut self.search,
                         show_archived: &mut self.show_archived,
                         selected: &mut self.selected,
+                        private: self.private,
                     },
                 );
                 if add
@@ -940,6 +1021,42 @@ impl Session {
         if self.write_ics(ui, &[invite], true, &format!("{name}.ics")) {
             self.notify(ui, format!("{series}Invite saved – {hint}"));
         }
+    }
+
+    /// Open Google Calendar's "new event" page filled in with the meeting,
+    /// visit or viva `uid` (a whole series if it repeats).
+    fn open_in_google(&mut self, ui: &Ui, student_id: Uuid, uid: &str) {
+        let Some(item) = self.db.invite(student_id, uid) else {
+            return;
+        };
+        let url = ics::google_calendar_url(&item, &self.db.settings, &jiff::tz::TimeZone::system());
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        let mut msg = "Opened in Google Calendar – check it and Save to send the invitation".to_string();
+        if item.series.as_ref().is_some_and(|r| !r.exceptions.is_empty()) {
+            msg.push_str("; cancelled or moved weeks need changing there");
+        }
+        self.notify(ui, msg);
+    }
+
+    /// Ask for an .ics file and show its events for importing.
+    fn pick_import(&mut self, ui: &Ui) {
+        let Some(path) = rfd::FileDialog::new().add_filter("iCalendar", &["ics"]).pick_file() else {
+            return;
+        };
+        let text = match std::fs::read(&path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) => {
+                self.notify(ui, format!("Reading {} failed: {e}", path.display()));
+                return;
+            }
+        };
+        let events = crate::ics_import::parse(&text, &jiff::tz::TimeZone::system());
+        if events.is_empty() {
+            self.notify(ui, "No events found in that file");
+            return;
+        }
+        let file = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        self.calendar.import = Some(calendar::ImportDialog::new(file, events, &self.db));
     }
 
     fn change_password(&mut self, ui: &Ui) {
@@ -1417,7 +1534,7 @@ mod ui_tests {
     use chrono::{Datelike, Duration as Days, NaiveTime};
     use egui::accesskit::Role as AkRole;
     use egui_kittest::Harness;
-    use egui_kittest::kittest::{NodeT, Queryable};
+    use egui_kittest::kittest::{By, NodeT, Queryable};
 
     const PASSWORD: &str = "test-password-123";
 
@@ -2092,6 +2209,362 @@ mod ui_tests {
     }
 
     #[test]
+    fn calendar_edits_drags_deletes_and_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        // Days in the middle of next month, so the month grid shows them.
+        let month = (crate::ui::widgets::today() + Days::days(31)).with_day(1).unwrap();
+        let day = |n: u32| month.with_day(n).unwrap();
+        let at = |hour| NaiveTime::from_hms_opt(hour, 0, 0);
+        let ana = Student {
+            name: "Ana Silva".into(),
+            email: "ana.silva@ulster.ac.uk".into(),
+            phd: Some(PhdRecord {
+                meetings: vec![Meeting {
+                    date: Some(day(10)),
+                    time: at(14),
+                    online: true,
+                    platform: Platform::GoogleMeet,
+                    link: "meet.google.com/abc-defg-hij".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bob = Student {
+            name: "Bob Jones".into(),
+            fyp: Some(FypRecord {
+                programme: "BEng".into(),
+                meetings: vec![Meeting {
+                    date: Some(day(4)),
+                    time: at(9),
+                    repeat: Some(Repeat {
+                        until: Some(day(25)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (ana_id, bob_id) = (ana.id, bob.id);
+        {
+            let s = session(&mut h);
+            s.db.students.extend([ana, bob]);
+            s.db.settings.week_starts_sunday = true;
+            s.view = View::Calendar;
+            s.calendar.layout = crate::ui::calendar::Layout::Month;
+            s.calendar.month = month;
+        }
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        let ana_meeting = |h: &mut Harness<'_, SupervisorApp>| session(h).db.student(ana_id).unwrap().phd.as_ref().unwrap().meetings[0].clone();
+        let bob_meeting = |h: &mut Harness<'_, SupervisorApp>| session(h).db.student(bob_id).unwrap().fyp.as_ref().unwrap().meetings[0].clone();
+
+        // Weeks start on Sunday.
+        let sun = h.get_by_label("SUN").rect();
+        assert!(sun.left() < h.get_by_label("MON").rect().left());
+        shot(&mut h, "20_month_sunday_first");
+
+        // Drag Ana's meeting from the 10th to the 12th.
+        let from = h.get_by_label_contains("14:00").rect().center();
+        let to = h.get_by_label("12").rect().center() + egui::vec2(0.0, 30.0);
+        h.drag_at(from);
+        h.run_steps(1);
+        h.hover_at(from + egui::vec2(10.0, 5.0));
+        h.run_steps(1);
+        h.hover_at(to);
+        h.run_steps(1);
+        h.drop_at(to);
+        h.run_steps(2);
+        let m = ana_meeting(&mut h);
+        assert_eq!((m.date, m.time), (Some(day(12)), at(14)));
+
+        // Right-click: edit, and Google Calendar with the student as guest.
+        h.get_by_label_contains("Ana Silva").click_secondary();
+        h.run_steps(2);
+        shot(&mut h, "21_item_menu");
+        h.get_by_label(&format!("{} Open in Google Calendar", icons::ARROW_SQUARE_OUT)).click();
+        h.run_steps(1);
+        let opened: Vec<String> = h
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::OpenUrl(u) => Some(u.url.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(opened.iter().any(|u| u.contains("calendar.google.com") && u.contains("add=ana.silva%40ulster.ac.uk")), "{opened:?}");
+        h.run_steps(1);
+        h.get_by_label_contains("Ana Silva").click_secondary();
+        h.run_steps(2);
+        h.get_by_label(&format!("{} Edit…", icons::PENCIL_SIMPLE)).click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Link").is_some());
+        shot(&mut h, "22_edit_dialog");
+        h.get_by_label("Save").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Saved").is_some());
+
+        // Select a week of Bob's meeting and press Delete: just that week is cancelled.
+        let week = day(11);
+        h.get_all_by_label_contains("Bob Jones")
+            .find(|n| n.rect().center().x > h.get_by_label("11").rect().left() - 5.0 && n.rect().center().y > h.get_by_label("11").rect().top())
+            .unwrap()
+            .click();
+        h.run_steps(2);
+        h.key_press(egui::Key::Delete);
+        h.run_steps(2);
+        assert!(h.query_by_label("Delete this item?").is_some());
+        shot(&mut h, "23_delete_dialog");
+        h.get_by_label("Cancel this week").click();
+        h.run_steps(2);
+        assert!(bob_meeting(&mut h).occurrence(week).cancelled);
+        assert_eq!(bob_meeting(&mut h).occurrences(&session(&mut h).db.settings).len(), 4);
+
+        // Import: the event with Ana as a guest is ticked and becomes her meeting.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:g1@google.com\r\nSUMMARY:Thesis chat\r\n\
+            DTSTART;TZID=Europe/London:20271103T100000\r\nATTENDEE;CN=Ana:mailto:ana.silva@ulster.ac.uk\r\n\
+            END:VEVENT\r\nBEGIN:VEVENT\r\nUID:g2@google.com\r\nSUMMARY:Dentist\r\nDTSTART:20271104T090000Z\r\n\
+            END:VEVENT\r\nEND:VCALENDAR\r\n";
+        {
+            let s = session(&mut h);
+            let events = crate::ics_import::parse(ics, &jiff::tz::TimeZone::get("Europe/London").unwrap());
+            s.calendar.import = Some(calendar::ImportDialog::new("work.ics".into(), events, &s.db));
+        }
+        h.run_steps(3);
+        assert!(h.query_by_label("1 to import, 1 as student meetings").is_some());
+        shot(&mut h, "24_import_dialog");
+        h.get_by_label("Import 1").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Imported 1 event").is_some());
+        let s = session(&mut h);
+        let imported = &s.db.student(ana_id).unwrap().phd.as_ref().unwrap().meetings[1];
+        assert_eq!((imported.source.as_str(), imported.time), ("g1@google.com", at(10)));
+        assert_eq!(s.db.ignored_imports, ["g2@google.com"]);
+
+        // Importing the file again: "Tick all shown" leaves out the event
+        // imported before, and ticking it by hand warns it would show twice.
+        let events = crate::ics_import::parse(ics, &jiff::tz::TimeZone::get("Europe/London").unwrap());
+        s.calendar.import = Some(calendar::ImportDialog::new("work.ics".into(), events, &s.db));
+        h.run_steps(3);
+        assert!(h.query_by_label("Nothing ticked").is_some());
+        h.get_by_label("Tick all shown").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("1 to import, none linked to a student").is_some(), "only the skipped one");
+        assert!(h.query_by_label_contains("already in Supervisor").is_none());
+        // The one left unticked.
+        h.get_all_by_role(AkRole::CheckBox)
+            .find(|c| c.accesskit_node().toggled() == Some(egui::accesskit::Toggled::False))
+            .unwrap()
+            .click();
+        h.run_steps(2);
+        assert!(h.query_by_label(&format!("{} will show twice", icons::WARNING)).is_some());
+        assert!(h.query_by_label(&format!("{} 1 is already in Supervisor", icons::WARNING)).is_some());
+        shot(&mut h, "25_import_again");
+    }
+
+    #[test]
+    fn privacy_mode_hides_names_and_marks_until_revealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let today = widgets::today();
+        let (bob, li) = {
+            let s = session(&mut h);
+            let sust = s.db.settings.modules.iter_mut().find(|m| m.applies_to == ["Sust"]).unwrap();
+            sust.courseworks.push(CourseworkTemplate { title: "Report".into(), ..Default::default() });
+            let first_cw = |programme: &str| s.db.settings.modules_for(programme).next().unwrap().courseworks[0].id;
+            let marked = |cw| {
+                std::collections::HashMap::from([(cw, CwStatus { mark_1: "71.5".into(), mark_2: "64.5".into(), ..Default::default() })])
+            };
+            let bob = Student {
+                name: "Bob Jones".into(),
+                b_number: "B00999111".into(),
+                email: "bob.jones@ulster.ac.uk".into(),
+                fyp: Some(FypRecord {
+                    coursework: marked(first_cw("BEng")),
+                    meetings: vec![Meeting {
+                        date: Some(today + Days::days(2)),
+                        time: NaiveTime::from_hms_opt(10, 0, 0),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let li = Student {
+                name: "Li Wei".into(),
+                fyp: Some(FypRecord {
+                    programme: "Sust".into(),
+                    sust_email: "li.wei@sust.edu.cn".into(),
+                    coursework: marked(first_cw("Sust")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let ids = (bob.id, li.id);
+            s.db.students.extend([bob, li]);
+            ids
+        };
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        assert!(all_text(&h).contains("Bob Jones (B00999111) – no initial contact yet"));
+        assert!(all_text(&h).contains("BEng project meeting – Bob Jones (B00999111)"), "upcoming meeting");
+
+        // Privacy mode: nobody is named on the dashboard.
+        h.get_by_label(&format!("{}  Hide names", icons::EYE_SLASH)).click();
+        h.run_steps(2);
+        let text = all_text(&h);
+        assert!(!text.contains("Bob") && !text.contains("B00999111") && !text.contains("Li Wei"), "{text}");
+        assert!(text.contains("no initial contact yet") && text.contains("BEng project meeting"));
+        shot(&mut h, "26_dashboard_private");
+
+        // ...nor in the lists or the calendar.
+        session(&mut h).view = View::List(Category::All);
+        h.run_steps(3);
+        let text = all_text(&h);
+        assert!(!text.contains("Bob") && !text.contains("B00999111") && !text.contains("bob.jones"), "{text}");
+        assert!(!text.contains("Li Wei"));
+        shot(&mut h, "26b_list_private");
+        session(&mut h).view = View::Calendar;
+        h.run_steps(3);
+        let text = all_text(&h);
+        assert!(!text.contains("Bob") && !text.contains("B00999111") && text.contains("BEng project meeting"), "{text}");
+        shot(&mut h, "26c_calendar_private");
+        session(&mut h).view = View::Dashboard;
+
+        // ...nor in their details, until revealed for one student.
+        session(&mut h).selected = Some(bob);
+        h.run_steps(3);
+        assert!(!all_text(&h).contains("Bob") && !all_text(&h).contains("bob.jones"));
+        shot(&mut h, "27_details_private");
+        h.get_by_label("Reveal the student's details").click();
+        h.run_steps(2);
+        assert!(all_text(&h).contains("bob.jones@ulster.ac.uk"));
+        session(&mut h).selected = Some(li);
+        h.run_steps(2);
+        assert!(!all_text(&h).contains("li.wei@sust.edu.cn"), "the SUST email too");
+        session(&mut h).selected = Some(bob);
+        h.run_steps(2);
+        assert!(!all_text(&h).contains("bob.jones"), "hidden again after switching students");
+
+        // Out of privacy mode, details show unless hidden for that student.
+        h.get_by_label(&format!("{}  Show names", icons::EYE)).click();
+        h.run_steps(2);
+        assert!(all_text(&h).contains("bob.jones@ulster.ac.uk"));
+        h.get_by_label("Hide the student's details").click();
+        h.run_steps(2);
+        session(&mut h).selected = Some(li);
+        h.run_steps(2);
+        assert!(all_text(&h).contains("li.wei@sust.edu.cn"));
+        session(&mut h).selected = Some(bob);
+        h.run_steps(2);
+        assert!(!all_text(&h).contains("bob.jones"), "still hidden for Bob");
+        h.get_by_label("Reveal the student's details").click();
+        h.run_steps(2);
+
+        // Marks are dots until revealed, for this student only. (A taller
+        // window, to reach them.)
+        h.set_size(egui::vec2(1360.0, 1300.0));
+        h.run_steps(2);
+        assert!(!all_text(&h).contains("71.5"));
+        assert!(h.query_all_by_label("Marker 2").next().is_some());
+        h.get_all_by_label(&format!("{} Reveal marks", icons::EYE)).next().unwrap().click();
+        h.run_steps(2);
+        assert!(all_text(&h).contains("71.5") && all_text(&h).contains("64.5"));
+        shot(&mut h, "28_marks_revealed");
+
+        // Marker 2 within 10% of marker 1 gives their average, to confirm.
+        let retype = |h: &mut Harness<'_, SupervisorApp>, from: &str, to: &str| {
+            let field = h.get(By::new().value(from).role(AkRole::TextInput));
+            field.focus();
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+            h.get(By::new().value(from).role(AkRole::TextInput)).type_text(to);
+            h.run_steps(2);
+        };
+        let agreed = |h: &mut Harness<'_, SupervisorApp>| {
+            let s = session(h);
+            let cw = s.db.settings.modules_for("BEng").next().unwrap().courseworks[0].id;
+            let status = &s.db.student(bob).unwrap().fyp.as_ref().unwrap().coursework[&cw];
+            (status.agreed_mark.clone(), status.agreed_unconfirmed)
+        };
+        retype(&mut h, "64.5", "66");
+        assert_eq!(agreed(&mut h), ("68.8".into(), true));
+        assert!(h.query_by_label(&format!("{} Confirm", icons::CHECK)).is_some());
+        // Further apart: no average, and a warning.
+        retype(&mut h, "66", "58");
+        assert_eq!(agreed(&mut h), (String::new(), false));
+        assert!(h.query_by_label(&format!("{} 18.9% from Marker 1", icons::WARNING)).is_some());
+        shot(&mut h, "28b_marks_apart");
+        retype(&mut h, "58", "65");
+        assert_eq!(agreed(&mut h), ("68.3".into(), true));
+        shot(&mut h, "28c_marks_to_confirm");
+        h.get_by_label(&format!("{} Confirm", icons::CHECK)).click();
+        h.run_steps(2);
+        assert_eq!(agreed(&mut h), ("68.3".into(), false));
+        assert!(h.query_by_label(&format!("{} Confirm", icons::CHECK)).is_none());
+        session(&mut h).selected = Some(li);
+        h.run_steps(2);
+        assert!(!all_text(&h).contains("64.5"));
+        // SUST: the SUST supervisor's marks, and the contact as for advisees.
+        for label in ["Sent by SUST", "SUST mark", "My mark", "I contacted them", "Their reply"] {
+            assert!(h.query_all_by_label(label).next().is_some(), "{label}");
+        }
+        // Clicking a hidden mark reveals them too.
+        h.get_all_by_label(&"•".repeat(8)).next().unwrap().click();
+        h.run_steps(2);
+        assert!(all_text(&h).contains("64.5") && all_text(&h).contains("71.5"), "SUST mark and my own");
+        shot(&mut h, "29_sust_contact_and_marks");
+    }
+
+    #[test]
+    fn role_chips_jump_to_their_folded_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let ana = Student {
+            name: "Ana Souza".into(),
+            fyp: Some(FypRecord::default()),
+            phd: Some(PhdRecord::default()),
+            advisee: Some(AdviseeRecord::default()),
+            ..Default::default()
+        };
+        let id = ana.id;
+        {
+            let s = session(&mut h);
+            s.db.students.push(ana);
+            s.view = View::List(Category::All);
+            s.selected = Some(id);
+        }
+        h.run_steps(3);
+        // Fold the details and the research section away.
+        h.get_by_label(&format!("{} DETAILS", icons::CARET_DOWN)).click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Full name").is_none() && h.query_by_label(&format!("{} DETAILS", icons::CARET_RIGHT)).is_some());
+        h.set_size(egui::vec2(1360.0, 2400.0));
+        h.run_steps(2);
+        h.get_all_by_label_contains("Research supervision").next().unwrap().click();
+        // Past the folding animation.
+        h.run_steps(20);
+        assert!(h.query_by_label(&format!("{} SUPERVISION MEETINGS", icons::CARET_DOWN)).is_none());
+        // Its chip opens it again and brings it into view.
+        h.set_size(egui::vec2(1360.0, 860.0));
+        h.run_steps(2);
+        h.get_by_label_contains(" PhD").click();
+        h.run_steps(20);
+        shot(&mut h, "25_role_chip_jump");
+        assert!(h.query_by_label(&format!("{} SUPERVISION MEETINGS", icons::CARET_DOWN)).is_some(), "open again");
+        let header = h.get_all_by_label_contains("Research supervision").next().unwrap().rect();
+        assert!(header.top() < 300.0, "scrolled to the top: {header:?}");
+    }
+
+    #[test]
     fn external_student_on_a_brazilian_programme() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.svt");
@@ -2116,8 +2589,10 @@ mod ui_tests {
         h.set_size(egui::vec2(1360.0, 2400.0));
         h.run_steps(3);
         let phd = |h: &mut Harness<'_, SupervisorApp>| session(h).db.student(ana).unwrap().phd.clone().unwrap();
+        // Section headings are shown in capitals, after the arrow that folds them.
+        let heading = |title: &str| format!("{} {title}", icons::CARET_DOWN);
         assert!(h.query_by_label("Standard assessments of this university").is_some());
-        assert!(h.query_by_label("GRANT").is_none());
+        assert!(h.query_by_label(&heading("GRANT")).is_none());
         // Their own university's number, in the list header and the details.
         // (list headers are shown in capitals).
         assert!(h.query_by_label("REGISTRATION #").is_some());
@@ -2129,9 +2604,8 @@ mod ui_tests {
         let p = phd(&mut h);
         assert!(p.brazilian_programme() && !p.skip_standard);
         assert_eq!(p.brazil.level, BrLevel::AcademicDoctorate);
-        // Card titles are shown in capitals.
-        for label in ["GRANT", "Standard stages of the Brazilian programme", "DEFENCE & AWARD", "Deadline extension"] {
-            assert!(h.query_by_label(label).is_some(), "{label}");
+        for label in [heading("GRANT"), "Standard stages of the Brazilian programme".into(), heading("DEFENCE & AWARD"), "Deadline extension".into()] {
+            assert!(h.query_by_label(&label).is_some(), "{label}");
         }
         assert!(h.query_by_label("Standard assessments of this university").is_none());
         assert!(h.query_by_label("Fee status").is_none());

@@ -3,6 +3,7 @@
 
 mod app;
 mod ics;
+mod ics_import;
 mod model;
 #[cfg(test)]
 mod perf_tests;

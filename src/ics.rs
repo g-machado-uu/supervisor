@@ -67,10 +67,26 @@ pub fn valid_email(email: &str) -> bool {
 
 /// A meeting link is used only if it's a plain `https://` address.
 pub fn valid_link(link: &str) -> bool {
+    full_link(link).is_some()
+}
+
+/// The link as a plain `https://` address. Links copied without it, as
+/// Google Calendar shows them (`meet.google.com/abc-defg-hij`), get it added.
+pub fn full_link(link: &str) -> Option<String> {
     let link = link.trim();
-    link.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
-        && link.len() > 8
-        && !link.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
+    if link.is_empty() || link.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"') {
+        return None;
+    }
+    if link.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://")) {
+        return (link.len() > 8).then(|| link.to_string());
+    }
+    // No other scheme: the part before the first `/` must be a domain name.
+    let host = link.split('/').next().unwrap_or_default();
+    let domain = host.contains('.')
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    domain.then(|| format!("https://{link}"))
 }
 
 fn to_jiff(dt: NaiveDateTime) -> Option<jiff::civil::DateTime> {
@@ -266,21 +282,21 @@ fn week_property(zone: &Zone, name: &str, planned: NaiveDate, time: Option<Naive
 fn push_details(out: &mut String, item: &CalItem, settings: &Settings, invite: bool) {
     let e = &item.event;
     push_line(out, &format!("SUMMARY:{}", escape(&e.title)));
-    if let Some(location) = location(e) {
+    let link = meeting_link(e, settings);
+    // Calendars show the location up front, so it holds the link when there is one.
+    if let Some(location) = link.as_deref().or(location(e)) {
         push_line(out, &format!("LOCATION:{}", escape(location)));
     }
-    if let Some(link) = meeting_link(e, settings) {
-        let join = match e.platform {
-            Platform::Teams => "Join on Microsoft Teams",
-            Platform::GoogleMeet => "Join with Google Meet",
-            Platform::Zoom => "Join the Zoom meeting",
-        };
+    if let Some(link) = &link {
         push_line(
             out,
-            &format!("DESCRIPTION:{}", escape(&format!("{join}:\n{link}"))),
+            &format!("DESCRIPTION:{}", escape(&format!("{}:\n{link}", join_text(e.platform)))),
         );
         // A URI, not text: escaping would add backslashes to the link.
         push_line(out, &format!("URL:{link}"));
+        if e.platform == Platform::GoogleMeet {
+            push_line(out, &format!("X-GOOGLE-CONFERENCE:{link}"));
+        }
     }
     let category = match e.kind {
         EventKind::FypMeeting => "Project",
@@ -289,6 +305,7 @@ fn push_details(out: &mut String, item: &CalItem, settings: &Settings, invite: b
         EventKind::PhdMeeting => "Research",
         EventKind::Deadline => "Deadline",
         EventKind::Reminder => "Reminder",
+        EventKind::Other => "Other",
     };
     push_line(out, &format!("CATEGORIES:{category}"));
     if matches!(e.kind, EventKind::Deadline | EventKind::Reminder) {
@@ -323,8 +340,16 @@ fn push_details(out: &mut String, item: &CalItem, settings: &Settings, invite: b
     push_line(out, "STATUS:CONFIRMED");
 }
 
+fn join_text(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Teams => "Join on Microsoft Teams",
+        Platform::GoogleMeet => "Join with Google Meet",
+        Platform::Zoom => "Join the Zoom meeting",
+    }
+}
+
 /// The link to join an online event: its own, or for Teams the one in Settings.
-pub fn meeting_link<'a>(e: &'a Event, settings: &'a Settings) -> Option<&'a str> {
+pub fn meeting_link(e: &Event, settings: &Settings) -> Option<String> {
     if !e.online {
         return None;
     }
@@ -333,7 +358,83 @@ pub fn meeting_link<'a>(e: &'a Event, settings: &'a Settings) -> Option<&'a str>
         Platform::Teams if own.is_empty() => settings.teams_link.trim(),
         _ => own,
     };
-    valid_link(link).then_some(link)
+    full_link(link)
+}
+
+/// Percent-encoding for a URL query value.
+fn query_value(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// A link that opens Google Calendar's "new event" page filled in with
+/// the item: title, times, place, the meeting link, a weekly repeat and the
+/// students as guests. Nothing is sent until Save is clicked there. A Google
+/// Meet meeting without a link asks Google to add one. Cancelled or moved
+/// weeks of a series aren't carried over.
+pub fn google_calendar_url(item: &CalItem, settings: &Settings, tz: &TimeZone) -> String {
+    let e = &item.event;
+    let zone = Zone::new(tz.clone(), e.date.year() - 1);
+    let local = zone.tz.iana_name().map(str::to_string);
+    let stamp = |dt: NaiveDateTime| match local {
+        Some(_) => dt.format("%Y%m%dT%H%M%S").to_string(),
+        None => zone.utc(dt),
+    };
+    let dates = match e.time {
+        Some(time) => {
+            let start = NaiveDateTime::new(e.date, time);
+            format!("{}/{}", stamp(start), stamp(start + Duration::hours(1)))
+        }
+        None => format!("{}/{}", e.date.format("%Y%m%d"), (e.date + Duration::days(1)).format("%Y%m%d")),
+    };
+    let mut query = vec![
+        ("action", "TEMPLATE".to_string()),
+        ("text", e.title.clone()),
+        ("dates", dates),
+    ];
+    if let Some(name) = local {
+        query.push(("ctz", name));
+    }
+    let link = meeting_link(e, settings);
+    if let Some(location) = link.as_deref().or(location(e)) {
+        query.push(("location", location.to_string()));
+    }
+    if let Some(link) = &link {
+        query.push(("details", format!("{}:\n{link}", join_text(e.platform))));
+    } else if e.online && e.platform == Platform::GoogleMeet {
+        query.push(("vcon", "meet".to_string()));
+    }
+    let guests: Vec<&str> = item
+        .attendees
+        .iter()
+        .map(|a| a.email.trim())
+        .filter(|email| valid_email(email))
+        .collect();
+    if !guests.is_empty() {
+        query.push(("add", guests.join(",")));
+    }
+    if let Some(rule) = &item.series {
+        let until = match e.time {
+            Some(time) => zone.utc(NaiveDateTime::new(rule.until, time)),
+            None => rule.until.format("%Y%m%d").to_string(),
+        };
+        query.push((
+            "recur",
+            format!("RRULE:FREQ=WEEKLY;INTERVAL={};UNTIL={until}", rule.every_weeks.max(1)),
+        ));
+    }
+    let query: Vec<String> = query
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_value(value)))
+        .collect();
+    format!("https://calendar.google.com/calendar/render?{}", query.join("&"))
 }
 
 fn location(e: &Event) -> Option<&str> {
@@ -591,8 +692,12 @@ mod tests {
         let with = unfold(&calendar(std::slice::from_ref(&teams), &settings(odd), true, &uk()));
         assert!(with.contains(&format!("URL:{odd}\r\n")));
 
+        // A link copied without https:// gets it added.
+        let bare = unfold(&calendar(std::slice::from_ref(&teams), &settings("teams.microsoft.com/l/abc"), true, &uk()));
+        assert!(bare.contains("URL:https://teams.microsoft.com/l/abc\r\n"));
+
         // Anything that isn't a plain https:// link is left out.
-        for bad in ["teams.microsoft.com/l/abc", "http://x.com/a", "javascript:alert(1)", "https://x.com/a b"] {
+        for bad in ["teams", "http://x.com/a", "javascript:alert(1)", "https://x.com/a b", "x.com/a b", ".x.com/a"] {
             let ics = calendar(std::slice::from_ref(&teams), &settings(bad), true, &uk());
             assert!(!ics.contains("URL:") && !ics.contains("DESCRIPTION"), "{bad}");
         }
@@ -614,10 +719,14 @@ mod tests {
         assert!(!ics.contains("URL:"), "the Teams link isn't used for Meet");
 
         let meet = "https://meet.google.com/abc-defg-hij";
-        e.link = meet.into();
+        // As Google Calendar shows it, without https://.
+        e.link = "meet.google.com/abc-defg-hij".into();
         let ics = unfold(&calendar(&[item(e.clone())], &settings(""), true, &uk()));
         assert!(ics.contains("DESCRIPTION:Join with Google Meet:\\n"));
         assert!(ics.contains(&format!("URL:{meet}")));
+        assert!(ics.contains(&format!("LOCATION:{meet}\r\n")), "the link is the location");
+        assert!(ics.contains(&format!("X-GOOGLE-CONFERENCE:{meet}")));
+        assert!(ics.contains(":mailto:smith-j@ulster.ac.uk"), "the student is a guest");
 
         // Zoom: its own link only, never the Teams one.
         e.platform = Platform::Zoom;
@@ -668,6 +777,32 @@ mod tests {
         assert!(ics.contains("RECURRENCE-ID;TZID=Local:20261116T140000"));
         assert!(ics.contains("DTSTART;TZID=Local:20261117T100000"));
         assert!(ics.lines().all(|l| l.len() <= 76));
+    }
+
+    #[test]
+    fn google_calendar_link() {
+        let mut e = event(d(2026, 10, 30), Some(14), EventKind::PhdMeeting, true);
+        e.platform = Platform::GoogleMeet;
+        let mut weekly = item(e.clone());
+        weekly.series = Some(SeriesRule {
+            every_weeks: 2,
+            until: d(2026, 12, 11),
+            exceptions: Vec::new(),
+        });
+        let london = jiff::tz::TimeZone::get("Europe/London").unwrap();
+        let url = google_calendar_url(&weekly, &settings(""), &london);
+        assert!(url.starts_with("https://calendar.google.com/calendar/render?action=TEMPLATE&text=BEng%20project%20meeting%20%E2%80%93%20Smith%2C%20J&"));
+        assert!(url.contains("&dates=20261030T140000%2F20261030T150000&ctz=Europe%2FLondon&"));
+        assert!(url.contains("&location=Google%20Meet&vcon=meet&"), "Google is asked for a Meet link");
+        assert!(url.contains("&add=smith-j%40ulster.ac.uk&"), "only the valid address is a guest");
+        assert!(url.ends_with("&recur=RRULE%3AFREQ%3DWEEKLY%3BINTERVAL%3D2%3BUNTIL%3D20261211T140000Z"));
+
+        e.link = "https://meet.google.com/abc-defg-hij".into();
+        e.time = None;
+        let url = google_calendar_url(&item(e), &settings(""), &london);
+        assert!(url.contains("&dates=20261030%2F20261031&"));
+        assert!(url.contains("&location=https%3A%2F%2Fmeet.google.com%2Fabc-defg-hij&details=Join%20with%20Google%20Meet%3A%0Ahttps"));
+        assert!(!url.contains("vcon") && !url.contains("recur"));
     }
 
     #[test]

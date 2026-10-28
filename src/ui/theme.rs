@@ -236,18 +236,32 @@ pub fn kind_style(kind: EventKind) -> (&'static str, Color32) {
         EventKind::PhdMeeting => (icons::GRADUATION_CAP, PLUM),
         EventKind::Deadline => (icons::PUSH_PIN, RED),
         EventKind::Reminder => (icons::BELL, GREY),
+        EventKind::Other => (icons::CALENDAR_BLANK, GREY),
     }
 }
 
 /// Small rounded pill with a soft coloured background, sized to its text
 /// (so it doesn't stretch to fill a table row).
 pub fn chip(ui: &mut Ui, text: impl Into<String>, color: Color32) -> Response {
-    let text = text.into();
+    chip_sensing(ui, text.into(), color, Sense::hover())
+}
+
+/// A chip that can be clicked, outlined while hovered.
+pub fn chip_button(ui: &mut Ui, text: impl Into<String>, color: Color32) -> Response {
+    chip_sensing(ui, text.into(), color, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn chip_sensing(ui: &mut Ui, text: String, color: Color32, sense: Sense) -> Response {
     let galley = ui.painter().layout_no_wrap(text.clone(), FontId::proportional(12.0), fg(ui, color));
     let size = galley.size() + egui::vec2(16.0, 6.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
-    resp.widget_info(|| WidgetInfo::labeled(egui::Role::Label, true, &text));
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let role = if sense.senses_click() { egui::Role::Button } else { egui::Role::Label };
+    resp.widget_info(|| WidgetInfo::labeled(role, true, &text));
     ui.painter().rect_filled(rect, CornerRadius::same(10), soft(ui, color));
+    if sense.senses_click() && resp.hovered() {
+        ui.painter()
+            .rect_stroke(rect, CornerRadius::same(10), egui::Stroke::new(1.0, fg(ui, color)), egui::StrokeKind::Inside);
+    }
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, fg(ui, color));
     resp
 }
@@ -293,6 +307,42 @@ pub fn card_title(ui: &mut Ui, title: &str) {
             .color(muted(ui)),
     );
     ui.add_space(6.0);
+}
+
+/// A section of a card under a heading like `card_title`; clicking the
+/// heading folds the section away. Returns what `add` returned, if shown.
+pub fn section<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
+    section_with(ui, title, |_| {}, add)
+}
+
+/// A `section` with controls (`right`) at the right of its heading.
+pub fn section_with<R>(
+    ui: &mut Ui,
+    title: &str,
+    right: impl FnOnce(&mut Ui),
+    add: impl FnOnce(&mut Ui) -> R,
+) -> Option<R> {
+    let id = ui.make_persistent_id(("section", title));
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let open = state.is_open();
+    let caret = if open { icons::CARET_DOWN } else { icons::CARET_RIGHT };
+    let heading = semibold(format!("{caret} {}", title.to_uppercase()))
+        .size(11.5)
+        .extra_letter_spacing(0.8)
+        .color(muted(ui));
+    ui.horizontal(|ui| {
+        if ui
+            .add(egui::Label::new(heading).sense(Sense::click()))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if open { "Fold away" } else { "Show" })
+            .clicked()
+        {
+            state.toggle(ui);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+    });
+    ui.add_space(if open { 6.0 } else { 2.0 });
+    state.show_body_unindented(ui, add).map(|r| r.inner)
 }
 
 /// Serif page title with a muted subtitle, and room for actions on the right.
@@ -637,4 +687,19 @@ mod tests {
         assert_eq!(super::initials("Li"), "L");
         assert_eq!(super::initials(""), "");
     }
+}
+
+/// The eye that shows or hides private details; like the Reveal and Hide
+/// buttons, its icon is what a click does. Returns true when clicked.
+/// `what` is what it shows, for the hover text.
+pub fn eye_button(ui: &mut Ui, shown: bool, what: &str) -> bool {
+    let (icon, hover) = if shown {
+        (icons::EYE_SLASH, format!("Hide {what}"))
+    } else {
+        (icons::EYE, format!("Reveal {what}"))
+    };
+    let resp = ui.add(egui::Button::new(RichText::new(icon).size(17.0).color(muted(ui))).frame(false));
+    // Named by what it does, for screen readers and tests.
+    resp.widget_info(|| WidgetInfo::labeled(egui::Role::Button, true, &hover));
+    resp.on_hover_text(hover).clicked()
 }

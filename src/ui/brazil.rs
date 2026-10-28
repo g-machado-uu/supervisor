@@ -2,6 +2,7 @@
 //! grant (bolsa) from a federal agency or state foundation, the extension of
 //! the deadlines, and the standard stages with their suggested dates.
 
+use chrono::NaiveDate;
 use egui::{RichText, Ui};
 
 use crate::model::{
@@ -130,8 +131,10 @@ fn agency_text(id: &str) -> String {
 }
 
 /// The grant: agency (federal, the 27 state foundations or other),
-/// modality, process number, start, length and any extension.
-pub fn grant_editor(ui: &mut Ui, g: &mut Grant, level: BrLevel) {
+/// modality, process number, start, length and any extension. Without a
+/// start of its own the grant starts with the project (`project_start`);
+/// its end is worked out, and can be changed.
+pub fn grant_editor(ui: &mut Ui, g: &mut Grant, level: BrLevel, project_start: Option<NaiveDate>) {
     let typical = level.typical_grant_months();
     widgets::form_grid(ui, "br-grant", |ui| {
         ui.label("Funder");
@@ -179,7 +182,25 @@ pub fn grant_editor(ui: &mut Ui, g: &mut Grant, level: BrLevel) {
         widgets::text_field(ui, &mut g.process, "Optional");
         ui.end_row();
         ui.label("Grant start");
-        widgets::opt_date(ui, "br-grant-start", &mut g.start);
+        match g.start {
+            Some(_) => widgets::opt_date(ui, "br-grant-start", &mut g.start),
+            None => {
+                ui.horizontal_wrapped(|ui| {
+                    let text = match project_start {
+                        Some(start) => format!("With the project ({})", widgets::fmt_date(Some(start))),
+                        None => "With the project (set its start below)".into(),
+                    };
+                    ui.label(text);
+                    if ui
+                        .small_button("Change…")
+                        .on_hover_text("The grant starts on another day")
+                        .clicked()
+                    {
+                        g.start = Some(project_start.unwrap_or_else(widgets::today));
+                    }
+                });
+            }
+        }
         ui.end_row();
         ui.label("Length");
         ui.horizontal(|ui| {
@@ -210,10 +231,36 @@ pub fn grant_editor(ui: &mut Ui, g: &mut Grant, level: BrLevel) {
         });
         ui.end_row();
         ui.label("Grant end");
-        match g.end() {
-            Some(end) => ui.label(theme::semibold(widgets::fmt_date(Some(end)))),
-            None => ui.label(RichText::new("set the start and length").color(theme::muted(ui))),
-        };
+        let calculated = g.calculated_end(project_start);
+        ui.vertical(|ui| match g.end_override {
+            None => {
+                ui.horizontal_wrapped(|ui| {
+                    match calculated {
+                        Some(end) => ui.label(theme::semibold(widgets::fmt_date(Some(end)))),
+                        None => ui.label(RichText::new("set the start and length").color(theme::muted(ui))),
+                    }
+                    .on_hover_text("Start + length + extension");
+                    if ui
+                        .small_button(format!("{} Change…", icons::PENCIL_SIMPLE))
+                        .on_hover_text("Type in the end date when it differs from the calculated one")
+                        .clicked()
+                    {
+                        g.end_override = Some(calculated.unwrap_or_else(widgets::today));
+                    }
+                });
+            }
+            Some(_) => {
+                widgets::opt_date(ui, "br-grant-end", &mut g.end_override);
+                if let Some(end) = calculated.filter(|end| g.end_override != Some(*end)) {
+                    ui.horizontal_wrapped(|ui| {
+                        small_wrapped(ui, &format!("Calculated: {}", widgets::fmt_date(Some(end))));
+                        if ui.small_button("Use this date").clicked() {
+                            g.end_override = None;
+                        }
+                    });
+                }
+            }
+        });
         ui.end_row();
     });
 }

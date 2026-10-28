@@ -144,12 +144,39 @@ pub fn form_grid(ui: &mut Ui, id: impl AsIdSalt, add: impl FnOnce(&mut Ui)) {
         .show(ui, add);
 }
 
-/// Button for saving an invite file; needs a date to be set.
-pub fn invite_button(ui: &mut Ui, has_date: bool) -> bool {
-    ui.add_enabled(has_date, egui::Button::new(format!("{} Invite file…", icons::PAPER_PLANE_TILT)).small())
+/// A meeting, visit or viva (by UID) to send to the student.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Share {
+    /// Save an invite file.
+    File(String),
+    /// Open it in Google Calendar.
+    Google(String),
+}
+
+/// "Invite file…" and "Google Calendar" buttons for the item `uid`; both
+/// need a date to be set.
+pub fn share_buttons(ui: &mut Ui, has_date: bool, uid: impl Fn() -> String) -> Option<Share> {
+    let mut share = None;
+    if ui
+        .add_enabled(has_date, egui::Button::new(format!("{} Invite file…", icons::PAPER_PLANE_TILT)).small())
         .on_hover_text("Save an .ics with the student as attendee, to upload to Outlook and send")
         .on_disabled_hover_text("Set a date first")
         .clicked()
+    {
+        share = Some(Share::File(uid()));
+    }
+    if ui
+        .add_enabled(has_date, egui::Button::new(format!("{} Google Calendar", icons::ARROW_SQUARE_OUT)).small())
+        .on_hover_text(
+            "Open Google Calendar in the browser with this filled in and the student as a guest. \
+             For Google Meet without a link, Google adds one. Check it there and Save to send the invitation.",
+        )
+        .on_disabled_hover_text("Set a date first")
+        .clicked()
+    {
+        share = Some(Share::Google(uid()));
+    }
+    share
 }
 
 /// "Teaching week 5 · Mon 26 Oct" style label for a date.
@@ -162,15 +189,15 @@ pub fn week_label(settings: &Settings, date: NaiveDate) -> String {
 
 /// Editable list of meetings: date, time, online (Teams / Meet) or room, repetition and
 /// notes. `first_label` names the first entry (e.g. "Semester meeting");
-/// later entries become follow-ons. Returns the UID of a meeting whose
-/// invite button was clicked.
+/// later entries become follow-ons. Returns the meeting to send, if its
+/// invite file or Google Calendar button was clicked.
 pub fn meetings_editor(
     ui: &mut Ui,
     salt: impl AsIdSalt,
     meetings: &mut Vec<Meeting>,
     first_label: Option<&str>,
     settings: &Settings,
-) -> Option<String> {
+) -> Option<Share> {
     let mut invite = None;
     ui.push_id(salt, |ui| {
         let mut remove = None;
@@ -200,8 +227,8 @@ pub fn meetings_editor(
                                     {
                                         remove = Some(i);
                                     }
-                                    if invite_button(ui, m.date.is_some()) {
-                                        invite = Some(m.uid());
+                                    if let Some(share) = share_buttons(ui, m.date.is_some(), || m.uid()) {
+                                        invite = Some(share);
                                     }
                                 },
                             );
@@ -234,6 +261,12 @@ pub fn meetings_editor(
                                 };
                                 text_field(ui, &mut m.link, hint);
                             });
+                            if !m.link.trim().is_empty() && !crate::ics::valid_link(&m.link) {
+                                ui.colored_label(
+                                    theme::fg(ui, theme::AMBER),
+                                    format!("{} This doesn't look like a link – it won't go into invitations", icons::WARNING),
+                                );
+                            }
                         }
                         repeat_editor(ui, m, settings);
                         notes(ui, &mut m.notes, "Meeting notes…");

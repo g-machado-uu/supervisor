@@ -259,6 +259,8 @@ pub struct Settings {
     /// ID such as the CPF or National Insurance number) as dots until revealed.
     pub hide_external_ids: bool,
     pub reveal_needs_password: bool,
+    /// Calendar weeks start on Sunday rather than Monday.
+    pub week_starts_sunday: bool,
 }
 
 impl Default for Settings {
@@ -281,6 +283,7 @@ impl Default for Settings {
             br_rules: default_br_rules(),
             hide_external_ids: true,
             reveal_needs_password: false,
+            week_starts_sunday: false,
         }
     }
 }
@@ -379,6 +382,16 @@ impl Settings {
         } else {
             Semester::S1
         }
+    }
+
+    /// First day of the calendar week `date` is in (Monday, or Sunday).
+    pub fn week_start(&self, date: NaiveDate) -> NaiveDate {
+        let back = if self.week_starts_sunday {
+            date.weekday().num_days_from_sunday()
+        } else {
+            date.weekday().num_days_from_monday()
+        };
+        date - Duration::days(i64::from(back))
     }
 
     /// Teaching week number of `date`, if it falls within teaching.
@@ -481,6 +494,8 @@ pub struct Meeting {
     pub location: String,
     pub repeat: Option<Repeat>,
     pub notes: String,
+    /// UID of the calendar event it was imported from, if any.
+    pub source: String,
 }
 
 impl Default for Meeting {
@@ -496,6 +511,7 @@ impl Default for Meeting {
             location: String::new(),
             repeat: None,
             notes: String::new(),
+            source: String::new(),
         }
     }
 }
@@ -653,6 +669,69 @@ pub struct CwStatus {
     pub submitted_on: Option<NaiveDate>,
     pub deadline_override: Option<NaiveDate>,
     pub notes: String,
+    /// Marks as typed in (e.g. "68"): first marker (me) and second marker
+    /// (for SUST students, the SUST supervisor), and the agreed mark.
+    pub mark_1: String,
+    pub mark_2: String,
+    pub agreed_mark: String,
+    /// SUST students: the SUST supervisor has sent their marks.
+    pub marks_received: bool,
+    /// The agreed mark was filled in as the average and is still to be confirmed.
+    pub agreed_unconfirmed: bool,
+}
+
+/// How far (as a share of marker 1's mark, the supervisor's) marker 2's
+/// mark may be for the two to be averaged; further away, the markers agree
+/// the mark themselves.
+pub const MARK_TOLERANCE: f64 = 0.10;
+
+/// A mark typed as "68", "68%" or "67.5".
+fn parse_mark(text: &str) -> Option<f64> {
+    text.trim().trim_end_matches('%').trim().parse().ok().filter(|m: &f64| m.is_finite())
+}
+
+/// A mark as text: "68", or "67.5" with a half.
+pub fn fmt_mark(mark: f64) -> String {
+    let rounded = (mark * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 { format!("{rounded:.0}") } else { format!("{rounded:.1}") }
+}
+
+impl CwStatus {
+    /// Both markers' marks, when both are numbers.
+    pub fn marks(&self) -> Option<(f64, f64)> {
+        Some((parse_mark(&self.mark_1)?, parse_mark(&self.mark_2)?))
+    }
+
+    /// How far marker 2's mark is from marker 1's, as a percentage of
+    /// marker 1's, when that is more than `MARK_TOLERANCE`.
+    pub fn marks_apart(&self) -> Option<f64> {
+        let (first, second) = self.marks()?;
+        let gap = (second - first).abs();
+        if gap <= MARK_TOLERANCE * first.abs() + 1e-9 {
+            return None;
+        }
+        Some(if first == 0.0 { 100.0 } else { gap / first.abs() * 100.0 })
+    }
+
+    /// After a marker's mark changes: marker 2's mark within
+    /// `MARK_TOLERANCE` of marker 1's gives their average as the agreed
+    /// mark, to be confirmed. A mark typed
+    /// in by hand is kept; a suggestion that no longer applies is removed.
+    pub fn suggest_agreed(&mut self) {
+        if !self.agreed_unconfirmed && !self.agreed_mark.trim().is_empty() {
+            return;
+        }
+        match self.marks().filter(|_| self.marks_apart().is_none()) {
+            Some((a, b)) => {
+                self.agreed_mark = fmt_mark((a + b) / 2.0);
+                self.agreed_unconfirmed = true;
+            }
+            None => {
+                self.agreed_mark.clear();
+                self.agreed_unconfirmed = false;
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -664,6 +743,9 @@ pub struct FypRecord {
     pub project_title: String,
     pub initial_contact: bool,
     pub initial_contact_on: Option<NaiveDate>,
+    /// SUST students: their reply to the first contact.
+    pub reply: ReplyStatus,
+    pub replied_on: Option<NaiveDate>,
     pub meetings: Vec<Meeting>,
     /// Keyed by `CourseworkTemplate::id`.
     pub coursework: HashMap<Uuid, CwStatus>,
@@ -681,6 +763,8 @@ impl Default for FypRecord {
             project_title: String::new(),
             initial_contact: false,
             initial_contact_on: None,
+            reply: ReplyStatus::default(),
+            replied_on: None,
             meetings: Vec::new(),
             coursework: HashMap::new(),
             second_marker_name: String::new(),
@@ -1411,6 +1495,8 @@ pub struct Grant {
     /// Months added by an extension.
     pub extension_months: u32,
     pub extension_reason: ExtensionReason,
+    /// The last day, typed in when it differs from the calculated one.
+    pub end_override: Option<NaiveDate>,
 }
 
 impl Grant {
@@ -1418,14 +1504,24 @@ impl Grant {
         !self.agency.is_empty()
     }
 
-    /// Last day of the grant: start + months + extension, minus a day.
-    pub fn end(&self) -> Option<NaiveDate> {
+    /// Start + months + extension, minus a day. Without a start of its own
+    /// the grant starts with the project (`project_start`).
+    pub fn calculated_end(&self, project_start: Option<NaiveDate>) -> Option<NaiveDate> {
         if !self.active() || self.months == 0 {
             return None;
         }
-        self.start?
+        self.start
+            .or(project_start)?
             .checked_add_months(Months::new(self.months + self.extension_months))?
             .pred_opt()
+    }
+
+    /// Last day of the grant: the one typed in, or the calculated one.
+    pub fn end_from(&self, project_start: Option<NaiveDate>) -> Option<NaiveDate> {
+        if !self.active() {
+            return None;
+        }
+        self.end_override.or_else(|| self.calculated_end(project_start))
     }
 
     /// "CAPES", or the name typed in for another source.
@@ -1626,6 +1722,12 @@ impl PhdRecord {
     /// The Brazilian grant, if the student is on a Brazilian programme and has one.
     pub fn brazilian_grant(&self) -> Option<&Grant> {
         Some(&self.brazil.grant).filter(|g| self.brazilian_programme() && g.active())
+    }
+
+    /// Last day of the Brazilian grant, if any; it starts with the project
+    /// unless it has a start of its own.
+    pub fn grant_end(&self) -> Option<NaiveDate> {
+        self.brazilian_grant()?.end_from(self.start)
     }
 
     /// Which research list the student is shown in.
@@ -1953,6 +2055,10 @@ pub struct Database {
     pub version: u32,
     pub settings: Settings,
     pub students: Vec<Student>,
+    /// Imported calendar events that aren't linked to a student.
+    pub entries: Vec<CalEntry>,
+    /// UIDs of imported calendar events the user chose not to import.
+    pub ignored_imports: Vec<String>,
 }
 
 impl Default for Database {
@@ -1961,8 +2067,120 @@ impl Default for Database {
             version: DB_VERSION,
             settings: Settings::default(),
             students: Vec::new(),
+            entries: Vec::new(),
+            ignored_imports: Vec::new(),
         }
     }
+}
+
+/// An event from an imported calendar, kept in the calendar without a
+/// student. Its date, time, place and repetition work like a meeting's.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct CalEntry {
+    pub title: String,
+    pub meeting: Meeting,
+}
+
+/// Which list of meetings an imported event joins.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MeetingRole {
+    Fyp,
+    Phd,
+    /// The semester is the one the meeting falls in.
+    Advisee,
+}
+
+impl MeetingRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            MeetingRole::Fyp => "Project meetings",
+            MeetingRole::Phd => "Research meetings",
+            MeetingRole::Advisee => "Advisee meetings",
+        }
+    }
+
+    /// The roles of `s` that have meetings.
+    pub fn of(s: &Student) -> Vec<MeetingRole> {
+        let mut out = Vec::new();
+        if s.fyp.is_some() {
+            out.push(MeetingRole::Fyp);
+        }
+        if s.phd.is_some() {
+            out.push(MeetingRole::Phd);
+        }
+        if s.advisee.is_some() {
+            out.push(MeetingRole::Advisee);
+        }
+        out
+    }
+}
+
+/// An event read from another calendar, ready to become a meeting.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportedEvent {
+    pub uid: String,
+    pub title: String,
+    /// Its date, time, place and repetition; `source` is the UID.
+    pub meeting: Meeting,
+    /// Email addresses of the guests, to suggest a student.
+    pub guests: Vec<String>,
+    /// It repeats in a way Supervisor can't follow; only its first date is kept.
+    pub repeat_dropped: bool,
+}
+
+/// Why an event of an imported calendar may not be wanted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Known {
+    /// Exported from Supervisor, so it is here already.
+    FromSupervisor,
+    Imported,
+    Skipped,
+}
+
+impl Known {
+    pub fn label(self) -> &'static str {
+        match self {
+            Known::FromSupervisor => "from Supervisor",
+            Known::Imported => "imported before",
+            Known::Skipped => "skipped before",
+        }
+    }
+
+    /// Importing it again would show it twice.
+    pub fn duplicate(self) -> bool {
+        self != Known::Skipped
+    }
+}
+
+/// What to do with one imported event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImportTarget {
+    Ignore,
+    /// Keep it in the calendar without a student.
+    Calendar,
+    Student(Uuid, MeetingRole),
+}
+
+/// What the calendar's edit dialog can change in an item.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventDetails {
+    /// Only imported events have a title of their own.
+    pub title: Option<String>,
+    pub date: NaiveDate,
+    pub time: Option<NaiveTime>,
+    /// `None` for items without a place (visits).
+    pub place: Option<Place>,
+}
+
+/// Where a meeting happens.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Place {
+    /// `None` for the viva, which only has a location.
+    pub online: Option<bool>,
+    pub platform: Platform,
+    pub link: String,
+    pub location: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1975,6 +2193,8 @@ pub enum EventKind {
     Deadline,
     /// Advance notice of a PhD deadline.
     Reminder,
+    /// An imported event that isn't linked to a student.
+    Other,
 }
 
 /// A dated item derived from the records, used for the dashboard, the
@@ -2002,6 +2222,15 @@ pub struct Event {
 }
 
 impl Event {
+    /// The title without the student's name, for privacy mode. Events
+    /// without a student (from an imported calendar) are just "Event".
+    pub fn anonymous_title(&self) -> &str {
+        if self.student_id.is_nil() {
+            return "Event";
+        }
+        self.title.rsplit_once(" – ").map_or(&self.title, |(title, _)| title)
+    }
+
     /// A week of a repeating meeting that was moved to another day.
     pub fn moved(&self) -> bool {
         self.series
@@ -2014,6 +2243,24 @@ impl Event {
         let rest = self.uid.strip_prefix("meeting-")?;
         Uuid::parse_str(rest.get(..36)?).ok()
     }
+
+    /// Can be moved, edited and deleted from the calendar: meetings,
+    /// visits, the viva and imported events, but not the deadlines that
+    /// come from the university's dates.
+    pub fn editable(&self) -> bool {
+        !matches!(self.kind, EventKind::Deadline | EventKind::Reminder)
+    }
+
+    /// Which placement visit (0 or 1) this is.
+    fn visit_index(&self) -> Option<usize> {
+        let rest = self.uid.strip_prefix("visit")?;
+        let n: usize = rest.get(..1)?.parse().ok()?;
+        (1..=2).contains(&n).then(|| n - 1)
+    }
+
+    fn is_viva(&self) -> bool {
+        self.uid.starts_with("phd-viva-")
+    }
 }
 
 /// A change the calendar can make to a meeting, or to one week of a
@@ -2023,6 +2270,8 @@ pub enum MeetingChange {
     Held(bool),
     /// Move it to this day and time.
     Postpone(NaiveDate, Option<NaiveTime>),
+    /// Cancel a week of a repeating meeting, or bring it back.
+    Cancelled(bool),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2061,13 +2310,15 @@ pub struct Attention {
     pub student_id: Uuid,
     pub severity: Severity,
     pub message: String,
+    /// The message without the student's name.
+    pub detail: String,
 }
 
 /// One event per week of `m` (only the meeting itself if it doesn't repeat).
 fn push_meeting(
     out: &mut Vec<Event>,
     settings: &Settings,
-    s: &Student,
+    student_id: Uuid,
     m: &Meeting,
     kind: EventKind,
     title: String,
@@ -2079,7 +2330,7 @@ fn push_meeting(
         };
         out.push(Event {
             uid,
-            student_id: s.id,
+            student_id,
             date: occ.date(),
             time: occ.time.or(m.time),
             kind,
@@ -2092,6 +2343,25 @@ fn push_meeting(
             series,
             cancelled: occ.cancelled,
         });
+    }
+}
+
+/// Move a meeting, or the week of a repeating one planned for `planned`,
+/// to `date` at `time`. A week back on its planned day and usual time is
+/// no longer marked as moved.
+fn reschedule(m: &mut Meeting, planned: Option<NaiveDate>, date: NaiveDate, time: Option<NaiveTime>) {
+    match planned {
+        None => {
+            m.date = Some(date);
+            m.time = time;
+        }
+        Some(planned) => {
+            let usual = m.time;
+            let mut week = m.occurrence(planned);
+            week.moved_to = (date != planned).then_some(date);
+            week.time = time.filter(|t| Some(*t) != usual);
+            m.set_occurrence(week);
+        }
     }
 }
 
@@ -2117,33 +2387,312 @@ impl Database {
     /// repeating meeting. Returns false if `event` isn't a meeting.
     pub fn change_meeting(&mut self, event: &Event, change: MeetingChange) -> bool {
         let Some(id) = event.meeting_id() else { return false };
-        let Some(m) = self
-            .student_mut(event.student_id)
-            .and_then(|s| s.meetings_mut().find(|m| m.id == id))
-        else {
+        let Some(m) = self.meeting_mut(event.student_id, id) else {
             return false;
         };
-        match &event.series {
-            None => match change {
-                MeetingChange::Held(held) => m.held = held,
-                MeetingChange::Postpone(date, time) => {
-                    m.date = Some(date);
-                    m.time = time;
+        let planned = event.series.as_ref().map(|(_, planned)| *planned);
+        match change {
+            MeetingChange::Held(held) => match planned {
+                None => m.held = held,
+                Some(planned) => {
+                    let mut week = m.occurrence(planned);
+                    week.held = held;
+                    m.set_occurrence(week);
                 }
             },
-            Some((_, planned)) => {
-                let mut week = m.occurrence(*planned);
-                match change {
-                    MeetingChange::Held(held) => week.held = held,
-                    MeetingChange::Postpone(date, time) => {
-                        week.moved_to = Some(date);
-                        week.time = time;
-                    }
-                }
+            MeetingChange::Postpone(date, time) => reschedule(m, planned, date, time),
+            MeetingChange::Cancelled(cancelled) => {
+                let Some(planned) = planned else { return false };
+                let mut week = m.occurrence(planned);
+                week.cancelled = cancelled;
                 m.set_occurrence(week);
             }
         }
         true
+    }
+
+    /// The meetings of a student or, for the nil id, of the imported events.
+    fn meetings_of(&self, student_id: Uuid) -> Box<dyn Iterator<Item = &Meeting> + '_> {
+        if student_id.is_nil() {
+            Box::new(self.entries.iter().map(|e| &e.meeting))
+        } else {
+            match self.student(student_id) {
+                Some(s) => Box::new(s.meetings()),
+                None => Box::new(std::iter::empty()),
+            }
+        }
+    }
+
+    fn meeting_mut(&mut self, student_id: Uuid, id: Uuid) -> Option<&mut Meeting> {
+        if student_id.is_nil() {
+            return self.entries.iter_mut().map(|e| &mut e.meeting).find(|m| m.id == id);
+        }
+        self.student_mut(student_id)?.meetings_mut().find(|m| m.id == id)
+    }
+
+    /// What the calendar's edit dialog shows for `e`, if it can be edited.
+    pub fn event_details(&self, e: &Event) -> Option<EventDetails> {
+        if !e.editable() {
+            return None;
+        }
+        if let Some(id) = e.meeting_id() {
+            let m = self.meetings_of(e.student_id).find(|m| m.id == id)?;
+            let title = self
+                .entries
+                .iter()
+                .find(|x| e.student_id.is_nil() && x.meeting.id == id)
+                .map(|x| x.title.clone());
+            return Some(EventDetails {
+                title,
+                date: e.date,
+                time: e.time,
+                place: Some(Place {
+                    online: Some(m.online),
+                    platform: m.platform,
+                    link: m.link.clone(),
+                    location: m.location.clone(),
+                }),
+            });
+        }
+        let s = self.student(e.student_id)?;
+        if let Some(i) = e.visit_index() {
+            let v = &s.placement.as_ref()?.visits[i];
+            return Some(EventDetails {
+                title: None,
+                date: v.date?,
+                time: v.time,
+                place: None,
+            });
+        }
+        if e.is_viva() {
+            let p = s.phd.as_ref()?;
+            return Some(EventDetails {
+                title: None,
+                date: p.viva?,
+                time: p.viva_time,
+                place: Some(Place {
+                    online: None,
+                    location: p.viva_location.clone(),
+                    ..Default::default()
+                }),
+            });
+        }
+        None
+    }
+
+    /// Store what was changed in the edit dialog. For a week of a repeating
+    /// meeting the day and time change that week only, and the place every
+    /// week. Returns false if `e` can't be edited.
+    pub fn edit_event(&mut self, e: &Event, d: &EventDetails) -> bool {
+        if !e.editable() {
+            return false;
+        }
+        if let Some(id) = e.meeting_id() {
+            if let Some(title) = &d.title
+                && let Some(x) = self.entries.iter_mut().find(|x| e.student_id.is_nil() && x.meeting.id == id)
+            {
+                x.title = title.trim().into();
+            }
+            let Some(m) = self.meeting_mut(e.student_id, id) else {
+                return false;
+            };
+            if let Some(place) = &d.place {
+                m.online = place.online.unwrap_or(m.online);
+                m.platform = place.platform;
+                m.link = place.link.trim().into();
+                m.location = place.location.trim().into();
+            }
+            let planned = e.series.as_ref().map(|(_, planned)| *planned);
+            reschedule(m, planned, d.date, d.time);
+            return true;
+        }
+        let visit = e.visit_index();
+        let viva = e.is_viva();
+        let Some(s) = self.student_mut(e.student_id) else {
+            return false;
+        };
+        if let Some(i) = visit
+            && let Some(p) = &mut s.placement
+        {
+            p.visits[i].date = Some(d.date);
+            p.visits[i].time = d.time;
+            return true;
+        }
+        if viva && let Some(p) = &mut s.phd {
+            p.viva = Some(d.date);
+            p.viva_time = d.time;
+            if let Some(place) = &d.place {
+                p.viva_location = place.location.trim().into();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Move `e` to another day, keeping its time.
+    pub fn move_event(&mut self, e: &Event, date: NaiveDate) -> bool {
+        let Some(details) = self.event_details(e) else {
+            return false;
+        };
+        self.edit_event(e, &EventDetails { date, ..details })
+    }
+
+    /// Delete `e`: a meeting is removed (a week of a repeating one is
+    /// cancelled, unless `whole_series`), a visit or the viva loses its
+    /// date. Returns false if `e` can't be deleted.
+    pub fn delete_event(&mut self, e: &Event, whole_series: bool) -> bool {
+        if !e.editable() {
+            return false;
+        }
+        if let Some(id) = e.meeting_id() {
+            if let (Some((_, planned)), false) = (&e.series, whole_series) {
+                let Some(m) = self.meeting_mut(e.student_id, id) else {
+                    return false;
+                };
+                let mut week = m.occurrence(*planned);
+                week.cancelled = true;
+                m.set_occurrence(week);
+                return true;
+            }
+            return self.remove_meeting(e.student_id, id);
+        }
+        let visit = e.visit_index();
+        let viva = e.is_viva();
+        let Some(s) = self.student_mut(e.student_id) else {
+            return false;
+        };
+        if let Some(i) = visit
+            && let Some(p) = &mut s.placement
+        {
+            p.visits[i].date = None;
+            p.visits[i].time = None;
+            return true;
+        }
+        if viva && let Some(p) = &mut s.phd {
+            p.viva = None;
+            p.viva_time = None;
+            return true;
+        }
+        false
+    }
+
+    fn remove_meeting(&mut self, student_id: Uuid, id: Uuid) -> bool {
+        let keep = |m: &Meeting| m.id != id;
+        if student_id.is_nil() {
+            let before = self.entries.len();
+            self.entries.retain(|e| keep(&e.meeting));
+            return self.entries.len() != before;
+        }
+        let Some(s) = self.student_mut(student_id) else {
+            return false;
+        };
+        let before = s.meetings().count();
+        if let Some(f) = &mut s.fyp {
+            f.meetings.retain(keep);
+        }
+        if let Some(a) = &mut s.advisee {
+            a.s1.meetings.retain(keep);
+            a.s2.meetings.retain(keep);
+        }
+        if let Some(p) = &mut s.phd {
+            p.meetings.retain(keep);
+        }
+        s.meetings().count() != before
+    }
+
+    /// Why an imported event may not be wanted: it came from Supervisor,
+    /// or was imported or skipped before.
+    pub fn known_import(&self, uid: &str) -> Option<Known> {
+        if uid.ends_with("@supervisor.local") {
+            Some(Known::FromSupervisor)
+        } else if self
+            .students
+            .iter()
+            .flat_map(Student::meetings)
+            .chain(self.entries.iter().map(|e| &e.meeting))
+            .any(|m| m.source == uid)
+        {
+            Some(Known::Imported)
+        } else if self.ignored_imports.iter().any(|u| u == uid) {
+            Some(Known::Skipped)
+        } else {
+            None
+        }
+    }
+
+    /// The student an imported event is probably with: one of the guests,
+    /// or named in the title. The role follows words in the title.
+    pub fn suggest_student(&self, ev: &ImportedEvent) -> Option<(Uuid, MeetingRole)> {
+        let candidates = || {
+            self.students
+                .iter()
+                .filter(|s| !s.archived && !MeetingRole::of(s).is_empty())
+        };
+        let title = ev.title.to_lowercase();
+        let s = candidates()
+            .find(|s| {
+                let email = s.email.trim();
+                !email.is_empty() && ev.guests.iter().any(|g| g.trim().eq_ignore_ascii_case(email))
+            })
+            .or_else(|| {
+                candidates().find(|s| {
+                    let name = s.name.trim().to_lowercase();
+                    name.len() >= 4 && title.contains(&name)
+                })
+            })?;
+        let roles = MeetingRole::of(s);
+        let hinted = |role, words: &[&str]| roles.contains(&role) && words.iter().any(|w| title.contains(w));
+        let role = if hinted(MeetingRole::Advisee, &["advis"]) {
+            MeetingRole::Advisee
+        } else if hinted(MeetingRole::Phd, &["phd", "msc", "research", "supervision", "thesis"]) {
+            MeetingRole::Phd
+        } else if hinted(MeetingRole::Fyp, &["project", "fyp"]) {
+            MeetingRole::Fyp
+        } else {
+            roles[0]
+        };
+        Some((s.id, role))
+    }
+
+    /// Add the imported events as chosen; the skipped ones are remembered.
+    /// Returns how many were added.
+    pub fn import(&mut self, choices: Vec<(ImportedEvent, ImportTarget)>) -> usize {
+        let mut added = 0;
+        for (ev, target) in choices {
+            let uid = ev.uid.clone();
+            if target == ImportTarget::Ignore {
+                if !self.ignored_imports.contains(&uid) {
+                    self.ignored_imports.push(uid);
+                }
+                continue;
+            }
+            let mut meeting = ev.meeting;
+            meeting.source = uid.clone();
+            let semester = meeting.date.map(|d| self.settings.semester_of(d));
+            let list = match target {
+                ImportTarget::Ignore => None,
+                ImportTarget::Calendar => {
+                    self.entries.push(CalEntry { title: ev.title, meeting });
+                    added += 1;
+                    self.ignored_imports.retain(|u| *u != uid);
+                    continue;
+                }
+                ImportTarget::Student(id, role) => self.student_mut(id).and_then(|s| match role {
+                    MeetingRole::Fyp => s.fyp.as_mut().map(|f| &mut f.meetings),
+                    MeetingRole::Phd => s.phd.as_mut().map(|p| &mut p.meetings),
+                    MeetingRole::Advisee => s.advisee.as_mut().map(|a| match semester {
+                        Some(Semester::S2) => &mut a.s2.meetings,
+                        _ => &mut a.s1.meetings,
+                    }),
+                }),
+            };
+            if let Some(list) = list {
+                list.push(meeting);
+                added += 1;
+                self.ignored_imports.retain(|u| *u != uid);
+            }
+        }
+        added
     }
 
     pub fn b_number_taken(&self, b_number: &str, except: Option<Uuid>) -> bool {
@@ -2162,8 +2711,15 @@ impl Database {
         for s in self.students.iter().filter(|s| !s.archived) {
             self.student_events(s, &mut out);
         }
+        self.entry_events(&mut out);
         out.sort_by_key(|e| (e.date, e.time));
         out
+    }
+
+    fn entry_events(&self, out: &mut Vec<Event>) {
+        for x in &self.entries {
+            push_meeting(out, &self.settings, Uuid::nil(), &x.meeting, EventKind::Other, x.title.clone());
+        }
     }
 
     fn student_events(&self, s: &Student, out: &mut Vec<Event>) {
@@ -2175,7 +2731,7 @@ impl Database {
                 push_meeting(
                     out,
                     settings,
-                    s,
+                    s.id,
                     m,
                     EventKind::FypMeeting,
                     format!("{short} project meeting – {name}"),
@@ -2243,7 +2799,7 @@ impl Database {
                     push_meeting(
                         out,
                         settings,
-                        s,
+                        s.id,
                         m,
                         EventKind::AdviseeMeeting,
                         format!("Advisee {sem} {label} – {name}"),
@@ -2259,7 +2815,7 @@ impl Database {
             push_meeting(
                 out,
                 &self.settings,
-                s,
+                s.id,
                 m,
                 EventKind::PhdMeeting,
                 format!("{degree} supervision – {name}"),
@@ -2322,7 +2878,7 @@ impl Database {
                 ));
             }
         }
-        if let Some(end) = p.brazilian_grant().and_then(Grant::end) {
+        if let Some(end) = p.grant_end() {
             out.push(Event {
                 uid: format!("phd-grant-end-{}", s.id),
                 student_id: s.id,
@@ -2388,15 +2944,19 @@ impl Database {
     pub fn cal_items(&self, pick: impl Fn(&Event) -> bool, as_series: bool) -> Vec<CalItem> {
         let mut out = Vec::new();
         let mut series_done = HashSet::new();
-        for s in self.students.iter().filter(|s| !s.archived) {
+        let students = self.students.iter().filter(|s| !s.archived).map(Some);
+        for s in students.chain([None]) {
             let mut events = Vec::new();
-            self.student_events(s, &mut events);
+            match s {
+                Some(s) => self.student_events(s, &mut events),
+                None => self.entry_events(&mut events),
+            }
             for e in events.into_iter().filter(|e| !e.cancelled && pick(e)) {
-                let attendees = Self::attendees(s, &e);
+                let attendees = s.map(|s| Self::attendees(s, &e)).unwrap_or_default();
                 match &e.series {
                     Some((uid, _)) if as_series => {
                         if series_done.insert(uid.clone())
-                            && let Some(item) = self.series_item(s, uid, e.clone(), attendees)
+                            && let Some(item) = self.series_item(uid, e.clone(), attendees)
                         {
                             out.push(item);
                         }
@@ -2414,14 +2974,8 @@ impl Database {
     }
 
     /// The whole repeating meeting `uid`, from the event of one of its weeks.
-    fn series_item(
-        &self,
-        s: &Student,
-        uid: &str,
-        week: Event,
-        attendees: Vec<Attendee>,
-    ) -> Option<CalItem> {
-        let m = s.meetings().find(|m| m.uid() == uid)?;
+    fn series_item(&self, uid: &str, week: Event, attendees: Vec<Attendee>) -> Option<CalItem> {
+        let m = self.meetings_of(week.student_id).find(|m| m.uid() == uid)?;
         let repeat = m.repeat.as_ref()?;
         let occurrences = m.occurrences(&self.settings);
         let last = occurrences.last()?.planned;
@@ -2448,18 +3002,22 @@ impl Database {
     }
 
     /// The meeting (whole series if it repeats) or visit `uid` of one
-    /// student, ready for an invite file.
+    /// student (or, for the nil id, an imported event), ready for an
+    /// invite file.
     pub fn invite(&self, student_id: Uuid, uid: &str) -> Option<CalItem> {
-        let s = self.student(student_id)?;
+        let s = if student_id.is_nil() { None } else { Some(self.student(student_id)?) };
         let mut events = Vec::new();
-        self.student_events(s, &mut events);
+        match s {
+            Some(s) => self.student_events(s, &mut events),
+            None => self.entry_events(&mut events),
+        }
         let e = events.into_iter().find(|e| {
             !matches!(e.kind, EventKind::Deadline | EventKind::Reminder)
                 && (e.uid == uid || e.series.as_ref().is_some_and(|(series, _)| series == uid))
         })?;
-        let attendees = Self::attendees(s, &e);
+        let attendees = s.map(|s| Self::attendees(s, &e)).unwrap_or_default();
         match e.series.as_ref().map(|(series, _)| series.clone()) {
-            Some(series) => self.series_item(s, &series, e, attendees),
+            Some(series) => self.series_item(&series, e, attendees),
             None => Some(CalItem {
                 event: e,
                 series: None,
@@ -2476,12 +3034,20 @@ impl Database {
                 student_id: student.id,
                 severity,
                 message: format!("{} – {message}", student.display_name()),
+                detail: message,
             })
         };
         for s in self.students.iter().filter(|s| !s.archived) {
             if let Some(fyp) = &s.fyp {
                 if !fyp.initial_contact {
                     push(s, Severity::Pending, "no initial contact yet".into());
+                } else if self.settings.is_sust(&fyp.programme) && fyp.reply != ReplyStatus::Replied {
+                    let severity = if fyp.reply == ReplyStatus::NoReply {
+                        Severity::Overdue
+                    } else {
+                        Severity::Pending
+                    };
+                    push(s, severity, format!("initial contact: {}", fyp.reply.label().to_lowercase()));
                 }
                 for module in self.settings.modules_for(&fyp.programme) {
                     for cw in &module.courseworks {
@@ -2538,7 +3104,7 @@ impl Database {
                     }
                 }
                 if let Some(grant) = p.brazilian_grant()
-                    && let Some(end) = grant.end()
+                    && let Some(end) = p.grant_end()
                 {
                     let who = grant.agency_label();
                     if end < today && today - end <= Duration::days(GRANT_ENDED_DAYS) {
@@ -2720,6 +3286,203 @@ mod tests {
         let viva = find(&db, &format!("phd-viva-{}", db.students[0].id));
         assert_eq!(viva.meeting_id(), None);
         assert!(!db.change_meeting(&viva, MeetingChange::Held(true)));
+    }
+
+    #[test]
+    fn calendar_edits_moves_and_deletes() {
+        let at = |h| NaiveTime::from_hms_opt(h, 0, 0);
+        let one_off = Meeting {
+            date: Some(d(2026, 10, 5)),
+            time: at(14),
+            location: "MG.201".into(),
+            ..Default::default()
+        };
+        let weekly = Meeting {
+            date: Some(d(2026, 10, 6)),
+            time: at(10),
+            repeat: Some(Repeat {
+                until: Some(d(2026, 11, 3)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut placement = PlacementRecord::default();
+        placement.visits[1].date = Some(d(2026, 11, 2));
+        placement.visits[1].time = at(11);
+        let mut db = Database::default();
+        db.students.push(Student {
+            fyp: Some(FypRecord {
+                meetings: vec![one_off.clone(), weekly.clone()],
+                ..Default::default()
+            }),
+            placement: Some(placement),
+            phd: Some(PhdRecord {
+                viva: Some(d(2026, 10, 7)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let id = db.students[0].id;
+        let find = |db: &Database, uid: &str| db.events().into_iter().find(|e| e.uid == uid);
+
+        // Edit a one-off meeting: day, time and place.
+        let e = find(&db, &one_off.uid()).unwrap();
+        let mut details = db.event_details(&e).unwrap();
+        assert_eq!(details.title, None);
+        assert_eq!(details.place.as_ref().unwrap().location, "MG.201");
+        details.date = d(2026, 10, 8);
+        details.time = at(9);
+        details.place = Some(Place {
+            online: Some(true),
+            platform: Platform::GoogleMeet,
+            link: " meet.google.com/abc-defg-hij ".into(),
+            location: "MG.201".into(),
+        });
+        assert!(db.edit_event(&e, &details));
+        let e = find(&db, &one_off.uid()).unwrap();
+        assert_eq!((e.date, e.time, e.online, e.platform), (d(2026, 10, 8), at(9), true, Platform::GoogleMeet));
+        assert_eq!(e.link, "meet.google.com/abc-defg-hij");
+
+        // Drag a week of a repeating meeting: only that week moves, keeping its time.
+        let week = find(&db, &weekly.occurrence_uid(d(2026, 10, 13))).unwrap();
+        assert!(db.move_event(&week, d(2026, 10, 14)));
+        let week = find(&db, &weekly.occurrence_uid(d(2026, 10, 13))).unwrap();
+        assert!(week.moved());
+        assert_eq!((week.date, week.time), (d(2026, 10, 14), at(10)));
+        // Back on its day it's no longer a change.
+        assert!(db.move_event(&week, d(2026, 10, 13)));
+        let m = &db.students[0].fyp.as_ref().unwrap().meetings[1];
+        assert!(m.repeat.as_ref().unwrap().exceptions.is_empty());
+
+        // Delete one week (cancelled, then restored), then the whole series.
+        let week = find(&db, &weekly.occurrence_uid(d(2026, 10, 20))).unwrap();
+        assert!(db.delete_event(&week, false));
+        assert!(find(&db, &weekly.occurrence_uid(d(2026, 10, 20))).unwrap().cancelled);
+        assert!(db.change_meeting(&week, MeetingChange::Cancelled(false)));
+        assert!(!find(&db, &weekly.occurrence_uid(d(2026, 10, 20))).unwrap().cancelled);
+        assert!(db.delete_event(&week, true));
+        assert!(find(&db, &weekly.occurrence_uid(d(2026, 10, 27))).is_none());
+        assert_eq!(db.students[0].meetings().count(), 1);
+
+        // A visit and the viva move and lose their date; deadlines can't be touched.
+        let visit = find(&db, &visit_uid(id, 1)).unwrap();
+        assert!(db.move_event(&visit, d(2026, 11, 4)));
+        assert_eq!(find(&db, &visit_uid(id, 1)).unwrap().time, at(11));
+        let viva = find(&db, &format!("phd-viva-{id}")).unwrap();
+        let mut details = db.event_details(&viva).unwrap();
+        details.place.as_mut().unwrap().location = "Room 5".into();
+        assert!(db.edit_event(&viva, &details));
+        assert_eq!(db.students[0].phd.as_ref().unwrap().viva_location, "Room 5");
+        assert!(db.delete_event(&visit, false) && db.delete_event(&viva, false));
+        assert!(find(&db, &visit_uid(id, 1)).is_none() && find(&db, &format!("phd-viva-{id}")).is_none());
+        let deadline = Event {
+            uid: "cw-x".into(),
+            kind: EventKind::Deadline,
+            ..viva
+        };
+        assert!(!deadline.editable() && db.event_details(&deadline).is_none());
+        assert!(!db.delete_event(&deadline, true));
+    }
+
+    #[test]
+    fn importing_events() {
+        let mut db = Database::default();
+        db.settings.sem2_start = Some(d(2027, 1, 25));
+        db.students.push(Student {
+            name: "Ana Silva".into(),
+            email: "ana.silva@ulster.ac.uk".into(),
+            phd: Some(PhdRecord::default()),
+            advisee: Some(AdviseeRecord::default()),
+            ..Default::default()
+        });
+        db.students.push(Student {
+            name: "Bob Jones".into(),
+            fyp: Some(FypRecord::default()),
+            ..Default::default()
+        });
+        let (ana, bob) = (db.students[0].id, db.students[1].id);
+        let event = |uid: &str, title: &str, date, guests: &[&str]| ImportedEvent {
+            uid: uid.into(),
+            title: title.into(),
+            meeting: Meeting {
+                date: Some(date),
+                ..Default::default()
+            },
+            guests: guests.iter().map(|g| g.to_string()).collect(),
+            repeat_dropped: false,
+        };
+        // The student is found by a guest's address or by name in the title.
+        let chat = event("a", "Catch-up", d(2026, 11, 3), &["Ana.Silva@ulster.ac.uk"]);
+        assert_eq!(db.suggest_student(&chat), Some((ana, MeetingRole::Phd)));
+        let advising = event("b", "Advisee meeting – Ana Silva", d(2027, 2, 1), &[]);
+        assert_eq!(db.suggest_student(&advising), Some((ana, MeetingRole::Advisee)));
+        let project = event("c", "bob jones project", d(2026, 11, 4), &[]);
+        assert_eq!(db.suggest_student(&project), Some((bob, MeetingRole::Fyp)));
+        let dentist = event("d", "Dentist", d(2026, 11, 5), &[]);
+        assert_eq!(db.suggest_student(&dentist), None);
+        let skipped = event("e", "Seminar", d(2026, 11, 6), &[]);
+
+        let added = db.import(vec![
+            (chat, ImportTarget::Student(ana, MeetingRole::Phd)),
+            (advising, ImportTarget::Student(ana, MeetingRole::Advisee)),
+            (dentist, ImportTarget::Calendar),
+            (skipped, ImportTarget::Ignore),
+        ]);
+        assert_eq!(added, 3);
+        let s = &db.students[0];
+        assert_eq!(s.phd.as_ref().unwrap().meetings[0].source, "a");
+        assert_eq!(s.advisee.as_ref().unwrap().s2.meetings.len(), 1, "February is semester 2");
+        assert_eq!(db.entries[0].title, "Dentist");
+        let other = db.events().into_iter().find(|e| e.kind == EventKind::Other).unwrap();
+        assert_eq!((other.title.as_str(), other.student_id), ("Dentist", Uuid::nil()));
+        assert_eq!(db.cal_items(|e| e.kind == EventKind::Other, true).len(), 1);
+
+        // Seen again: imported, skipped, or exported by Supervisor itself.
+        assert_eq!(db.known_import("a"), Some(Known::Imported));
+        assert_eq!(db.known_import("d"), Some(Known::Imported));
+        assert_eq!(db.known_import("e"), Some(Known::Skipped));
+        assert_eq!(db.known_import("meeting-x@supervisor.local"), Some(Known::FromSupervisor));
+        assert!(Known::Imported.duplicate() && Known::FromSupervisor.duplicate() && !Known::Skipped.duplicate());
+        assert_eq!(db.known_import("new"), None);
+
+        // An imported event can be renamed, and deleted.
+        let mut details = db.event_details(&other).unwrap();
+        details.title = Some("Dentist (moved)".into());
+        assert!(db.edit_event(&other, &details));
+        assert_eq!(db.entries[0].title, "Dentist (moved)");
+        assert!(db.delete_event(&other, false));
+        assert!(db.entries.is_empty());
+    }
+
+    #[test]
+    fn grant_starts_with_the_project_and_its_end_can_be_typed_in() {
+        let mut p = PhdRecord {
+            external: true,
+            brazilian: true,
+            start: Some(d(2026, 3, 1)),
+            ..Default::default()
+        };
+        p.brazil.grant.agency = "CAPES".into();
+        p.brazil.grant.months = 24;
+        assert_eq!(p.grant_end(), Some(d(2028, 2, 29)), "from the project start");
+        p.brazil.grant.start = Some(d(2026, 4, 1));
+        assert_eq!(p.grant_end(), Some(d(2028, 3, 31)), "its own start wins");
+        p.brazil.grant.end_override = Some(d(2028, 6, 30));
+        assert_eq!(p.grant_end(), Some(d(2028, 6, 30)));
+        assert_eq!(p.brazil.grant.calculated_end(p.start), Some(d(2028, 3, 31)));
+        p.brazil.grant.agency.clear();
+        assert_eq!(p.grant_end(), None, "no grant, no end");
+    }
+
+    #[test]
+    fn weeks_start_on_monday_or_sunday() {
+        let mut settings = Settings::default();
+        // Wednesday 28 October 2026, and a Sunday.
+        assert_eq!(settings.week_start(d(2026, 10, 28)), d(2026, 10, 26));
+        assert_eq!(settings.week_start(d(2026, 11, 1)), d(2026, 10, 26));
+        settings.week_starts_sunday = true;
+        assert_eq!(settings.week_start(d(2026, 10, 28)), d(2026, 10, 25));
+        assert_eq!(settings.week_start(d(2026, 11, 1)), d(2026, 11, 1));
     }
 
     #[test]
@@ -2912,6 +3675,90 @@ mod tests {
         let items = db.attention(d(2026, 10, 21));
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].severity, Severity::Overdue);
+        assert_eq!(items[1].message, "Bob – no initial contact yet");
+        assert_eq!(items[1].detail, "no initial contact yet");
+    }
+
+    #[test]
+    fn agreed_mark_is_the_average_of_close_marks() {
+        let mut cw = CwStatus::default();
+        let set = |cw: &mut CwStatus, m1: &str, m2: &str| {
+            cw.mark_1 = m1.into();
+            cw.mark_2 = m2.into();
+            cw.suggest_agreed();
+            (cw.agreed_mark.clone(), cw.agreed_unconfirmed)
+        };
+        assert_eq!(set(&mut cw, "68", ""), (String::new(), false), "one mark only");
+        assert_eq!(set(&mut cw, "68", "63%"), ("65.5".into(), true));
+        // Within 10% of marker 1's mark: 63 to 77 for a 70.
+        assert_eq!(set(&mut cw, "70", "63"), ("66.5".into(), true), "10% is still close");
+        assert_eq!(set(&mut cw, "70", "77"), ("73.5".into(), true));
+        assert_eq!(cw.marks_apart(), None);
+        assert_eq!(set(&mut cw, "70", "56"), (String::new(), false), "20% away: the suggestion goes");
+        assert_eq!(cw.marks_apart(), Some(20.0));
+        assert_eq!(set(&mut cw, "50", "56"), (String::new(), false), "12% above a 50");
+        assert_eq!(set(&mut cw, "60", "56"), ("58".into(), true), "but under 7% below a 60");
+        // A confirmed or typed-in mark stays.
+        set(&mut cw, "70", "66");
+        cw.agreed_unconfirmed = false;
+        assert_eq!(set(&mut cw, "70", "50"), ("68".into(), false));
+        cw.agreed_mark = "61".into();
+        assert_eq!(set(&mut cw, "62", "64"), ("61".into(), false));
+        assert_eq!(fmt_mark(67.25), "67.3");
+        assert_eq!(parse_mark("A"), None);
+    }
+
+    #[test]
+    fn anonymous_titles_leave_out_the_student() {
+        let event = |student_id, title: &str| Event {
+            uid: String::new(),
+            student_id,
+            date: d(2026, 10, 1),
+            time: None,
+            kind: EventKind::Visit,
+            title: title.into(),
+            done: false,
+            online: false,
+            platform: Platform::Teams,
+            link: String::new(),
+            location: String::new(),
+            series: None,
+            cancelled: false,
+        };
+        let id = Uuid::new_v4();
+        assert_eq!(event(id, "BEng project meeting – Bob").anonymous_title(), "BEng project meeting");
+        assert_eq!(event(id, "Placement visit 1 (Online) – Bob @ Acme").anonymous_title(), "Placement visit 1 (Online)");
+        assert_eq!(event(id, "MEC526 Coursework 1 due – Bob").anonymous_title(), "MEC526 Coursework 1 due");
+        assert_eq!(event(Uuid::nil(), "Lunch with Ana").anonymous_title(), "Event");
+    }
+
+    #[test]
+    fn sust_students_reply_to_the_first_contact() {
+        let mut db = Database::default();
+        let mut fyp = FypRecord {
+            programme: "Sust".into(),
+            initial_contact: true,
+            initial_contact_on: Some(d(2026, 9, 25)),
+            ..Default::default()
+        };
+        let messages = |db: &Database| db.attention(d(2026, 10, 21)).into_iter().map(|a| a.detail).collect::<Vec<_>>();
+        db.students.push(Student {
+            name: "Li".into(),
+            fyp: Some(fyp.clone()),
+            ..Default::default()
+        });
+        assert_eq!(messages(&db), ["initial contact: awaiting reply"]);
+        fyp.reply = ReplyStatus::NoReply;
+        db.students[0].fyp = Some(fyp.clone());
+        assert_eq!(db.attention(d(2026, 10, 21))[0].severity, Severity::Overdue);
+        fyp.reply = ReplyStatus::Replied;
+        db.students[0].fyp = Some(fyp.clone());
+        assert!(messages(&db).is_empty());
+        // Others only need the contact made.
+        fyp.programme = "BEng".into();
+        fyp.reply = ReplyStatus::Awaiting;
+        db.students[0].fyp = Some(fyp);
+        assert!(messages(&db).is_empty());
     }
 
     /// The example from the university system: start 14 Sep 2026.
@@ -3121,13 +3968,13 @@ mod tests {
         // CAPES: 48 months for a doctorate, ending the day before.
         assert_eq!(p.brazil.grant.months, 48);
         assert_eq!(p.brazil.grant.start, Some(d(2026, 3, 1)));
-        assert_eq!(p.brazil.grant.end(), Some(d(2030, 2, 28)));
+        assert_eq!(p.brazil.grant.end_from(None), Some(d(2030, 2, 28)));
 
         // A parental-leave extension adds to the grant and to the course.
         let mut q = p.clone();
         q.brazil.grant.extension_months = 6;
         q.brazil.extension_months = 6;
-        assert_eq!(q.brazil.grant.end(), Some(d(2030, 8, 31)));
+        assert_eq!(q.brazil.grant.end_from(None), Some(d(2030, 8, 31)));
         let rule = BrRule::default_for(q.brazil.level);
         assert_eq!(q.br_rule_deadline(&rule), Some(d(2030, 9, 1)));
 

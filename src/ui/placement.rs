@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::model::{PlacementRecord, ReplyStatus, VisitMode, visit_uid};
 use crate::ui::{icons, theme, widgets};
 
-/// Returns the UID of a visit to save an invite for.
-pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<String> {
+/// Returns the visit to send, if asked.
+pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<widgets::Share> {
     let mut invite = None;
     widgets::form_grid(ui, "placement-grid", |ui| {
         ui.label("Company");
@@ -43,8 +43,8 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<St
                             theme::chip(ui, "completed", theme::GREEN);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if widgets::invite_button(ui, v.date.is_some()) {
-                                invite = Some(visit_uid(student_id, i));
+                            if let Some(share) = widgets::share_buttons(ui, v.date.is_some(), || visit_uid(student_id, i)) {
+                                invite = Some(share);
                             }
                         });
                     });

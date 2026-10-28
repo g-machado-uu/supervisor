@@ -6,7 +6,7 @@ use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
 
 use crate::model::{
-    Database, FypRecord, Meeting, PhdRecord, ReplyStatus, ResearchGroup, SemesterContact, Settings, Student,
+    Database, FypRecord, masked, Meeting, PhdRecord, ReplyStatus, ResearchGroup, SemesterContact, Settings, Student,
     Visit,
 };
 use crate::ui::{icons, theme, widgets};
@@ -58,6 +58,8 @@ pub struct ListState<'a> {
     pub search: &'a mut String,
     pub show_archived: &'a mut bool,
     pub selected: &'a mut Option<Uuid>,
+    /// Privacy mode: names and numbers are dots.
+    pub private: bool,
 }
 
 /// Returns true when "Add student" was clicked.
@@ -163,7 +165,7 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
 
     theme::card_frame(ui)
         .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 4 })
-        .show(ui, |ui| table(ui, db, cat, &rows, mixed, headers, st.selected, today));
+        .show(ui, |ui| table(ui, db, cat, &rows, mixed, headers, st.selected, st.private, today));
     add
 }
 
@@ -176,6 +178,7 @@ fn table(
     mixed: bool,
     headers: &[&str],
     selected: &mut Option<Uuid>,
+    private: bool,
     today: NaiveDate,
 ) {
     ui.spacing_mut().item_spacing.x = 6.0;
@@ -207,14 +210,20 @@ fn table(
                 let s = rows[row.index()];
                 row.set_selected(*selected == Some(s.id));
                 row.col(|ui| {
-                    theme::avatar(ui, &s.name, 30.0);
-                    let text = if s.name.is_empty() { "(no name)" } else { &s.name };
+                    theme::avatar(ui, if private { "" } else { &s.name }, 30.0);
+                    let text = if private {
+                        "•".repeat(10)
+                    } else if s.name.is_empty() {
+                        "(no name)".into()
+                    } else {
+                        s.name.clone()
+                    };
                     let mut rt = theme::semibold(text);
                     if s.archived {
                         rt = rt.color(theme::muted(ui));
                     }
                     let name = ui.label(rt);
-                    if let Some(title) = project_title(cat, s) {
+                    if let Some(title) = project_title(cat, s).filter(|_| !private) {
                         name.on_hover_text(title);
                     }
                     if s.archived {
@@ -223,7 +232,8 @@ fn table(
                     }
                 });
                 row.col(|ui| {
-                    ui.label(RichText::new(s.shown_number(&db.settings)).color(theme::muted(ui)));
+                    let number = if private { masked(&s.b_number) } else { s.shown_number(&db.settings) };
+                    ui.label(RichText::new(number).color(theme::muted(ui)));
                 });
                 match cat {
                     Category::Projects(_) => {
@@ -239,7 +249,15 @@ fn table(
                             }
                         });
                         row.col(|ui| {
-                            if f.initial_contact {
+                            let sust = db.settings.is_sust(&f.programme);
+                            if f.initial_contact && sust {
+                                let (text, color) = match f.reply {
+                                    ReplyStatus::Replied => (format!("{} replied", icons::CHECK), theme::GREEN),
+                                    ReplyStatus::Awaiting => ("awaiting reply".into(), theme::AMBER),
+                                    ReplyStatus::NoReply => ("no reply".into(), theme::RED),
+                                };
+                                theme::chip(ui, text, color);
+                            } else if f.initial_contact {
                                 theme::chip(ui, format!("{} contacted", icons::CHECK), theme::GREEN);
                             } else {
                                 theme::chip(ui, format!("{} not yet", icons::HOURGLASS), theme::AMBER);
@@ -285,7 +303,7 @@ fn table(
                     }
                     Category::All => {
                         row.col(|ui| {
-                            ui.label(&s.email);
+                            ui.label(if private { "" } else { &s.email });
                         });
                         row.col(|ui| {
                             ui.label(&s.course);
