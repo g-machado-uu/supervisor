@@ -778,7 +778,10 @@ impl Session {
                         });
                     });
                     ui.add_space(4.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Only as tall as the row: in this bottom-up layout it would
+                    // otherwise take the free space above and centre in it.
+                    let row = egui::vec2(ui.available_width(), 36.0);
+                    ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let keys = egui::Button::new(RichText::new(icons::KEYBOARD).size(17.0))
                             .frame_when_inactive(false)
                             .corner_radius(egui::CornerRadius::same(10))
