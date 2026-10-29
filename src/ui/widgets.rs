@@ -378,6 +378,9 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
         header.push_str(&format!(", {cancelled} cancelled"));
     }
     header.push(')');
+    // The week whose notes are open in the notes dialog.
+    let notes_open = ui.scope_id().with("notes-open");
+    let mut open = ui.data(|d| d.get_temp::<NaiveDate>(notes_open));
     let mut changed = Vec::new();
     egui::CollapsingHeader::new(header)
         .id_salt("weeks")
@@ -391,7 +394,7 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
                         ui.label(RichText::new(h).small().color(theme::muted(ui)));
                     }
                     ui.end_row();
-                    for occ in weeks {
+                    for occ in &weeks {
                         let mut edited = occ.clone();
                         let mut planned = RichText::new(week_label(settings, occ.planned));
                         if occ.cancelled {
@@ -418,20 +421,129 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
                             });
                         });
                         ui.push_id((occ.planned, "notes"), |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut edited.notes)
-                                    .hint_text("Notes")
-                                    .desired_width(120.0),
-                            );
+                            if notes_button(ui, &occ.notes).clicked() {
+                                open = Some(occ.planned);
+                            }
                         });
                         ui.end_row();
-                        if edited != occ {
+                        if edited != *occ {
                             changed.push(edited);
                         }
                     }
                 });
         });
+    if let Some(planned) = open
+        && let Some(i) = weeks.iter().position(|o| o.planned == planned)
+    {
+        let mut edited = weeks[i].clone();
+        match week_notes_dialog(ui, settings, &weeks, i, &mut edited.notes) {
+            NotesNav::Stay => {}
+            NotesNav::Go(j) => open = Some(weeks[j].planned),
+            NotesNav::Close => open = None,
+        }
+        if edited != weeks[i] {
+            changed.push(edited);
+        }
+    } else {
+        open = None;
+    }
+    ui.data_mut(|d| match open {
+        Some(date) => {
+            d.insert_temp(notes_open, date);
+        }
+        None => d.remove::<NaiveDate>(notes_open),
+    });
     for occ in changed {
         m.set_occurrence(occ);
     }
+}
+
+/// A week's notes in the weeks list: the start of them, or "Add notes".
+/// Opens them in the notes dialog.
+fn notes_button(ui: &mut Ui, notes: &str) -> egui::Response {
+    let first = notes.lines().map(str::trim).find(|l| !l.is_empty());
+    let text = match first {
+        Some(line) if notes.trim().lines().count() > 1 => RichText::new(format!("{} {line}…", icons::NOTE)),
+        Some(line) => RichText::new(format!("{} {line}", icons::NOTE)),
+        None => RichText::new(format!("{} Add notes", icons::NOTE_PENCIL)).color(theme::muted(ui)),
+    };
+    // A fixed width, cut short with "…", so the column doesn't grow while typing.
+    let size = egui::vec2(140.0, ui.spacing().interact_size.y);
+    let resp = ui.add_sized(size, egui::Button::new(text).small().truncate().min_size(size));
+    match first {
+        Some(_) => resp.on_hover_text(notes.trim()),
+        None => resp.on_hover_text("Write notes for this week"),
+    }
+}
+
+enum NotesNav {
+    Stay,
+    Go(usize),
+    Close,
+}
+
+/// The notes of week `i` of a repeating meeting, in a dialog over the app
+/// (not a window of its own), with buttons to the weeks before and after.
+fn week_notes_dialog(ui: &mut Ui, settings: &Settings, weeks: &[crate::model::Occurrence], i: usize, notes: &mut String) -> NotesNav {
+    let occ = &weeks[i];
+    let mut nav = NotesNav::Stay;
+    let resp = egui::Modal::new(egui::Id::unique("week-notes")).frame(theme::modal_frame(ui)).show(ui.ctx(), |ui| {
+        ui.set_width(560.0);
+        ui.horizontal(|ui| {
+            theme::icon_badge(ui, icons::NOTE_PENCIL, theme::ACCENT, 40.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(theme::serif("Meeting notes", 22.0));
+                let mut when = week_label(settings, occ.planned);
+                if occ.moved_to.is_some_and(|d| d != occ.planned) {
+                    when.push_str(&format!(" · moved to {}", occ.date().format("%a %d %b")));
+                }
+                if occ.cancelled {
+                    when.push_str(" · cancelled");
+                } else if occ.held {
+                    when.push_str(" · held");
+                }
+                ui.label(RichText::new(when).color(theme::muted(ui)));
+            });
+        });
+        ui.add_space(10.0);
+        // A new id per week, so the cursor and undo history don't carry over.
+        let edit = ui.add(
+            egui::TextEdit::multiline(notes)
+                .id_salt(("week-notes", occ.planned))
+                .hint_text("What was discussed, actions agreed…")
+                .desired_rows(14)
+                .desired_width(f32::INFINITY),
+        );
+        // Ready to type on opening, and on moving to another week.
+        let focused_week = egui::Id::unique("week-notes-focused");
+        if ui.data(|d| d.get_temp::<NaiveDate>(focused_week)) != Some(occ.planned) {
+            ui.data_mut(|d| d.insert_temp(focused_week, occ.planned));
+            edit.request_focus();
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(i > 0, egui::Button::new(format!("{} Previous week", icons::CARET_LEFT)))
+                .clicked()
+            {
+                nav = NotesNav::Go(i - 1);
+            }
+            if ui
+                .add_enabled(i + 1 < weeks.len(), egui::Button::new(format!("Next week {}", icons::CARET_RIGHT)))
+                .clicked()
+            {
+                nav = NotesNav::Go(i + 1);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(theme::primary_button("Done")).clicked() {
+                    nav = NotesNav::Close;
+                }
+            });
+        });
+    });
+    if resp.should_close() {
+        nav = NotesNav::Close;
+    }
+    nav
 }

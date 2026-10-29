@@ -11,14 +11,14 @@ This project is built with the help of Claude Opus 5.5.
 - **Second markers** for project and placement students, with name and email. For SUST students this is the SUST supervisor, and there is a place for the student's SUST email.
 - **Marks** for each project coursework: Marker 1, Marker 2 and the agreed mark, or for SUST students whether the SUST supervisor has sent theirs, their mark, yours and the agreed one. They show as dots until you click **Reveal marks**. When Marker 2's mark is within 10% of Marker 1's (the supervisor's), their average fills in the agreed mark for you to confirm; further away, a warning shows instead.
 - **Privacy**: **Hide names** on the dashboard hides students' names and B numbers on the dashboard, in the lists, the calendar and their details, for when someone else can see your screen. The eye on a student's Details hides or shows that student's name, number and email.
-- **Meetings**, one-off or repeating, online (Teams, Google Meet or Zoom, with the meeting link) or in a room. Mark each week as held, cancelled or moved.
+- **Meetings**, one-off or repeating, online (Teams, Google Meet or Zoom, with the meeting link) or in a room. Mark each week as held, cancelled or moved, and open each week's notes in a larger box to write or read them.
 - **Coursework deadlines** are worked out from the teaching weeks you set in Settings.
 - **Research students**, in four lists: PhD, PhD External, MSc and MSc External. Assessments, annual reports, submission and viva: type in the deadlines from the university system and the app reminds you in time.
 - **External students** (registered at another university) start with a blank list of assessments. Add their own deadlines and choose how long before each one to be reminded. You can do the same for any student, alongside the standard assessments.
 - **External students in Brazil**: tick *On a Brazilian programme* to get the levels (academic or professional master's and doctorate), the grant from CNPq, CAPES, FINEP, ANP, the 27 state foundations (FAPs) or other sources, with its length, extension and end date, the standard stages (course credits, language proficiency, qualifying exam, annual reports, sending the work to the committee, defence, final version) and the defence with its committee and result. *Fill in suggested deadlines* works them out from the enrolment date, using the months per level in Settings › Brazilian programmes.
 - **Registration numbers** of external students are shown as *Registration #* and, since they may be a national ID (a Brazilian CPF or a National Insurance number), hidden as dots until you click **Reveal** in the student's details. Settings › Privacy can ask for your password first, or turn hiding off. They are never put in calendar or invite files.
 - **Placement visits**: requests, replies and whether the line manager is coming.
-- **Calendar** as a list or a month grid, with weeks starting on Monday or Sunday. Right-click an item to edit, delete or postpone it. In the month grid, drag it to another day. Select items and press Delete to remove them. Export any items to an `.ics` file for Outlook or Google Calendar, or save an invite file for one meeting to send to the student. **Google Calendar** opens a meeting in Google Calendar with the student as a guest, and Google adds a Meet link if needed. **Import…** brings in events from another calendar's `.ics`, each linked to a student or kept on its own; events already in Supervisor are left unticked.
+- **Calendar** as a list or a month grid, with weeks starting on Monday or Sunday. Right-click an item to edit, delete or postpone it. In the month grid, drag it to another day. Select items and press Delete to remove them, or Esc to clear the selection. Export any items to an `.ics` file for Outlook or Google Calendar, or save an invite file for one meeting to send to the student. **Google Calendar** opens a meeting in Google Calendar with the student as a guest, and Google adds a Meet link if needed. **Import…** brings in events from another calendar's `.ics`, each linked to a student or kept on its own; events already in Supervisor are left unticked.
 
 ![Student details](docs/screenshots/student.png)
 
@@ -68,6 +68,8 @@ Instead of using **Import key file…**, you can copy your backup into that fold
 1. Set a password on first launch.
 2. In **Settings**, enter the academic year and the date week 1 starts in each semester.
 3. Add students with **Add student** (`Ctrl+N`) and fill in the rest from their details panel.
+
+The keyboard button next to **Settings** (or `F1`) lists the keyboard shortcuts.
 
 ## Install
 

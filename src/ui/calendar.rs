@@ -235,6 +235,15 @@ pub fn show(
         }
     }
 
+    // Escape clears the selection.
+    if !st.dialog_open()
+        && !st.selected.is_empty()
+        && !ui.ctx().egui_wants_keyboard_input()
+        && ui.input(|i| i.key_pressed(egui::Key::Escape))
+    {
+        st.selected.clear();
+    }
+
     let n = st.selected.len();
     let subtitle = match n {
         0 => "Tick items to export them · right-click an item to edit or delete it".to_string(),

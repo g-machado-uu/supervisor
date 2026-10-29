@@ -271,6 +271,8 @@ struct Session {
     key_setup: Option<KeyFileSetup>,
     calendar: CalendarState,
     toast: Option<(String, f64)>,
+    /// The list of keyboard shortcuts is open.
+    shortcuts: bool,
     applied_dark: Option<bool>,
     /// Fingerprint of `db` when last checked, to spot edits.
     db_print: [u8; 32],
@@ -319,6 +321,7 @@ impl Session {
             key_setup: None,
             calendar: CalendarState::default(),
             toast: None,
+            shortcuts: false,
             applied_dark: None,
             last_active: Instant::now(),
             leaving: None,
@@ -502,6 +505,9 @@ impl Session {
         if ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S))) {
             save_now = true;
         }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            self.shortcuts = !self.shortcuts;
+        }
 
         // A revealed registration number, marks, or details in privacy mode
         // are hidden again once another student is opened.
@@ -521,6 +527,7 @@ impl Session {
             )
             .show(ui, |ui| self.central(ui));
         self.toast(ui);
+        self.shortcuts(ui);
         self.dialogs(ui);
 
         // Every edit needs a click, key press or drag; frames from just moving
@@ -587,6 +594,70 @@ impl Session {
                         });
                     });
             });
+    }
+
+    /// The list of keyboard shortcuts, from the keyboard button next to
+    /// Settings or F1.
+    fn shortcuts(&mut self, ui: &mut Ui) {
+        if !self.shortcuts {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let key = |modifiers, key| ctx.format_shortcut(&egui::KeyboardShortcut::new(modifiers, key));
+        let groups = [
+            (
+                "Anywhere",
+                vec![
+                    (key(egui::Modifiers::COMMAND, egui::Key::S), "Save now"),
+                    (key(egui::Modifiers::COMMAND, egui::Key::L), "Lock"),
+                    ("Esc".to_string(), "Close a dialog"),
+                    ("F1".to_string(), "Show this list"),
+                ],
+            ),
+            (
+                "Student lists",
+                vec![(key(egui::Modifiers::COMMAND, egui::Key::N), "Add a student")],
+            ),
+            (
+                "Calendar",
+                vec![
+                    ("Click".to_string(), "Select an item"),
+                    ("Double-click".to_string(), "Open the student"),
+                    ("Drag".to_string(), "Move an item to another day (month view)"),
+                    ("Right-click".to_string(), "Edit, postpone or delete an item"),
+                    ("Delete".to_string(), "Delete the selected items"),
+                    ("Esc".to_string(), "Clear the selection"),
+                ],
+            ),
+        ];
+        let mut close = false;
+        let resp = egui::Modal::new(Id::unique("shortcuts")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
+            ui.set_width(440.0);
+            ui.horizontal(|ui| {
+                theme::icon_badge(ui, icons::KEYBOARD, theme::ACCENT, 40.0);
+                ui.label(theme::serif("Keyboard shortcuts", 22.0));
+            });
+            for (title, rows) in groups {
+                ui.add_space(10.0);
+                ui.label(RichText::new(title.to_uppercase()).small().strong().color(theme::muted(ui)));
+                egui::Grid::new(title).num_columns(2).spacing([16.0, 6.0]).min_col_width(110.0).show(ui, |ui| {
+                    for (keys, what) in rows {
+                        ui.label(RichText::new(keys).monospace());
+                        ui.label(what);
+                        ui.end_row();
+                    }
+                });
+            }
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(theme::primary_button("Close")).clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || resp.should_close() {
+            self.shortcuts = false;
+        }
     }
 
     fn sidebar(&mut self, ui: &mut Ui, lock: &mut bool, save_now: &mut bool) {
@@ -707,7 +778,16 @@ impl Session {
                         });
                     });
                     ui.add_space(4.0);
-                    nav(ui, View::Settings, icons::GEAR_SIX, "Settings", None);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let keys = egui::Button::new(RichText::new(icons::KEYBOARD).size(17.0))
+                            .frame_when_inactive(false)
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .min_size(egui::vec2(36.0, 36.0));
+                        if ui.add(keys).on_hover_text("Keyboard shortcuts (F1)").clicked() {
+                            self.shortcuts = true;
+                        }
+                        nav(ui, View::Settings, icons::GEAR_SIX, "Settings", None);
+                    });
                 });
             });
     }
@@ -2313,11 +2393,20 @@ mod ui_tests {
 
         // Select a week of Bob's meeting and press Delete: just that week is cancelled.
         let week = day(11);
-        h.get_all_by_label_contains("Bob Jones")
-            .find(|n| n.rect().center().x > h.get_by_label("11").rect().left() - 5.0 && n.rect().center().y > h.get_by_label("11").rect().top())
-            .unwrap()
-            .click();
+        let select_bob = |h: &mut Harness<'_, SupervisorApp>| {
+            h.get_all_by_label_contains("Bob Jones")
+                .find(|n| n.rect().center().x > h.get_by_label("11").rect().left() - 5.0 && n.rect().center().y > h.get_by_label("11").rect().top())
+                .unwrap()
+                .click();
+            h.run_steps(2);
+        };
+        // Escape clears the selection.
+        select_bob(&mut h);
+        assert_eq!(session(&mut h).calendar.selected.len(), 1);
+        h.key_press(egui::Key::Escape);
         h.run_steps(2);
+        assert!(session(&mut h).calendar.selected.is_empty());
+        select_bob(&mut h);
         h.key_press(egui::Key::Delete);
         h.run_steps(2);
         assert!(h.query_by_label("Delete this item?").is_some());
@@ -2617,6 +2706,16 @@ mod ui_tests {
         assert_eq!(p.annual_reports.len(), 3);
         assert!(h.query_by_label("Thesis defence").is_some());
         shot(&mut h, "16_brazilian_external_detail");
+        // A longer item name (another level) widens the column rather than
+        // wrapping into the next row: the grid only grows to what its cells
+        // measure, and wrapped text never measures wider.
+        session(&mut h).db.student_mut(ana).unwrap().phd.as_mut().unwrap().brazil.level = BrLevel::ProfessionalMasters;
+        h.run_steps(5);
+        let reminder = h.get_by_label(&format!("{} reminder 01 Jan 2030", icons::BELL)).rect();
+        let next = h.get_by_label("Final project defence").rect();
+        assert!(reminder.bottom() <= next.top(), "{reminder:?} runs into {next:?}");
+        shot(&mut h, "16b_brazilian_narrow");
+        session(&mut h).db.student_mut(ana).unwrap().phd.as_mut().unwrap().brazil.level = BrLevel::AcademicDoctorate;
 
         // A CAPES grant gets the usual 48 months; a Zoom meeting.
         {
@@ -2735,5 +2834,86 @@ mod ui_tests {
         h.run_steps(2);
         assert!(all_text(&h).contains(CPF) && all_text(&h).contains("QQ123456C"));
         assert!(h.query_by_label_contains("National Insurance").is_none(), "João isn't open");
+    }
+
+    #[test]
+    fn week_notes_open_in_a_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let first = chrono::NaiveDate::from_ymd_opt(2026, 10, 29).unwrap();
+        let id = {
+            let s = session(&mut h);
+            let student = Student {
+                name: "Weekly Student".into(),
+                fyp: Some(FypRecord {
+                    programme: "BEng".into(),
+                    meetings: vec![Meeting {
+                        date: Some(first),
+                        repeat: Some(Repeat {
+                            until: Some(first + Days::weeks(2)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let id = student.id;
+            s.db.students.push(student);
+            s.view = View::List(Category::Projects("BEng".into()));
+            s.selected = Some(id);
+            id
+        };
+        h.set_size(egui::vec2(1360.0, 2000.0));
+        h.run_steps(3);
+        h.get_by_label("Weeks (3)").click();
+        h.run_steps(3);
+        let add = format!("{} Add notes", icons::NOTE_PENCIL);
+        assert_eq!(h.query_all_by_label(&add).count(), 3);
+        h.get_all_by_label(&add).next().unwrap().click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Meeting notes").is_some());
+        // Ready to type straight away.
+        h.event(egui::Event::Text("Talked about the literature review".into()));
+        h.run_steps(2);
+        shot(&mut h, "26_week_notes");
+        h.get_by_label(&format!("Next week {}", icons::CARET_RIGHT)).click();
+        h.run_steps(3);
+        h.event(egui::Event::Text("Second week".into()));
+        h.run_steps(2);
+        h.get_by_label("Done").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Meeting notes").is_none(), "closed");
+        let notes: Vec<String> = {
+            let s = session(&mut h);
+            let m = &s.db.student(id).unwrap().fyp.as_ref().unwrap().meetings[0];
+            m.occurrences(&s.db.settings).into_iter().map(|o| o.notes).collect()
+        };
+        assert_eq!(notes, ["Talked about the literature review", "Second week", ""]);
+        // The start of the notes shows in the list.
+        let note = h.get_by_label(&format!("{} Talked about the literature review", icons::NOTE)).rect();
+        let empty = h.get_by_label(&add).rect();
+        assert_eq!(note.width(), empty.width(), "as wide as Add notes, however long the notes");
+        shot(&mut h, "26b_week_notes_list");
+    }
+
+    #[test]
+    fn shortcuts_button_lists_the_shortcuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        h.get_by_label(icons::KEYBOARD).click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Keyboard shortcuts").is_some());
+        assert!(h.query_by_label("Save now").is_some());
+        shot(&mut h, "27_shortcuts");
+        h.get_by_label("Close").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Save now").is_none());
+        h.key_press(egui::Key::F1);
+        h.run_steps(3);
+        assert!(h.query_by_label("Save now").is_some(), "F1 opens it too");
     }
 }

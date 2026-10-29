@@ -380,12 +380,16 @@ fn state_color(ui: &Ui, m: &Milestone, lead: Lead, today: NaiveDate) -> egui::Co
     }
 }
 
+/// Kept on one line: wrapped inside a grid row, it ran into the next row.
 fn reminder_note(ui: &mut Ui, m: &Milestone, lead: Lead) {
     if let Some(r) = m.reminder(lead).filter(|_| !m.done) {
-        ui.label(
-            RichText::new(format!("{} reminder {}", icons::BELL, r.format("%d %b %Y")))
-                .small()
-                .color(theme::muted(ui)),
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("{} reminder {}", icons::BELL, r.format("%d %b %Y")))
+                    .small()
+                    .color(theme::muted(ui)),
+            )
+            .wrap_mode(egui::TextWrapMode::Extend),
         );
     }
 }
@@ -395,7 +399,7 @@ fn step_label(ui: &mut Ui, step: &PhdStep, today: NaiveDate) {
     let color = state_color(ui, &step.milestone, step.lead, today);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        ui.label(RichText::new(&step.label).color(color));
+        ui.add(egui::Label::new(RichText::new(&step.label).color(color)).wrap_mode(egui::TextWrapMode::Extend));
         reminder_note(ui, &step.milestone, step.lead);
     });
 }
