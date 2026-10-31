@@ -2919,4 +2919,105 @@ mod ui_tests {
         h.run_steps(3);
         assert!(h.query_by_label("Save now").is_some(), "F1 opens it too");
     }
+
+    /// A repeating meeting's student, open on the calendar with its item selected.
+    fn calendar_with_selection(path: &std::path::Path) -> Harness<'static, SupervisorApp> {
+        let mut h = create_and_unlock(path, false);
+        let first = chrono::NaiveDate::from_ymd_opt(2026, 10, 29).unwrap();
+        {
+            let s = session(&mut h);
+            let student = Student {
+                name: "Weekly Student".into(),
+                fyp: Some(FypRecord {
+                    programme: "BEng".into(),
+                    meetings: vec![Meeting {
+                        date: Some(first),
+                        repeat: Some(Repeat {
+                            until: Some(first + Days::weeks(2)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            s.selected = Some(student.id);
+            s.db.students.push(student);
+            s.view = View::Calendar;
+        }
+        h.set_size(egui::vec2(1360.0, 2000.0));
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        let s = session(&mut h);
+        let uid = s.derived().events.iter().find(|e| e.editable() && !e.cancelled).unwrap().uid.clone();
+        s.calendar.selected.insert(uid);
+        h.run_steps(3);
+        assert_eq!(session(&mut h).calendar.selected.len(), 1);
+        h
+    }
+
+    #[test]
+    fn calendar_ignores_keys_behind_the_shortcuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = calendar_with_selection(&dir.path().join("data.svt"));
+        h.key_press(egui::Key::F1);
+        h.run_steps(3);
+        h.key_press(egui::Key::Delete);
+        h.run_steps(3);
+        assert!(h.query_by_label("Delete this item?").is_none(), "Delete stays behind the list");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        assert!(h.query_by_label("Save now").is_none(), "Esc closes the list");
+        assert_eq!(session(&mut h).calendar.selected.len(), 1, "and leaves the selection");
+        // With the list closed, the keys reach the calendar again.
+        h.key_press(egui::Key::Delete);
+        h.run_steps(3);
+        assert!(h.query_by_label("Delete this item?").is_some());
+    }
+
+    #[test]
+    fn calendar_ignores_keys_behind_the_week_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = calendar_with_selection(&dir.path().join("data.svt"));
+        h.get_by_label("Weeks (3)").click();
+        h.run_steps(3);
+        h.get_all_by_label(&format!("{} Add notes", icons::NOTE_PENCIL)).next().unwrap().click();
+        h.run_steps(3);
+        // Out of the text box, keys are no longer taken by it.
+        h.get_by_label("Meeting notes").click();
+        h.run_steps(3);
+        h.key_press(egui::Key::Delete);
+        h.run_steps(3);
+        assert!(h.query_by_label("Delete this item?").is_none(), "Delete stays behind the notes");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        assert!(h.query_by_label("Meeting notes").is_none(), "Esc closes the notes");
+        assert_eq!(session(&mut h).calendar.selected.len(), 1, "and leaves the selection");
+    }
+
+    #[test]
+    fn week_notes_take_the_cursor_when_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = calendar_with_selection(&dir.path().join("data.svt"));
+        h.get_by_label("Weeks (3)").click();
+        h.run_steps(3);
+        let add = format!("{} Add notes", icons::NOTE_PENCIL);
+        for _ in 0..2 {
+            h.get_all_by_label(&add).next().unwrap().click();
+            h.run_steps(3);
+            assert!(h.ctx.egui_wants_keyboard_input(), "the cursor is in the notes");
+            h.get_by_label("Done").click();
+            h.run_steps(3);
+            assert!(h.query_by_label("Meeting notes").is_none());
+        }
+        // Typing goes in the box on a second opening.
+        h.get_all_by_label(&add).next().unwrap().click();
+        h.run_steps(3);
+        h.event(egui::Event::Text("Typed after reopening".into()));
+        h.run_steps(2);
+        h.get_by_label("Done").click();
+        h.run_steps(3);
+        assert!(h.query_by_label(&format!("{} Typed after reopening", icons::NOTE)).is_some());
+    }
 }

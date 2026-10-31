@@ -380,6 +380,8 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
     header.push(')');
     // The week whose notes are open in the notes dialog.
     let notes_open = ui.scope_id().with("notes-open");
+    // The week that has had the cursor put in its notes since they opened.
+    let notes_focused = notes_open.with("focused");
     let mut open = ui.data(|d| d.get_temp::<NaiveDate>(notes_open));
     let mut changed = Vec::new();
     egui::CollapsingHeader::new(header)
@@ -436,7 +438,7 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
         && let Some(i) = weeks.iter().position(|o| o.planned == planned)
     {
         let mut edited = weeks[i].clone();
-        match week_notes_dialog(ui, settings, &weeks, i, &mut edited.notes) {
+        match week_notes_dialog(ui, settings, &weeks, i, &mut edited.notes, notes_focused) {
             NotesNav::Stay => {}
             NotesNav::Go(j) => open = Some(weeks[j].planned),
             NotesNav::Close => open = None,
@@ -451,7 +453,10 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
         Some(date) => {
             d.insert_temp(notes_open, date);
         }
-        None => d.remove::<NaiveDate>(notes_open),
+        None => {
+            d.remove::<NaiveDate>(notes_open);
+            d.remove::<NaiveDate>(notes_focused);
+        }
     });
     for occ in changed {
         m.set_occurrence(occ);
@@ -484,7 +489,14 @@ enum NotesNav {
 
 /// The notes of week `i` of a repeating meeting, in a dialog over the app
 /// (not a window of its own), with buttons to the weeks before and after.
-fn week_notes_dialog(ui: &mut Ui, settings: &Settings, weeks: &[crate::model::Occurrence], i: usize, notes: &mut String) -> NotesNav {
+fn week_notes_dialog(
+    ui: &mut Ui,
+    settings: &Settings,
+    weeks: &[crate::model::Occurrence],
+    i: usize,
+    notes: &mut String,
+    focused_week: egui::Id,
+) -> NotesNav {
     let occ = &weeks[i];
     let mut nav = NotesNav::Stay;
     let resp = egui::Modal::new(egui::Id::unique("week-notes")).frame(theme::modal_frame(ui)).show(ui.ctx(), |ui| {
@@ -516,7 +528,6 @@ fn week_notes_dialog(ui: &mut Ui, settings: &Settings, weeks: &[crate::model::Oc
                 .desired_width(f32::INFINITY),
         );
         // Ready to type on opening, and on moving to another week.
-        let focused_week = egui::Id::unique("week-notes-focused");
         if ui.data(|d| d.get_temp::<NaiveDate>(focused_week)) != Some(occ.planned) {
             ui.data_mut(|d| d.insert_temp(focused_week, occ.planned));
             edit.request_focus();

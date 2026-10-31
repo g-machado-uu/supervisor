@@ -219,12 +219,14 @@ pub fn show(
     st.selected.retain(|uid| exists.contains(uid.as_str()));
     let events: Vec<&Event> = all.iter().filter(|e| shown(db, st, e, today)).collect();
 
+    // Delete and Escape are for the calendar only when nothing is over it or
+    // typing: not this page's dialogs, nor any other open in the app.
+    let keys_free = !st.dialog_open()
+        && ui.ctx().memory(|m| m.top_modal_layer()).is_none()
+        && !ui.ctx().egui_wants_keyboard_input();
+
     // Delete removes the selected items, once confirmed.
-    if !st.dialog_open()
-        && !st.selected.is_empty()
-        && !ui.ctx().egui_wants_keyboard_input()
-        && ui.input(|i| i.key_pressed(egui::Key::Delete))
-    {
+    if keys_free && !st.selected.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
         let chosen: Vec<Event> = all
             .iter()
             .filter(|e| st.selected.contains(&e.uid) && e.editable() && !e.cancelled)
@@ -236,11 +238,7 @@ pub fn show(
     }
 
     // Escape clears the selection.
-    if !st.dialog_open()
-        && !st.selected.is_empty()
-        && !ui.ctx().egui_wants_keyboard_input()
-        && ui.input(|i| i.key_pressed(egui::Key::Escape))
-    {
+    if keys_free && !st.selected.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         st.selected.clear();
     }
 
