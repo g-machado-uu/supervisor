@@ -46,6 +46,8 @@ pub enum FormAction {
     Reveal,
     /// Hide it again.
     Hide,
+    /// Open the student's timetable.
+    Timetable,
 }
 
 /// What of a student's private details is on screen; the eye buttons
@@ -104,6 +106,15 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
                 .clicked()
             {
                 action = FormAction::Close;
+            }
+            let filled = !s.timetable.is_empty();
+            let color = if filled { theme::fg(ui, theme::ACCENT) } else { theme::muted(ui) };
+            let timetable = ui.add(egui::Button::new(RichText::new(icons::CALENDAR_DOTS).size(17.0).color(color)).frame(false));
+            // Named by what it does, for screen readers and tests.
+            timetable.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Timetable"));
+            let hover = if filled { "Timetable: when this student is busy" } else { "Add the times this student is busy" };
+            if timetable.on_hover_text(hover).clicked() {
+                action = FormAction::Timetable;
             }
         });
     });
@@ -251,30 +262,31 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
         // At most one invite button is clicked per frame.
         let mut invite = None;
         let id = s.id;
+        let timetable = &s.timetable;
         if let Some(f) = &mut s.fyp {
             role_section(ui, Role::Fyp, jump, &mut action, |ui| {
-                if let Some(share) = fyp::show(ui, f, settings, shown) {
+                if let Some(share) = fyp::show(ui, f, settings, timetable, shown) {
                     invite = Some(share);
                 }
             });
         }
         if let Some(p) = &mut s.phd {
             role_section(ui, Role::Phd, jump, &mut action, |ui| {
-                if let Some(share) = phd::show(ui, p, settings, id) {
+                if let Some(share) = phd::show(ui, p, settings, timetable, id) {
                     invite = Some(share);
                 }
             });
         }
         if let Some(p) = &mut s.placement {
             role_section(ui, Role::Placement, jump, &mut action, |ui| {
-                if let Some(share) = placement::show(ui, p, id) {
+                if let Some(share) = placement::show(ui, p, settings, timetable, id) {
                     invite = Some(share);
                 }
             });
         }
         if let Some(a) = &mut s.advisee {
             role_section(ui, Role::Advisee, jump, &mut action, |ui| {
-                if let Some(share) = advisee::show(ui, a, settings) {
+                if let Some(share) = advisee::show(ui, a, settings, timetable) {
                     invite = Some(share);
                 }
             });

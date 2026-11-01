@@ -223,7 +223,7 @@ pub fn serif(text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text).family(FontFamily::Name(SERIF.into())).size(size)
 }
 
-fn semibold_font(size: f32) -> FontId {
+pub fn semibold_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(SEMIBOLD.into()))
 }
 
@@ -631,6 +631,7 @@ mod tests {
             include_str!("student_form.rs"),
             include_str!("student_list.rs"),
             include_str!("theme.rs"),
+            include_str!("timetable.rs"),
             include_str!("widgets.rs"),
         ];
         let ctx = egui::Context::default();

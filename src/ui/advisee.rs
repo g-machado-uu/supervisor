@@ -2,14 +2,14 @@
 
 use egui::Ui;
 
-use crate::model::{AdviseeRecord, ReplyStatus, SemesterContact, Settings};
+use crate::model::{AdviseeRecord, ReplyStatus, SemesterContact, Settings, Timetable};
 use crate::ui::{theme, widgets};
 
 /// Returns the meeting to send, if asked.
-pub fn show(ui: &mut Ui, a: &mut AdviseeRecord, settings: &Settings) -> Option<widgets::Share> {
-    let s1 = semester(ui, "Semester 1", &mut a.s1, settings);
+pub fn show(ui: &mut Ui, a: &mut AdviseeRecord, settings: &Settings, timetable: &Timetable) -> Option<widgets::Share> {
+    let s1 = semester(ui, "Semester 1", &mut a.s1, settings, timetable);
     ui.add_space(6.0);
-    let s2 = semester(ui, "Semester 2", &mut a.s2, settings);
+    let s2 = semester(ui, "Semester 2", &mut a.s2, settings, timetable);
     s1.or(s2)
 }
 
@@ -18,6 +18,7 @@ fn semester(
     title: &str,
     c: &mut SemesterContact,
     settings: &Settings,
+    timetable: &Timetable,
 ) -> Option<widgets::Share> {
     ui.push_id(title, |ui| {
         egui::Frame::group(ui.style())
@@ -47,6 +48,7 @@ fn semester(
                     &mut c.meetings,
                     Some("Semester meeting"),
                     settings,
+                    timetable,
                 )
             })
             .inner

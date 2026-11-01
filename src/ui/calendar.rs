@@ -10,8 +10,8 @@ use egui::{RichText, Ui};
 use uuid::Uuid;
 
 use crate::model::{
-    Database, Event, EventDetails, EventKind, ImportTarget, ImportedEvent, Known, MeetingChange, MeetingRole, Platform,
-    Semester,
+    BusyTime, Database, Event, EventDetails, EventKind, ImportTarget, ImportedEvent, Known, MeetingChange, MeetingRole,
+    Platform, Semester,
 };
 use crate::ui::{icons, theme, widgets};
 
@@ -40,6 +40,11 @@ pub struct CalendarState {
     pub reminders: bool,
     /// Imported events without a student.
     pub other: bool,
+    /// Show when students are busy. Off whenever the app opens, as it can
+    /// crowd the calendar.
+    pub timetables: bool,
+    /// Just this student's busy times.
+    pub timetable_of: Option<Uuid>,
     /// Event UIDs; kept while switching months or layouts.
     pub selected: HashSet<String>,
     /// Export a repeating meeting as one series rather than single weeks.
@@ -99,9 +104,10 @@ struct Editing {
     date: Option<NaiveDate>,
 }
 
-/// The list's range, the kinds shown, the first day of the week, the width,
-/// and the events (a new list after every edit, so its address and length change).
-type ListKey = (Range, [bool; 6], u32, usize, usize);
+/// The list's range, the kinds shown, the first day of the week, whose busy
+/// times show, the width, and the events (a new list after every edit, so its
+/// address and length change).
+type ListKey = (Range, [bool; 7], Option<Uuid>, u32, usize, usize);
 
 /// What is carried while an item is dragged in the month grid.
 struct Dragged(Event);
@@ -117,6 +123,8 @@ impl Default for CalendarState {
             deadlines: true,
             reminders: true,
             other: true,
+            timetables: false,
+            timetable_of: None,
             selected: HashSet::new(),
             as_series: true,
             week_heights: HashMap::new(),
@@ -182,20 +190,24 @@ fn shown(db: &Database, st: &CalendarState, e: &Event, today: NaiveDate) -> bool
         EventKind::Reminder => st.reminders,
         EventKind::Other => st.other,
     };
-    let in_range = match st.layout {
+    kind && in_range(db, st, e.date, today)
+}
+
+/// Whether `date` is in the month or range on screen.
+fn in_range(db: &Database, st: &CalendarState, date: NaiveDate, today: NaiveDate) -> bool {
+    match st.layout {
         Layout::Month => {
             let start = db.settings.week_start(st.month);
             let last = st.month + Months::new(1) - Duration::days(1);
             let end = db.settings.week_start(last) + Duration::days(6);
-            (start..=end).contains(&e.date)
+            (start..=end).contains(&date)
         }
         Layout::List => match st.range {
-            Range::Upcoming => e.date >= today,
-            Range::Semester(sem) => db.settings.semester_of(e.date) == sem,
+            Range::Upcoming => date >= today,
+            Range::Semester(sem) => db.settings.semester_of(date) == sem,
             Range::All => true,
         },
-    };
-    kind && in_range
+    }
 }
 
 /// `all` is `db.events()`, built once per change. `with_guests` is the
@@ -218,6 +230,13 @@ pub fn show(
         .collect();
     st.selected.retain(|uid| exists.contains(uid.as_str()));
     let events: Vec<&Event> = all.iter().filter(|e| shown(db, st, e, today)).collect();
+    // Worked out only while switched on; privacy mode has no list of students to choose from.
+    let only = st.timetable_of.filter(|_| !st.private);
+    let busy = if st.timetables {
+        db.busy_times(only, |date| in_range(db, st, date, today))
+    } else {
+        Vec::new()
+    };
 
     // Delete and Escape are for the calendar only when nothing is over it or
     // typing: not this page's dialogs, nor any other open in the app.
@@ -318,6 +337,7 @@ pub fn show(
             theme::toggle_pill(ui, &mut st.other, icons::CALENDAR_BLANK, "Other", theme::GREY)
                 .on_hover_text("Imported events that aren't linked to a student");
         }
+        timetables_filter(ui, db, st);
         ui.separator();
         if ui.button("Select all shown").clicked() {
             st.selected.extend(
@@ -340,21 +360,63 @@ pub fn show(
 
     match st.layout {
         Layout::List => {
-            let kinds = [st.meetings, st.visits, st.deadlines, st.reminders, st.other, db.settings.week_starts_sunday];
-            let key = (st.range, kinds, ui.available_width() as u32, all.as_ptr() as usize, all.len());
+            let kinds = [st.meetings, st.visits, st.deadlines, st.reminders, st.other, st.timetables, db.settings.week_starts_sunday];
+            let key = (st.range, kinds, only, ui.available_width() as u32, all.as_ptr() as usize, all.len());
             if st.heights_for != Some(key) {
                 st.heights_for = Some(key);
                 st.week_heights.clear();
             }
-            list(ui, db, st, &events, now, &mut action);
+            list(ui, db, st, &events, &busy, now, &mut action);
         }
-        Layout::Month => month(ui, db, st, &events, now, &mut action),
+        Layout::Month => month(ui, db, st, &events, &busy, now, &mut action),
     }
-    postpone_dialog(ui, st, &mut action);
-    edit_dialog(ui, st, &mut action);
+    postpone_dialog(ui, db, st, &mut action);
+    edit_dialog(ui, db, st, &mut action);
     delete_dialog(ui, st, &mut action);
     import_dialog(ui, db, st, &mut action);
     action
+}
+
+/// The pill that shows students' busy times, once any student has a
+/// timetable, and the choice of whose.
+fn timetables_filter(ui: &mut Ui, db: &Database, st: &mut CalendarState) {
+    let students: Vec<_> = db.students.iter().filter(|s| !s.archived && !s.timetable.is_empty()).collect();
+    if st.timetable_of.is_some_and(|id| !students.iter().any(|s| s.id == id)) {
+        st.timetable_of = None;
+    }
+    if students.is_empty() {
+        return;
+    }
+    theme::toggle_pill(ui, &mut st.timetables, icons::CLOCK, "Timetables", theme::PLUM)
+        .on_hover_text("Show when students are busy, from the timetable in their details");
+    if st.timetables && !st.private && students.len() > 1 {
+        let chosen = st.timetable_of.and_then(|id| db.student(id)).map_or_else(|| "All students".to_string(), busy_name);
+        egui::ComboBox::from_id_salt("timetable-of")
+            .selected_text(chosen)
+            .width(150.0)
+            .height(320.0)
+            .truncate()
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut st.timetable_of, None, "All students");
+                for s in students {
+                    ui.selectable_value(&mut st.timetable_of, Some(s.id), busy_name(s));
+                }
+            });
+    }
+}
+
+/// A student's name beside their busy times.
+fn busy_name(s: &crate::model::Student) -> String {
+    if s.name.is_empty() { s.display_name() } else { s.name.clone() }
+}
+
+/// When a busy time is and who it is for, without the name in privacy mode.
+/// The time comes first, as a narrow month cell cuts the end off.
+fn busy_text(db: &Database, st: &CalendarState, b: &BusyTime) -> String {
+    match db.student(b.student_id).filter(|_| !st.private) {
+        Some(s) => format!("{} {}", b.block.label(), busy_name(s)),
+        None => b.block.label(),
+    }
 }
 
 /// Right-click menu of an item: mark a past meeting held or postpone it,
@@ -414,7 +476,7 @@ fn item_menu(ui: &mut Ui, db: &Database, e: &Event, st: &mut CalendarState, now:
 }
 
 /// Asks for the new day and time of the meeting being postponed.
-fn postpone_dialog(ui: &mut Ui, st: &mut CalendarState, action: &mut CalAction) {
+fn postpone_dialog(ui: &mut Ui, db: &Database, st: &mut CalendarState, action: &mut CalAction) {
     let private = st.private;
     let Some(p) = &mut st.postpone else { return };
     let mut postpone = false;
@@ -437,6 +499,10 @@ fn postpone_dialog(ui: &mut Ui, st: &mut CalendarState, action: &mut CalAction) 
             widgets::opt_time(ui, "time", &mut p.time);
             ui.end_row();
         });
+        if let Some(student) = db.student(p.event.student_id) {
+            ui.add_space(4.0);
+            widgets::clash_alert(ui, &db.settings, &student.timetable, p.date, p.time);
+        }
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add_enabled(p.date.is_some(), theme::primary_button("Postpone")).clicked() {
@@ -464,7 +530,7 @@ fn when_text(e: &Event) -> String {
 }
 
 /// Day, time and place of the item being edited.
-fn edit_dialog(ui: &mut Ui, st: &mut CalendarState, action: &mut CalAction) {
+fn edit_dialog(ui: &mut Ui, db: &Database, st: &mut CalendarState, action: &mut CalAction) {
     let private = st.private;
     let Some(ed) = &mut st.editing else { return };
     let mut save = false;
@@ -533,6 +599,10 @@ fn edit_dialog(ui: &mut Ui, st: &mut CalendarState, action: &mut CalAction) {
                 }
             }
         });
+        if let Some(student) = db.student(ed.event.student_id) {
+            ui.add_space(4.0);
+            widgets::clash_alert(ui, &db.settings, &student.timetable, ed.date, ed.details.time);
+        }
         if ed.event.series.is_some() {
             ui.add_space(4.0);
             ui.add(
@@ -652,11 +722,12 @@ fn list(
     db: &Database,
     st: &mut CalendarState,
     events: &[&Event],
+    busy: &[BusyTime],
     now: NaiveDateTime,
     action: &mut CalAction,
 ) {
     let today = now.date();
-    if events.is_empty() {
+    if events.is_empty() && busy.is_empty() {
         theme::card(ui, "", |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(30.0);
@@ -672,6 +743,13 @@ fn list(
     let mut weeks: BTreeMap<NaiveDate, Vec<&Event>> = BTreeMap::new();
     for e in events {
         weeks.entry(db.settings.week_start(e.date)).or_default().push(e);
+    }
+    // Busy times go under the items, a line per day.
+    let mut busy_weeks: BTreeMap<NaiveDate, BTreeMap<NaiveDate, Vec<&BusyTime>>> = BTreeMap::new();
+    for b in busy {
+        let first = db.settings.week_start(b.date);
+        weeks.entry(first).or_default();
+        busy_weeks.entry(first).or_default().entry(b.date).or_default().push(b);
     }
 
     egui::ScrollArea::vertical()
@@ -733,6 +811,9 @@ fn list(
                 ui.add_space(2.0);
                 for e in items {
                     row(ui, db, e, st, now, action);
+                }
+                for (date, times) in busy_weeks.get(&first).into_iter().flatten() {
+                    busy_row(ui, db, st, *date, times);
                 }
                 });
                 st.week_heights.insert(first, card.response.rect.height());
@@ -846,6 +927,20 @@ fn row(ui: &mut Ui, db: &Database, e: &Event, st: &mut CalendarState, now: Naive
     });
 }
 
+/// When students are busy on one day, in the list.
+fn busy_row(ui: &mut Ui, db: &Database, st: &CalendarState, date: NaiveDate, times: &[&BusyTime]) {
+    let color = theme::muted(ui);
+    ui.horizontal_wrapped(|ui| {
+        // Lined up with the items, which have a tick box here.
+        ui.add_space(ui.spacing().icon_width + ui.spacing().item_spacing.x);
+        ui.add_sized([110.0, 20.0], egui::Label::new(RichText::new(date.format("%a %d").to_string()).color(color)));
+        ui.label(RichText::new(icons::CLOCK).size(16.0).color(color));
+        let mut texts: Vec<String> = times.iter().map(|b| busy_text(db, st, b)).collect();
+        texts.dedup();
+        ui.label(RichText::new(texts.join(" · ")).small().color(color));
+    });
+}
+
 /// Short text for a month cell: the student, or the coursework for deadlines.
 fn cell_text(db: &Database, st: &CalendarState, e: &Event) -> String {
     let what = match e.kind {
@@ -875,12 +970,17 @@ fn month(
     db: &Database,
     st: &mut CalendarState,
     events: &[&Event],
+    busy: &[BusyTime],
     now: NaiveDateTime,
     action: &mut CalAction,
 ) {
     let mut by_day: BTreeMap<NaiveDate, Vec<&Event>> = BTreeMap::new();
     for e in events {
         by_day.entry(e.date).or_default().push(e);
+    }
+    let mut busy_by_day: BTreeMap<NaiveDate, Vec<&BusyTime>> = BTreeMap::new();
+    for b in busy {
+        busy_by_day.entry(b.date).or_default().push(b);
     }
     let first = db.settings.week_start(st.month);
     let last = st.month + Months::new(1) - Duration::days(1);
@@ -919,9 +1019,8 @@ fn month(
             while week <= last {
                 let busiest = (0..7)
                     .map(|d| {
-                        by_day
-                            .get(&(week + Duration::days(d)))
-                            .map_or(0, Vec::len)
+                        let date = week + Duration::days(d);
+                        by_day.get(&date).map_or(0, Vec::len) + busy_by_day.get(&date).map_or(0, Vec::len)
                     })
                     .max()
                     .unwrap_or(0);
@@ -937,7 +1036,8 @@ fn month(
                     for d in 0..7 {
                         let date = week + Duration::days(d);
                         let items = by_day.get(&date).map_or(&[][..], Vec::as_slice);
-                        day_cell(ui, db, st, date, items, now, egui::vec2(col, height), action);
+                        let busy = busy_by_day.get(&date).map_or(&[][..], Vec::as_slice);
+                        day_cell(ui, db, st, date, items, busy, now, egui::vec2(col, height), action);
                     }
                 });
                 week += Duration::days(7);
@@ -953,6 +1053,7 @@ fn day_cell(
     st: &mut CalendarState,
     date: NaiveDate,
     items: &[&Event],
+    busy: &[&BusyTime],
     now: NaiveDateTime,
     size: egui::Vec2,
     action: &mut CalAction,
@@ -1000,6 +1101,10 @@ fn day_cell(
                 }
                 for e in items {
                     ui.push_id(&e.uid, |ui| pill(ui, db, st, e, now, action));
+                }
+                for b in busy {
+                    let text = RichText::new(format!("{} {}", icons::CLOCK, busy_text(db, st, b))).small().color(theme::muted(ui));
+                    ui.add(egui::Label::new(text).truncate());
                 }
             });
         })

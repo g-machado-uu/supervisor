@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use egui::{RichText, Ui};
 use uuid::Uuid;
 
-use crate::model::{CwStatus, FypRecord, MARK_TOLERANCE, ReplyStatus, Settings, fmt_mark};
+use crate::model::{CwStatus, FypRecord, MARK_TOLERANCE, ReplyStatus, Settings, Timetable, fmt_mark};
 use crate::ui::student_form::{Shown, hidden_value};
 use crate::ui::{icons, theme, widgets};
 
 /// Returns the meeting to send, if asked.
-pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings, shown: &mut Shown) -> Option<widgets::Share> {
+pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings, timetable: &Timetable, shown: &mut Shown) -> Option<widgets::Share> {
     let sust = settings.is_sust(&fyp.programme);
     widgets::form_grid(ui, "fyp-grid", |ui| {
         ui.label("Course");
@@ -196,7 +196,7 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings, shown: &mut S
 
     ui.add_space(10.0);
     theme::section(ui, "Meetings", |ui| {
-        widgets::meetings_editor(ui, "fyp-meetings", &mut fyp.meetings, None, settings)
+        widgets::meetings_editor(ui, "fyp-meetings", &mut fyp.meetings, None, settings, timetable)
     })
     .flatten()
 }

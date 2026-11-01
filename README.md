@@ -12,13 +12,14 @@ This project is built with the help of Claude Opus 5.5.
 - **Marks** for each project coursework: Marker 1, Marker 2 and the agreed mark, or for SUST students whether the SUST supervisor has sent theirs, their mark, yours and the agreed one. They show as dots until you click **Reveal marks**. When Marker 2's mark is within 10% of Marker 1's (the supervisor's), their average fills in the agreed mark for you to confirm; further away, a warning shows instead.
 - **Privacy**: **Hide names** on the dashboard hides students' names and B numbers on the dashboard, in the lists, the calendar and their details, for when someone else can see your screen. The eye on a student's Details hides or shows that student's name, number and email.
 - **Meetings**, one-off or repeating, online (Teams, Google Meet or Zoom, with the meeting link) or in a room. Mark each week as held, cancelled or moved, and open each week's notes in a larger box to write or read them.
+- **Student timetables**: click the calendar icon at the top of a student's details, then click or drag over the hours they are busy, for each semester (just the times, no module names). Lectures start at quarter past and finish on the hour, so the grid does too. When you choose a meeting's date and time, a warning shows if it clashes; a meeting is taken to last an hour. With only a date chosen, it tells you when the student is busy that day. Clashes are checked in the teaching weeks you set in Settings.
 - **Coursework deadlines** are worked out from the teaching weeks you set in Settings.
 - **Research students**, in four lists: PhD, PhD External, MSc and MSc External. Assessments, annual reports, submission and viva: type in the deadlines from the university system and the app reminds you in time.
 - **External students** (registered at another university) start with a blank list of assessments. Add their own deadlines and choose how long before each one to be reminded. You can do the same for any student, alongside the standard assessments.
 - **External students in Brazil**: tick *On a Brazilian programme* to get the levels (academic or professional master's and doctorate), the grant from CNPq, CAPES, FINEP, ANP, the 27 state foundations (FAPs) or other sources, with its length, extension and end date, the standard stages (course credits, language proficiency, qualifying exam, annual reports, sending the work to the committee, defence, final version) and the defence with its committee and result. *Fill in suggested deadlines* works them out from the enrolment date, using the months per level in Settings › Brazilian programmes.
 - **Registration numbers** of external students are shown as *Registration #* and, since they may be a national ID (a Brazilian CPF or a National Insurance number), hidden as dots until you click **Reveal** in the student's details. Settings › Privacy can ask for your password first, or turn hiding off. They are never put in calendar or invite files.
 - **Placement visits**: requests, replies and whether the line manager is coming.
-- **Calendar** as a list or a month grid, with weeks starting on Monday or Sunday. Right-click an item to edit, delete or postpone it. In the month grid, drag it to another day. Select items and press Delete to remove them, or Esc to clear the selection. Export any items to an `.ics` file for Outlook or Google Calendar, or save an invite file for one meeting to send to the student. **Google Calendar** opens a meeting in Google Calendar with the student as a guest, and Google adds a Meet link if needed. **Import…** brings in events from another calendar's `.ics`, each linked to a student or kept on its own; events already in Supervisor are left unticked.
+- **Calendar** as a list or a month grid, with weeks starting on Monday or Sunday. Right-click an item to edit, delete or postpone it. In the month grid, drag it to another day. Select items and press Delete to remove them, or Esc to clear the selection. Export any items to an `.ics` file for Outlook or Google Calendar, or save an invite file for one meeting to send to the student. **Google Calendar** opens a meeting in Google Calendar with the student as a guest, and Google adds a Meet link if needed. **Import…** brings in events from another calendar's `.ics`, each linked to a student or kept on its own; events already in Supervisor are left unticked. **Timetables** shows when students are busy, for all of them or just one. It is off each time you open the app, and busy times are never exported.
 
 ![Student details](docs/screenshots/student.png)
 
@@ -35,10 +36,23 @@ This project is built with the help of Claude Opus 5.5.
 
   You can open or create a file somewhere else (e.g. a synced folder) from the unlock screen.
 
+- **Backup copy** (optional): in Settings › Backup copy, choose a folder on another drive, a USB stick or a synced folder. Each save then also replaces a copy of your data file there, called something like `data-backup-1a2b3c4d.svt`, so a problem with one disk doesn't take both. See [Backup copy](#backup-copy-optional).
 - **Lock** (bottom of the sidebar, or `Ctrl+L`) saves your changes and closes your data; you need your password to open it again. Supervisor also locks by itself after **10 minutes** without use. Change this in Settings › Security.
 - If saving fails (for example, a network drive is disconnected), Supervisor tells you and won't lock or close until your changes are saved, unless you choose to discard them.
 - A data file can be open in only one Supervisor window at a time. If it is changed somewhere else while you have it open (e.g. on another computer sharing the file), Supervisor asks before replacing that version, and keeps it as the `.bak`.
 - Exported `.ics` files are **not** encrypted.
+
+## Backup copy (optional)
+
+Turn it on in Settings › Backup copy by clicking **Choose folder…**. Pick a folder that isn't where your data file is.
+
+- The copy is **as encrypted as your data file** and opens with the same password (and key file, if you use one).
+- **To use it:** on the unlock screen, click **Open another file…** and choose the copy. Supervisor then carries on from that file.
+- It is always your latest save, replaced each time. To go back to earlier, use the `.bak` next to your data file.
+- If the folder can't be reached (for example, the USB stick is out), your data file still saves as usual. A message tells you, and **Saved** at the bottom of the sidebar shows a warning until the copy works again. It works again on the next save, or when you click **Back up now**.
+- Changing your password updates the copy too, as long as the folder can be reached.
+- The folder is remembered **on this computer only**, so choose one on each computer you use. Turning it off or changing the folder leaves the old copy where it is; delete it yourself if you don't need it.
+- **Don't keep your key file's backup in the same folder.** Together they would let anyone with that folder open the copy with just the password.
 
 ## Key file (optional)
 

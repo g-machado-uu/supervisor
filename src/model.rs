@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime};
+use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Timelike};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -465,6 +465,172 @@ impl Settings {
             .find(|r| r.level == level)
             .cloned()
             .unwrap_or_else(|| BrRule::default_for(level))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Timetable
+// ---------------------------------------------------------------------------
+
+/// Days of the timetable grid, Monday first.
+pub const TIMETABLE_DAYS: [&str; 5] = ["Mon", "Tue", "Wed", "Thu", "Fri"];
+/// Hours of the grid. Lectures start at quarter past and finish on the hour,
+/// so 9 is 09:15–10:00.
+pub const TIMETABLE_HOURS: std::ops::RangeInclusive<u8> = 9..=18;
+/// How long a meeting is taken to last: it has no end time of its own, and
+/// calendar exports give it an hour too.
+const MEETING_MINUTES: u32 = 60;
+
+/// One busy hour of the week.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct BusySlot {
+    /// 0 is Monday.
+    pub day: u8,
+    /// From quarter past this hour to the next full hour.
+    pub hour: u8,
+}
+
+impl BusySlot {
+    /// "09:15–10:00".
+    pub fn label(self) -> String {
+        BusyBlock::new(self.hour, self.hour).label()
+    }
+}
+
+/// A stretch of busy time on one day; a two-hour lecture is one block, with
+/// its break inside.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BusyBlock {
+    pub start: NaiveTime,
+    pub end: NaiveTime,
+}
+
+impl BusyBlock {
+    /// From the first hour's quarter past to the end of the last. The hours
+    /// must be in `TIMETABLE_HOURS`.
+    fn new(first: u8, last: u8) -> Self {
+        let time = |hour: u8, minute| NaiveTime::from_hms_opt(hour.into(), minute, 0).expect("an hour of the grid");
+        Self {
+            start: time(first, 15),
+            end: time(last + 1, 0),
+        }
+    }
+
+    /// "09:15–11:00".
+    pub fn label(self) -> String {
+        format!("{}–{}", self.start.format("%H:%M"), self.end.format("%H:%M"))
+    }
+}
+
+/// A week of a meeting that falls in the student's busy time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Clash {
+    /// The week as planned, which is how repeating meetings list their weeks.
+    pub planned: NaiveDate,
+    pub date: NaiveDate,
+    pub time: NaiveTime,
+    pub block: BusyBlock,
+}
+
+/// When a student is busy each week of teaching, per semester. Just the
+/// times: it says nothing about what the lectures are.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Timetable {
+    /// Kept sorted.
+    pub s1: Vec<BusySlot>,
+    pub s2: Vec<BusySlot>,
+}
+
+impl Timetable {
+    pub fn is_empty(&self) -> bool {
+        self.s1.is_empty() && self.s2.is_empty()
+    }
+
+    pub fn slots(&self, semester: Semester) -> &[BusySlot] {
+        match semester {
+            Semester::S2 => &self.s2,
+            Semester::S1 | Semester::FullYear => &self.s1,
+        }
+    }
+
+    pub fn slots_mut(&mut self, semester: Semester) -> &mut Vec<BusySlot> {
+        match semester {
+            Semester::S2 => &mut self.s2,
+            Semester::S1 | Semester::FullYear => &mut self.s1,
+        }
+    }
+
+    pub fn is_busy(&self, semester: Semester, slot: BusySlot) -> bool {
+        self.slots(semester).binary_search(&slot).is_ok()
+    }
+
+    pub fn set_busy(&mut self, semester: Semester, slot: BusySlot, busy: bool) {
+        let slots = self.slots_mut(semester);
+        match (slots.binary_search(&slot), busy) {
+            (Err(at), true) => slots.insert(at, slot),
+            (Ok(at), false) => {
+                slots.remove(at);
+            }
+            _ => {}
+        }
+    }
+
+    /// The busy stretches of a day of the week, adjoining hours together.
+    pub fn blocks(&self, semester: Semester, day: u8) -> Vec<BusyBlock> {
+        let mut hours: Vec<u8> = self
+            .slots(semester)
+            .iter()
+            .filter(|s| s.day == day && TIMETABLE_HOURS.contains(&s.hour))
+            .map(|s| s.hour)
+            .collect();
+        hours.sort_unstable();
+        hours.dedup();
+        let mut blocks: Vec<BusyBlock> = Vec::new();
+        for hour in hours {
+            let next = BusyBlock::new(hour, hour);
+            match blocks.last_mut() {
+                Some(block) if block.end.hour() == u32::from(hour) => block.end = next.end,
+                _ => blocks.push(next),
+            }
+        }
+        blocks
+    }
+
+    /// The busy stretches of a date: none outside teaching, when there are
+    /// no lectures, nor in a semester whose dates aren't set.
+    pub fn blocks_on(&self, settings: &Settings, date: NaiveDate) -> Vec<BusyBlock> {
+        match settings.teaching_week(date) {
+            Some((semester, _)) => self.blocks(semester, date.weekday().num_days_from_monday() as u8),
+            None => Vec::new(),
+        }
+    }
+
+    /// The busy stretch a meeting at `time` on `date` would overlap.
+    pub fn clash(&self, settings: &Settings, date: NaiveDate, time: NaiveTime) -> Option<BusyBlock> {
+        let minutes = |t: NaiveTime| t.hour() * 60 + t.minute();
+        let (from, to) = (minutes(time), minutes(time) + MEETING_MINUTES);
+        self.blocks_on(settings, date)
+            .into_iter()
+            .find(|b| from < minutes(b.end) && to > minutes(b.start))
+    }
+
+    /// The weeks of `m` still to come that clash. Cancelled and held weeks
+    /// can't be changed any more, so they don't count.
+    pub fn meeting_clashes(&self, m: &Meeting, settings: &Settings, today: NaiveDate) -> Vec<Clash> {
+        m.occurrences(settings)
+            .into_iter()
+            .filter(|o| !o.cancelled && !o.held && o.date() >= today)
+            .filter_map(|o| {
+                let (date, time) = (o.date(), o.time.or(m.time)?);
+                self.clash(settings, date, time).map(|block| Clash {
+                    planned: o.planned,
+                    date,
+                    time,
+                    block,
+                })
+            })
+            .collect()
     }
 }
 
@@ -1906,6 +2072,7 @@ pub struct Student {
     pub placement: Option<PlacementRecord>,
     pub advisee: Option<AdviseeRecord>,
     pub phd: Option<PhdRecord>,
+    pub timetable: Timetable,
 }
 
 impl Default for Student {
@@ -1922,6 +2089,7 @@ impl Default for Student {
             placement: None,
             advisee: None,
             phd: None,
+            timetable: Timetable::default(),
         }
     }
 }
@@ -2261,6 +2429,15 @@ impl Event {
     fn is_viva(&self) -> bool {
         self.uid.starts_with("phd-viva-")
     }
+}
+
+/// One student's busy time on one day, for the calendar's Timetables toggle.
+/// Not an [`Event`]: it can't be selected, moved or exported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusyTime {
+    pub student_id: Uuid,
+    pub date: NaiveDate,
+    pub block: BusyBlock,
 }
 
 /// A change the calendar can make to a meeting, or to one week of a
@@ -2704,6 +2881,35 @@ impl Database {
                 .any(|s| Some(s.id) != except && s.b_number.trim().eq_ignore_ascii_case(b))
     }
 
+    /// The busy stretch of a student's timetable that a meeting at this day
+    /// and time would overlap.
+    pub fn clash(&self, student_id: Uuid, date: NaiveDate, time: Option<NaiveTime>) -> Option<BusyBlock> {
+        self.student(student_id)?.timetable.clash(&self.settings, date, time?)
+    }
+
+    /// Busy times of the active students (or just `only`) on the days of
+    /// teaching that `keep` accepts, in order.
+    pub fn busy_times(&self, only: Option<Uuid>, keep: impl Fn(NaiveDate) -> bool) -> Vec<BusyTime> {
+        let mut days = Vec::new();
+        for semester in [Semester::S1, Semester::S2] {
+            if let (Some(start), Some(end)) = (self.settings.semester_start(semester), self.settings.teaching_end(semester)) {
+                days.extend(start.iter_days().take_while(|d| *d <= end).filter(|d| keep(*d)));
+            }
+        }
+        days.sort_unstable();
+        days.dedup();
+        let mut out = Vec::new();
+        for s in self.students.iter().filter(|s| !s.archived && !s.timetable.is_empty() && only.is_none_or(|id| id == s.id)) {
+            for &date in &days {
+                for block in s.timetable.blocks_on(&self.settings, date) {
+                    out.push(BusyTime { student_id: s.id, date, block });
+                }
+            }
+        }
+        out.sort_by_key(|b| (b.date, b.block.start));
+        out
+    }
+
     /// Every dated item across all active (non-archived) students, including
     /// cancelled weeks of repeating meetings.
     pub fn events(&self) -> Vec<Event> {
@@ -3138,6 +3344,156 @@ mod tests {
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    fn t(hour: u32, minute: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(hour, minute, 0).unwrap()
+    }
+
+    /// Semester 1 from Mon 21 Sep 2026 and semester 2 from Mon 25 Jan 2027.
+    fn teaching() -> Settings {
+        Settings {
+            sem1_start: Some(d(2026, 9, 21)),
+            sem2_start: Some(d(2027, 1, 25)),
+            ..Default::default()
+        }
+    }
+
+    /// Mondays 09:15–11:00 and 14:15–15:00 in semester 1 only.
+    fn monday_lectures() -> Timetable {
+        let mut timetable = Timetable::default();
+        for hour in [14, 10, 9] {
+            timetable.set_busy(Semester::S1, BusySlot { day: 0, hour }, true);
+        }
+        timetable
+    }
+
+    #[test]
+    fn adjoining_hours_make_one_block() {
+        let timetable = monday_lectures();
+        let labels = |day| timetable.blocks(Semester::S1, day).iter().map(|b| b.label()).collect::<Vec<_>>();
+        assert_eq!(labels(0), ["09:15–11:00", "14:15–15:00"]);
+        assert!(labels(1).is_empty());
+        assert!(timetable.blocks(Semester::S2, 0).is_empty());
+        assert_eq!(BusySlot { day: 0, hour: 9 }.label(), "09:15–10:00");
+
+        // Setting twice keeps one copy, and removing splits the block.
+        let mut timetable = monday_lectures();
+        timetable.set_busy(Semester::S1, BusySlot { day: 0, hour: 9 }, true);
+        assert_eq!(timetable.s1.len(), 3);
+        timetable.set_busy(Semester::S1, BusySlot { day: 0, hour: 10 }, false);
+        assert_eq!(timetable.s1.len(), 2);
+        assert!(timetable.s1.is_sorted());
+        timetable.set_busy(Semester::S1, BusySlot { day: 0, hour: 10 }, false);
+        assert_eq!(timetable.s1.len(), 2);
+    }
+
+    #[test]
+    fn hours_outside_the_grid_are_ignored() {
+        let mut timetable = monday_lectures();
+        timetable.s1.push(BusySlot { day: 0, hour: 255 });
+        assert_eq!(timetable.blocks(Semester::S1, 0).len(), 2);
+    }
+
+    #[test]
+    fn a_meeting_clashes_if_its_hour_overlaps() {
+        let settings = teaching();
+        let timetable = monday_lectures();
+        let monday = d(2026, 10, 5);
+        let clash = |time| timetable.clash(&settings, monday, time).map(|b| b.label());
+        let morning = Some("09:15–11:00".to_string());
+        assert_eq!(clash(t(8, 15)), None, "ends just as the lecture starts");
+        assert_eq!(clash(t(8, 30)), morning, "runs into the lecture");
+        assert_eq!(clash(t(9, 15)), morning);
+        assert_eq!(clash(t(10, 5)), morning, "the break inside a two-hour lecture is busy");
+        assert_eq!(clash(t(10, 59)), morning);
+        assert_eq!(clash(t(11, 0)), None, "starts as the lecture finishes");
+        assert_eq!(clash(t(13, 15)), None);
+        assert_eq!(clash(t(14, 0)), Some("14:15–15:00".to_string()));
+        assert_eq!(clash(t(15, 0)), None);
+    }
+
+    #[test]
+    fn only_teaching_weeks_of_the_right_semester_count() {
+        let settings = teaching();
+        let timetable = monday_lectures();
+        let at_ten = |date| timetable.clash(&settings, date, t(10, 0)).is_some();
+        assert!(at_ten(d(2026, 9, 21)), "first day of teaching");
+        assert!(!at_ten(d(2026, 9, 14)), "before teaching");
+        assert!(at_ten(d(2026, 12, 7)), "week 12");
+        assert!(!at_ten(d(2026, 12, 14)), "after teaching");
+        assert!(!at_ten(d(2026, 10, 6)), "a Tuesday");
+        assert!(!at_ten(d(2027, 2, 1)), "semester 2 has its own timetable");
+        let mut second = Timetable::default();
+        second.set_busy(Semester::S2, BusySlot { day: 0, hour: 9 }, true);
+        assert!(second.clash(&settings, d(2027, 2, 1), t(10, 0)).is_none(), "over by 10:00");
+        assert!(second.clash(&settings, d(2027, 2, 1), t(9, 30)).is_some());
+        assert!(second.clash(&settings, d(2026, 10, 5), t(9, 30)).is_none());
+        // Without the semester's dates there are no teaching weeks to check.
+        assert!(timetable.clash(&Settings::default(), d(2026, 10, 5), t(10, 0)).is_none());
+    }
+
+    #[test]
+    fn meeting_clashes_are_the_weeks_still_to_change() {
+        let settings = teaching();
+        let timetable = monday_lectures();
+        let today = d(2026, 10, 12);
+        let one_off = |date, time| Meeting { date: Some(date), time, ..Default::default() };
+        let clashes = |m: &Meeting| timetable.meeting_clashes(m, &settings, today);
+        assert_eq!(clashes(&one_off(d(2026, 10, 19), Some(t(10, 0)))).len(), 1);
+        assert!(clashes(&one_off(d(2026, 10, 19), None)).is_empty(), "no time yet");
+        assert!(clashes(&one_off(d(2026, 10, 5), Some(t(10, 0)))).is_empty(), "already past");
+        let held = Meeting { held: true, ..one_off(d(2026, 10, 19), Some(t(10, 0))) };
+        assert!(clashes(&held).is_empty());
+
+        let first = d(2026, 10, 5);
+        let mut series = Meeting {
+            repeat: Some(Repeat { until: Some(first + Duration::weeks(3)), ..Default::default() }),
+            ..one_off(first, Some(t(10, 0)))
+        };
+        // 5 Oct has passed; 12, 19 and 26 Oct are to come.
+        let planned = |m: &Meeting| clashes(m).iter().map(|c| c.planned).collect::<Vec<_>>();
+        assert_eq!(planned(&series), [d(2026, 10, 12), d(2026, 10, 19), d(2026, 10, 26)]);
+        series.set_occurrence(Occurrence { planned: d(2026, 10, 12), cancelled: true, ..Default::default() });
+        series.set_occurrence(Occurrence { planned: d(2026, 10, 19), time: Some(t(12, 0)), ..Default::default() });
+        series.set_occurrence(Occurrence { planned: d(2026, 10, 26), moved_to: Some(d(2026, 10, 27)), ..Default::default() });
+        assert!(planned(&series).is_empty(), "cancelled, later that day, and moved to a free day");
+        series.set_occurrence(Occurrence { planned: d(2026, 10, 26), moved_to: Some(d(2026, 11, 2)), ..Default::default() });
+        let moved = clashes(&series);
+        assert_eq!((moved[0].planned, moved[0].date), (d(2026, 10, 26), d(2026, 11, 2)), "moved onto a busy Monday");
+    }
+
+    #[test]
+    fn busy_times_are_of_active_students_in_teaching() {
+        let mut db = Database { settings: teaching(), ..Default::default() };
+        let student = |name: &str, archived| Student {
+            name: name.into(),
+            archived,
+            timetable: monday_lectures(),
+            ..Default::default()
+        };
+        db.students = vec![student("Ana", false), student("Ben", false), student("Old", true), Student::default()];
+        let october = |date: NaiveDate| date >= d(2026, 10, 5) && date < d(2026, 10, 12);
+        let week = db.busy_times(None, october);
+        assert_eq!(week.len(), 4, "two blocks of two students");
+        assert!(week.iter().all(|b| b.date == d(2026, 10, 5) && b.student_id != db.students[2].id));
+        assert!(week.windows(2).all(|w| w[0].block.start <= w[1].block.start));
+        let ana = db.students[0].id;
+        assert_eq!(db.busy_times(Some(ana), october).len(), 2);
+        // Twelve Mondays of semester 1, none of semester 2 or the weeks between.
+        assert_eq!(db.busy_times(Some(ana), |_| true).len(), 24);
+        assert_eq!(db.clash(ana, d(2026, 10, 5), Some(t(10, 0))).map(|b| b.label()).as_deref(), Some("09:15–11:00"));
+        assert_eq!(db.clash(ana, d(2026, 10, 5), None), None);
+        assert_eq!(db.clash(Uuid::nil(), d(2026, 10, 5), Some(t(10, 0))), None);
+    }
+
+    #[test]
+    fn timetables_survive_saving_and_older_files_have_none() {
+        let student = Student { timetable: monday_lectures(), ..Default::default() };
+        let json = serde_json::to_string(&student).unwrap();
+        assert_eq!(serde_json::from_str::<Student>(&json).unwrap(), student);
+        let older: Student = serde_json::from_str(r#"{"name":"Grace"}"#).unwrap();
+        assert!(older.timetable.is_empty());
     }
 
     #[test]

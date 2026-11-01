@@ -4,11 +4,11 @@ use egui::Ui;
 
 use uuid::Uuid;
 
-use crate::model::{PlacementRecord, ReplyStatus, VisitMode, visit_uid};
+use crate::model::{PlacementRecord, ReplyStatus, Settings, Timetable, VisitMode, visit_uid};
 use crate::ui::{icons, theme, widgets};
 
 /// Returns the visit to send, if asked.
-pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<widgets::Share> {
+pub fn show(ui: &mut Ui, p: &mut PlacementRecord, settings: &Settings, timetable: &Timetable, student_id: Uuid) -> Option<widgets::Share> {
     let mut invite = None;
     widgets::form_grid(ui, "placement-grid", |ui| {
         ui.label("Company");
@@ -37,16 +37,14 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<wi
             widgets::inner_frame(ui)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(theme::semibold(format!("Visit {}", i + 1)));
                         if v.completed {
                             theme::chip(ui, "completed", theme::GREEN);
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if let Some(share) = widgets::share_buttons(ui, v.date.is_some(), || visit_uid(student_id, i)) {
-                                invite = Some(share);
-                            }
-                        });
+                        if let Some(share) = widgets::share_buttons(ui, v.date.is_some(), || visit_uid(student_id, i)) {
+                            invite = Some(share);
+                        }
                     });
                     widgets::form_grid(ui, "visit-grid", |ui| {
                         ui.label("Mode");
@@ -71,10 +69,8 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord, student_id: Uuid) -> Option<wi
                         }
 
                         ui.label("Visit date / time");
-                        ui.horizontal(|ui| {
-                            widgets::opt_date(ui, "date", &mut v.date);
-                            widgets::opt_time(ui, "time", &mut v.time);
-                        });
+                        let clash = (!v.completed).then_some((settings, timetable));
+                        widgets::date_time_cell(ui, &mut v.date, &mut v.time, clash);
                         ui.end_row();
 
                         ui.label("Line manager attending");

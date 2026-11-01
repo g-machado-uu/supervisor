@@ -22,6 +22,7 @@ use crate::ui::lock::{LockScreen, Unlocked};
 use crate::ui::settings::{self, KeyFileForm, PasswordForm, SettingsAction};
 use crate::ui::student_form::{self, FormAction, Role, Shown};
 use crate::ui::student_list::{self, Category, ListState};
+use crate::ui::timetable::{self, TimetableDialog};
 use crate::ui::{icons, theme, widgets};
 
 const AUTOSAVE_DELAY: f64 = 1.0;
@@ -266,9 +267,15 @@ struct Session {
     /// The student whose coursework marks are shown.
     marks_shown: Option<Uuid>,
     confirm: Option<Confirm>,
+    /// A student's timetable, while it is open.
+    timetable: Option<TimetableDialog>,
     password_form: PasswordForm,
     key_form: KeyFileForm,
     key_setup: Option<KeyFileSetup>,
+    /// How the last thing asked of the backup copy went, for Settings.
+    backup_message: Option<(bool, String)>,
+    /// A problem with the backup copy has been announced, and not yet solved.
+    backup_warned: bool,
     calendar: CalendarState,
     toast: Option<(String, f64)>,
     /// The list of keyboard shortcuts is open.
@@ -316,9 +323,12 @@ impl Session {
             hidden: HashSet::new(),
             marks_shown: None,
             confirm: None,
+            timetable: None,
             password_form: PasswordForm::default(),
             key_form: KeyFileForm::default(),
             key_setup: None,
+            backup_message: None,
+            backup_warned: false,
             calendar: CalendarState::default(),
             toast: None,
             shortcuts: false,
@@ -487,6 +497,18 @@ impl Session {
         self.toast = Some((msg.into(), ui.input(|i| i.time)));
     }
 
+    /// Says once when the backup copy stops working, and when it works again.
+    fn announce_backup_problem(&mut self, ui: &Ui) {
+        let problem = self.vault.backup_copy().and_then(|c| c.problem.clone());
+        if problem.is_some() != self.backup_warned {
+            self.backup_warned = problem.is_some();
+            self.notify(ui, match problem {
+                Some(problem) => format!("The backup copy couldn't be saved. {problem}"),
+                None => "The backup copy is saving again".to_string(),
+            });
+        }
+    }
+
     /// Draws the unlocked app. Returns what to do once nothing is left unsaved.
     fn ui(&mut self, ui: &mut Ui) -> Option<Leave> {
         let now = ui.input(|i| i.time);
@@ -498,6 +520,7 @@ impl Session {
         if let Some(msg) = self.notice.take() {
             self.notify(ui, msg);
         }
+        self.announce_backup_problem(ui);
 
         if ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::L))) {
             lock = true;
@@ -528,6 +551,7 @@ impl Session {
             .show(ui, |ui| self.central(ui));
         self.toast(ui);
         self.shortcuts(ui);
+        self.timetable_dialog(ui);
         self.dialogs(ui);
 
         // Every edit needs a click, key press or drag; frames from just moving
@@ -757,6 +781,12 @@ impl Session {
                                         .on_hover_text("The data file was changed somewhere else");
                                     return;
                                 }
+                                // Saved, but not to the backup copy. The row has no room for more.
+                                SaveStatus::Saved if let Some(problem) = self.vault.backup_copy().and_then(|c| c.problem.as_deref()) => (
+                                    format!("{} Saved", icons::WARNING),
+                                    theme::fg(ui, theme::AMBER),
+                                    format!("Your data is saved, but the backup copy couldn't be. {problem}\nSee Settings › Backup copy."),
+                                ),
                                 SaveStatus::Saved => (
                                     format!("{} Saved", icons::FLOPPY_DISK),
                                     theme::fg(ui, theme::GREEN),
@@ -856,6 +886,7 @@ impl Session {
             }
             FormAction::Reveal => self.revealed = Some(id),
             FormAction::Hide => self.revealed = None,
+            FormAction::Timetable => self.timetable = Some(TimetableDialog::new(id, &self.db.settings, widgets::today())),
         }
     }
 
@@ -906,7 +937,11 @@ impl Session {
                     }
                     CalAction::Move(event, date) => {
                         if self.db.move_event(&event, date) {
-                            self.notify(ui, format!("Moved to {}", date.format("%a %d %b")));
+                            let mut msg = format!("Moved to {}", date.format("%a %d %b"));
+                            if let Some(block) = self.db.clash(event.student_id, date, event.time) {
+                                msg.push_str(&format!(" – but it clashes with the student's timetable: busy {}", block.label()));
+                            }
+                            self.notify(ui, msg);
                         }
                     }
                     CalAction::Edit(event, details) => {
@@ -974,6 +1009,8 @@ impl Session {
                     weak_password: self.weak_password,
                     password: &mut self.password_form,
                     key_file: &mut self.key_form,
+                    backup_copy: self.vault.backup_copy(),
+                    backup_message: &self.backup_message,
                 };
                 match settings::show(ui, &mut self.db.settings, &in_use, security) {
                     SettingsAction::None => {}
@@ -981,6 +1018,13 @@ impl Session {
                     SettingsAction::ChangePassword => self.change_password(ui),
                     SettingsAction::AddKeyFile => self.start_key_file(),
                     SettingsAction::RemoveKeyFile => self.remove_key_file(ui),
+                    SettingsAction::ChooseBackupFolder => {
+                        if let Some(folder) = rfd::FileDialog::new().set_title("Choose a folder for the backup copy").pick_folder() {
+                            self.set_backup_folder(ui, &folder);
+                        }
+                    }
+                    SettingsAction::BackupNow => self.backup_now(ui),
+                    SettingsAction::StopBackup => self.stop_backup(ui),
                 }
             }
         }
@@ -1178,6 +1222,34 @@ impl Session {
         })
     }
 
+    fn set_backup_folder(&mut self, ui: &Ui, folder: &std::path::Path) {
+        self.wait_for_save(ui);
+        let before = self.vault.backup_copy().map(|c| c.file.clone());
+        let result = self.vault.set_backup_folder(Some(folder), &self.db);
+        let moved = before.filter(|file| Some(file) != self.vault.backup_copy().map(|c| &c.file));
+        self.backup_message = Some(match (result, moved) {
+            (Ok(()), Some(old)) => (true, format!("Saved there. The old copy stays at {}; delete it if you don't need it.", old.display())),
+            (Ok(()), None) => (true, "Saved there. Every save now goes there too.".into()),
+            (Err(e), _) => (false, format!("{e:#}")),
+        });
+    }
+
+    fn backup_now(&mut self, ui: &Ui) {
+        self.wait_for_save(ui);
+        // A failure shows with the folder in Settings, and goes once it works.
+        self.backup_message = self.vault.backup_now(&self.db).ok().map(|()| (true, "Copy saved.".to_string()));
+    }
+
+    fn stop_backup(&mut self, ui: &Ui) {
+        self.wait_for_save(ui);
+        let file = self.vault.backup_copy().map(|c| c.file.clone());
+        self.backup_message = Some(match (self.vault.set_backup_folder(None, &self.db), file) {
+            (Ok(()), Some(file)) => (true, format!("Turned off. The copy stays at {}; delete it if you don't need it.", file.display())),
+            (Ok(()), None) => (true, "Turned off.".into()),
+            (Err(e), _) => (false, format!("{e:#}")),
+        });
+    }
+
     /// Adding a key file, step 1: check the password and put the key file in
     /// place on this computer. The data file is re-keyed only after a backup
     /// copy has been saved (see `dialogs`).
@@ -1246,6 +1318,21 @@ impl Session {
             ),
             Err(e) => (false, e),
         });
+    }
+
+    /// The open student's timetable, if any.
+    fn timetable_dialog(&mut self, ui: &mut Ui) {
+        let Some(dialog) = &mut self.timetable else { return };
+        let id = dialog.student;
+        let hidden = if self.private { self.peek != Some(id) } else { self.hidden.contains(&id) };
+        let Database { settings, students, .. } = &mut self.db;
+        let open = students.iter_mut().find(|s| s.id == id).is_some_and(|student| {
+            let name = if hidden { "•".repeat(10) } else { student.display_name() };
+            timetable::show(ui, dialog, student, settings, &name)
+        });
+        if !open {
+            self.timetable = None;
+        }
     }
 
     fn dialogs(&mut self, ui: &mut Ui) {
@@ -1371,7 +1458,13 @@ impl Session {
                         .set_file_name("supervisor-key.bin")
                         .save_file()
                 {
-                    match storage::save_key_backup(&setup.key, &dest, &data_file) {
+                    let beside_copy = self.vault.backup_copy().is_some_and(|c| storage::same_folder(&dest, &c.file));
+                    let saved = if beside_copy {
+                        Err(anyhow::anyhow!("Choose another place: a key file next to the backup copy of your data would protect nothing."))
+                    } else {
+                        storage::save_key_backup(&setup.key, &dest, &data_file)
+                    };
+                    match saved {
                         Ok(()) => {
                             setup.backup = Some(dest);
                             setup.error = None;
@@ -2918,6 +3011,480 @@ mod ui_tests {
         h.key_press(egui::Key::F1);
         h.run_steps(3);
         assert!(h.query_by_label("Save now").is_some(), "F1 opens it too");
+    }
+
+    /// A project student with a meeting next Monday at 10:00, and semester 1
+    /// teaching around it. The dates follow today, so the meeting is always to come.
+    fn student_with_meeting(h: &mut Harness<'_, SupervisorApp>, time: Option<NaiveTime>) -> Uuid {
+        let s = session(h);
+        let today = widgets::today();
+        s.db.settings.sem1_start = Some(s.db.settings.week_start(today));
+        s.db.settings.sem2_start = Some(today + Days::weeks(26));
+        let student = Student {
+            name: "Timetabled Student".into(),
+            fyp: Some(FypRecord {
+                programme: "BEng".into(),
+                meetings: vec![Meeting {
+                    date: Some(next_monday()),
+                    time,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let id = student.id;
+        s.db.students.push(student);
+        s.view = View::List(Category::Projects("BEng".into()));
+        s.selected = Some(id);
+        id
+    }
+
+    fn next_monday() -> chrono::NaiveDate {
+        let today = widgets::today();
+        today + Days::days(7 - i64::from(today.weekday().num_days_from_monday()))
+    }
+
+    fn at(hour: u32, minute: u32) -> Option<NaiveTime> {
+        NaiveTime::from_hms_opt(hour, minute, 0)
+    }
+
+    fn slots(h: &mut Harness<'_, SupervisorApp>, id: Uuid) -> Vec<BusySlot> {
+        session(h).db.student(id).unwrap().timetable.s1.clone()
+    }
+
+    /// How many things on screen say `text`.
+    fn shows(h: &Harness<'_, SupervisorApp>, text: &str) -> usize {
+        h.query_all_by_label_contains(text).count()
+    }
+
+    fn slot_rect(h: &Harness<'_, SupervisorApp>, label: &str) -> egui::Rect {
+        h.get_by_label(label).rect()
+    }
+
+    #[test]
+    fn timetable_is_ticked_and_dragged_in_its_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let id = student_with_meeting(&mut h, at(10, 0));
+        h.run_steps(3);
+        assert!(!all_text(&h).contains("Clashes"), "nothing to clash with yet");
+
+        let name_shown = shows(&h, "Timetabled Student");
+        h.get_by_label("Timetable").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Done").is_some());
+        assert_eq!(shows(&h, "Timetabled Student"), name_shown + 1, "the dialog says whose it is");
+        shot(&mut h, "30_timetable_empty");
+
+        // A click ticks an hour, and another click clears it.
+        h.get_by_label("Tue 11:15–12:00").click();
+        h.run_steps(3);
+        assert_eq!(slots(&mut h, id), [BusySlot { day: 1, hour: 11 }]);
+        h.get_by_label("Tue 11:15–12:00").click();
+        h.run_steps(3);
+        assert!(slots(&mut h, id).is_empty());
+        // Held down for a moment, it still only changes once.
+        let press = slot_rect(&h, "Tue 11:15–12:00").center();
+        h.hover_at(press);
+        h.run_steps(1);
+        h.drag_at(press);
+        h.run_steps(3);
+        h.drop_at(press);
+        h.run_steps(3);
+        assert_eq!(slots(&mut h, id), [BusySlot { day: 1, hour: 11 }]);
+        // And Space does the same from the keyboard.
+        h.get_by_label("Tue 11:15–12:00").focus();
+        h.run_steps(1);
+        h.key_press(egui::Key::Space);
+        h.run_steps(3);
+        assert!(slots(&mut h, id).is_empty());
+
+        // A drag marks every hour it passes over, even when the pointer jumps.
+        let from = slot_rect(&h, "Mon 09:15–10:00").center();
+        let mid = slot_rect(&h, "Mon 10:15–11:00").center();
+        let to = slot_rect(&h, "Mon 12:15–13:00").center();
+        h.hover_at(from);
+        h.run_steps(1);
+        h.drag_at(from);
+        h.run_steps(2);
+        h.hover_at(mid);
+        h.run_steps(2);
+        h.hover_at(to);
+        h.run_steps(2);
+        h.drop_at(to);
+        h.run_steps(3);
+        let hours = |h: &mut Harness<'_, SupervisorApp>| slots(h, id).iter().map(|s| (s.day, s.hour)).collect::<Vec<_>>();
+        assert_eq!(hours(&mut h), [(0, 9), (0, 10), (0, 11), (0, 12)]);
+        assert!(h.query_by_label_contains("meeting still to come clashes").is_some(), "names the meeting it now clashes with");
+        shot(&mut h, "31_timetable_filled");
+
+        // Dragging from a busy hour clears instead.
+        let from = slot_rect(&h, "Mon 12:15–13:00").center();
+        let to = slot_rect(&h, "Mon 11:15–12:00").center();
+        h.hover_at(from);
+        h.run_steps(1);
+        h.drag_at(from);
+        h.run_steps(2);
+        h.hover_at(to);
+        h.run_steps(2);
+        h.drop_at(to);
+        h.run_steps(3);
+        assert_eq!(hours(&mut h), [(0, 9), (0, 10)]);
+
+        // Semester 2 has its own timetable, and can start from semester 1's.
+        h.get_by_label("Semester 2").click();
+        h.run_steps(3);
+        h.get_by_label("Copy Semester 1").click();
+        h.run_steps(3);
+        assert_eq!(session(&mut h).db.student(id).unwrap().timetable.s2.len(), 2);
+        h.get_by_label(&format!("{} Clear", icons::TRASH)).click();
+        h.run_steps(3);
+        assert!(session(&mut h).db.student(id).unwrap().timetable.s2.is_empty());
+        assert_eq!(slots(&mut h, id).len(), 2, "semester 1 is untouched");
+
+        h.get_by_label("Done").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Done").is_none(), "closed");
+        // Back on the student: the meeting at 10:00 is in the way.
+        assert!(h.query_by_label_contains("Clashes with the student's timetable: busy 09:15–11:00").is_some());
+        h.set_size(egui::vec2(1360.0, 1900.0));
+        shot(&mut h, "32_meeting_clash");
+
+        // It is kept in the encrypted file.
+        wait_until(&mut h, "saved", all_saved);
+        let saved = storage::read_database(&path, PASSWORD, None).unwrap();
+        assert_eq!(saved.student(id).unwrap().timetable.s1.len(), 2);
+    }
+
+    #[test]
+    fn choosing_a_time_warns_of_a_clash_as_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = create_and_unlock(&dir.path().join("data.svt"), false);
+        let id = student_with_meeting(&mut h, None);
+        let monday_nine = BusySlot { day: 0, hour: 9 };
+        session(&mut h).db.student_mut(id).unwrap().timetable.s1.push(monday_nine);
+        h.run_steps(3);
+        // With only a date, it says when the student is busy that day.
+        assert!(h.query_by_label_contains("The student is busy that day: 09:15–10:00").is_some());
+        assert!(h.query_by_label_contains("Clashes").is_none());
+        let set_time = |h: &mut Harness<'_, SupervisorApp>, time| {
+            let s = session(h);
+            s.db.student_mut(id).unwrap().fyp.as_mut().unwrap().meetings[0].time = time;
+            h.run_steps(3);
+        };
+        set_time(&mut h, at(9, 30));
+        assert!(h.query_by_label_contains("Clashes with the student's timetable: busy 09:15–10:00").is_some());
+        set_time(&mut h, at(10, 0));
+        assert!(h.query_by_label_contains("Clashes").is_none(), "free after the lecture");
+        assert!(h.query_by_label_contains("busy that day").is_none(), "only until a time is chosen");
+
+        // A repeating meeting is checked week by week.
+        {
+            let s = session(&mut h);
+            let m = &mut s.db.student_mut(id).unwrap().fyp.as_mut().unwrap().meetings[0];
+            m.time = at(9, 30);
+            m.repeat = Some(Repeat { until: m.date.map(|d| d + Days::weeks(2)), ..Default::default() });
+        }
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("3 weeks clash with the student's timetable").is_some());
+    }
+
+    #[test]
+    fn calendar_dialogs_warn_of_a_clash_and_dragging_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = create_and_unlock(&dir.path().join("data.svt"), false);
+        let id = student_with_meeting(&mut h, at(9, 30));
+        let monday = next_monday();
+        {
+            let s = session(&mut h);
+            let student = s.db.student_mut(id).unwrap();
+            student.timetable.s1.push(BusySlot { day: 0, hour: 9 });
+            // The Tuesday, which is free; the Monday is in the same row of the grid.
+            student.fyp.as_mut().unwrap().meetings[0].date = Some(monday + Days::days(1));
+            s.view = View::Calendar;
+            s.selected = None;
+            s.calendar.layout = calendar::Layout::Month;
+            s.calendar.month = monday.with_day(1).unwrap();
+        }
+        h.set_size(egui::vec2(1360.0, 1400.0));
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        let alert = "clashes with the student's timetable: busy 09:15–10:00";
+        let edit_dialog_warns = |h: &mut Harness<'_, SupervisorApp>| {
+            h.get_by_label_contains("09:30").click_secondary();
+            h.run_steps(3);
+            h.get_by_label(&format!("{} Edit…", icons::PENCIL_SIMPLE)).click();
+            h.run_steps(3);
+            let warns = h.query_by_label_contains("Clashes with the student's timetable: busy 09:15–10:00").is_some();
+            h.get_by_label("Cancel").click();
+            h.run_steps(3);
+            warns
+        };
+        assert!(!edit_dialog_warns(&mut h), "free on the Tuesday");
+
+        // Drag it onto the Monday: the message says it now clashes.
+        let from = h.get_by_label_contains("09:30").rect().center();
+        let day = monday.day().to_string();
+        let to = h
+            .get_all_by_label(&day)
+            .map(|n| n.rect().center())
+            .find(|c| (c.y - from.y).abs() < 60.0)
+            .expect("the Monday is in the same row")
+            + egui::vec2(20.0, 30.0);
+        h.drag_at(from);
+        h.run_steps(1);
+        h.hover_at(from + egui::vec2(10.0, 5.0));
+        h.run_steps(1);
+        h.hover_at(to);
+        h.run_steps(1);
+        h.drop_at(to);
+        h.run_steps(3);
+        let moved = session(&mut h).db.student(id).unwrap().fyp.as_ref().unwrap().meetings[0].date;
+        assert_eq!(moved, Some(monday));
+        assert!(h.query_by_label_contains(alert).is_some(), "the message warns");
+        assert!(edit_dialog_warns(&mut h), "and so does the edit dialog");
+    }
+
+    #[test]
+    fn calendar_shows_timetables_only_when_switched_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = create_and_unlock(&dir.path().join("data.svt"), false);
+        let id = student_with_meeting(&mut h, at(12, 0));
+        {
+            let s = session(&mut h);
+            s.selected = None;
+            s.view = View::Calendar;
+            s.calendar.layout = calendar::Layout::Month;
+            s.calendar.month = next_monday().with_day(1).unwrap();
+        }
+        h.set_size(egui::vec2(1360.0, 1400.0));
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        let pill = format!("{}  Timetables", icons::CLOCK);
+        assert!(h.query_by_label(&pill).is_none(), "no timetables, no toggle");
+
+        session(&mut h).db.student_mut(id).unwrap().timetable.s1.push(BusySlot { day: 0, hour: 9 });
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        let busy = format!("{} 09:15–10:00 Timetabled Student", icons::CLOCK);
+        assert!(!session(&mut h).calendar.timetables, "off to begin with");
+        assert!(h.query_by_label(&pill).is_some());
+        assert!(h.query_by_label_contains("09:15–10:00").is_none(), "nothing shows until it is on");
+
+        h.get_by_label(&pill).click();
+        h.run_steps(3);
+        assert!(shows(&h, &busy) > 0, "shows in the month");
+        shot(&mut h, "33_calendar_timetables_month");
+
+        // They can't be selected, and aren't events: no export can include them.
+        h.get_by_label("Select all shown").click();
+        h.run_steps(3);
+        let s = session(&mut h);
+        assert_eq!(s.calendar.selected.len(), 1, "only the meeting");
+        assert!(s.derived().events.iter().all(|e| !e.title.contains("09:15")));
+        s.calendar.selected.clear();
+
+        // In the list they go under each week.
+        s.calendar.layout = calendar::Layout::List;
+        s.calendar.range = calendar::Range::Upcoming;
+        h.run_steps(3);
+        assert!(shows(&h, "09:15–10:00 Timetabled Student") > 0, "shows in the list");
+        shot(&mut h, "34_calendar_timetables_list");
+
+        // Privacy mode: the times stay, the name goes.
+        session(&mut h).private = true;
+        h.run_steps(3);
+        assert_eq!(shows(&h, "Timetabled Student"), 0);
+        assert!(shows(&h, "09:15–10:00") > 0);
+        session(&mut h).private = false;
+
+        // Off again when the app next opens.
+        assert!(!CalendarState::default().timetables);
+    }
+
+    #[test]
+    fn calendar_narrows_timetables_to_one_student() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = create_and_unlock(&dir.path().join("data.svt"), false);
+        let id = student_with_meeting(&mut h, None);
+        let other = Student {
+            name: "Second Student".into(),
+            timetable: Timetable { s1: vec![BusySlot { day: 0, hour: 11 }], s2: Vec::new() },
+            ..Default::default()
+        };
+        let other_id = other.id;
+        {
+            let s = session(&mut h);
+            s.db.students.push(other);
+            s.db.student_mut(id).unwrap().timetable.s1.push(BusySlot { day: 0, hour: 9 });
+            s.selected = None;
+            s.view = View::Calendar;
+            s.calendar.layout = calendar::Layout::Month;
+            s.calendar.month = next_monday().with_day(1).unwrap();
+            s.calendar.timetables = true;
+        }
+        h.set_size(egui::vec2(1360.0, 1400.0));
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        assert!(shows(&h, "09:15–10:00 Timetabled Student") > 0);
+        assert!(shows(&h, "11:15–12:00 Second Student") > 0);
+        session(&mut h).calendar.timetable_of = Some(other_id);
+        h.run_steps(3);
+        assert_eq!(shows(&h, "09:15–10:00 Timetabled Student"), 0);
+        assert!(shows(&h, "11:15–12:00 Second Student") > 0);
+        // Forgets a student who no longer has a timetable.
+        session(&mut h).db.student_mut(other_id).unwrap().timetable = Timetable::default();
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        assert_eq!(session(&mut h).calendar.timetable_of, None);
+    }
+
+    #[test]
+    fn timetable_hides_the_name_in_privacy_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = create_and_unlock(&dir.path().join("data.svt"), false);
+        student_with_meeting(&mut h, None);
+        session(&mut h).private = true;
+        h.run_steps(3);
+        h.get_by_label("Timetable").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Done").is_some());
+        assert!(h.query_by_label_contains("Timetabled Student").is_none());
+    }
+
+    #[test]
+    fn meeting_title_and_buttons_never_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = create_and_unlock(&dir.path().join("data.svt"), false);
+        let id = student_with_meeting(&mut h, at(9, 30));
+        {
+            let s = session(&mut h);
+            let m = &mut s.db.student_mut(id).unwrap().fyp.as_mut().unwrap().meetings[0];
+            m.repeat = Some(Repeat { every_weeks: 3, until: m.date, ..Default::default() });
+        }
+        h.set_size(egui::vec2(1360.0, 2000.0));
+        h.run_steps(3);
+        let check = |h: &Harness<'_, SupervisorApp>, width: &str| {
+            let chip = h.get_by_label_contains("every 3 weeks").rect();
+            let google = h.get_by_label_contains("Google Calendar").rect();
+            let invite = h.get_by_label_contains("Invite file").rect();
+            let remove = h.get_by_label(icons::TRASH).rect();
+            for (name, other) in [("Google Calendar", google), ("Invite file", invite), ("remove", remove)] {
+                assert!(!chip.intersects(other), "{width}: the chip runs under {name}");
+            }
+            assert!(!google.intersects(invite), "{width}");
+            assert!(invite.right() <= remove.right() + 1.0, "{width}: stays inside the meeting");
+        };
+        check(&h, "usual panel");
+        shot(&mut h, "35_meeting_row");
+    }
+
+    /// Where the student's name starts in the details panel, which moves left
+    /// as the panel widens. Panels grow but don't shrink back, so each record
+    /// is measured in a new window.
+    fn panel_growth(name_of_shot: &str, add: impl FnOnce(&mut Student)) -> f32 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = create_and_unlock(&dir.path().join("data.svt"), false);
+        let id = student_with_meeting(&mut h, None);
+        h.set_size(egui::vec2(1360.0, 3400.0));
+        let name = |h: &Harness<'_, SupervisorApp>| h.get_all_by_label("Timetabled Student").map(|n| n.rect().left()).fold(0.0, f32::max);
+        session(&mut h).db.student_mut(id).unwrap().fyp = None;
+        h.run_steps(4);
+        let usual = name(&h);
+        let student = session(&mut h).db.student_mut(id).unwrap();
+        student.timetable.s1.push(BusySlot { day: 0, hour: 9 });
+        add(student);
+        h.run_steps(4);
+        shot(&mut h, name_of_shot);
+        usual - name(&h)
+    }
+
+    #[test]
+    fn visit_and_viva_rows_keep_the_panel_its_usual_width() {
+        // On the busy hour, so the clash warning shows as well.
+        let (date, time) = (Some(next_monday()), at(9, 30));
+        let visit = panel_growth("37_visit_row", |s| {
+            let mut placement = PlacementRecord::default();
+            placement.visits[0].date = date;
+            placement.visits[0].time = time;
+            s.placement = Some(placement);
+        });
+        let no_visit = panel_growth("37b_no_visit", |s| s.placement = Some(PlacementRecord::default()));
+        assert!(visit <= no_visit + 1.0, "a visit widened the panel by {} more", visit - no_visit);
+        let with_viva = panel_growth("37c_viva_row", |s| {
+            let mut phd = PhdRecord::default();
+            phd.viva = date;
+            phd.viva_time = time;
+            s.phd = Some(phd);
+        });
+        let without_viva = panel_growth("37d_no_viva", |s| s.phd = Some(PhdRecord::default()));
+        assert!(with_viva <= without_viva + 1.0, "a viva widened the panel by {} more", with_viva - without_viva);
+    }
+
+    #[test]
+    fn backup_copy_is_set_in_settings_and_problems_are_announced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let usb = dir.path().join("usb");
+        std::fs::create_dir_all(&usb).unwrap();
+        let mut h = create_and_unlock(&path, false);
+        session(&mut h).view = View::Settings;
+        h.set_size(egui::vec2(1360.0, 4200.0));
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("Off – the only backup").is_some());
+        assert!(h.query_by_label(&format!("{} Choose folder…", icons::FLOPPY_DISK)).is_some());
+        shot(&mut h, "38_backup_off");
+
+        // The folder picker can't run here; what it hands over is the same.
+        wait_until(&mut h, "saved", all_saved);
+        let s = session(&mut h);
+        s.vault.set_backup_folder(Some(&usb), &s.db).unwrap();
+        h.run_steps(3);
+        let file = session(&mut h).vault.backup_copy().unwrap().file.clone();
+        assert!(h.query_by_label_contains("On – every save also goes to").is_some());
+        assert!(h.query_by_label_contains(&file.display().to_string()).is_some());
+        assert!(h.query_by_label_contains("Last written").is_some());
+        shot(&mut h, "39_backup_on");
+
+        // An edit reaches the copy with the autosave.
+        session(&mut h).db.settings.my_name = "Edited".into();
+        h.key_press(egui::Key::F20);
+        h.run_steps(1);
+        wait_until(&mut h, "saved", all_saved);
+        assert_eq!(storage::read_database(&file, PASSWORD, None).unwrap().settings.my_name, "Edited");
+
+        // The folder goes away: the data still saves, and it says so.
+        let unplugged = dir.path().join("unplugged");
+        std::fs::rename(&usb, &unplugged).unwrap();
+        session(&mut h).db.settings.my_name = "Without the copy".into();
+        h.key_press(egui::Key::F20);
+        h.run_steps(1);
+        wait_until(&mut h, "saved", all_saved);
+        h.run_steps(3);
+        assert!(matches!(session(&mut h).status, SaveStatus::Saved), "saving isn't held up");
+        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Without the copy");
+        assert!(h.query_by_label_contains("The backup copy couldn't be saved").is_some(), "a message says so");
+        assert!(h.query_by_label_contains("The copy couldn't be saved").is_some(), "and Settings");
+        let warning = format!("{} Saved", icons::WARNING);
+        assert!(h.query_by_label(&warning).is_some(), "and the warning stays in the sidebar");
+        shot(&mut h, "40_backup_problem");
+
+        // Back again: Back up now puts it right.
+        std::fs::rename(&unplugged, &usb).unwrap();
+        h.get_by_label(&format!("{} Back up now", icons::FLOPPY_DISK)).click();
+        h.run_steps(3);
+        assert_eq!(storage::read_database(&file, PASSWORD, None).unwrap().settings.my_name, "Without the copy");
+        assert!(h.query_by_label(&warning).is_none());
+        assert!(h.query_by_label("Copy saved.").is_some());
+        assert!(h.query_by_label_contains("saving again").is_some());
+
+        h.get_by_label("Turn off").click();
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("Off – the only backup").is_some());
+        assert!(h.query_by_label_contains("The copy stays at").is_some());
+        assert!(file.exists());
     }
 
     /// A repeating meeting's student, open on the calendar with its item selected.

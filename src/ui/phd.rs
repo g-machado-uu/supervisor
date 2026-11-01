@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::model::{
     CustomStep, DefenceOutcome, FeeStatus, Funder, Lead, LeadUnit, Milestone, PhdRecord, PhdStep,
-    ResearchDegree, ResearchStatus, Settings, StudyMode, VisaType, VivaOutcome,
+    ResearchDegree, ResearchStatus, Settings, StudyMode, Timetable, VisaType, VivaOutcome,
 };
 use crate::ui::widgets::Share;
 use crate::ui::{brazil, icons, theme, widgets};
@@ -18,7 +18,7 @@ use crate::ui::{brazil, icons, theme, widgets};
 const FULL_TIME_MONTHS: u32 = 36;
 
 /// Returns the meeting (or the viva) to send, if asked.
-pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, student_id: Uuid) -> Option<Share> {
+pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, timetable: &Timetable, student_id: Uuid) -> Option<Share> {
     let mut invite = None;
     let today = widgets::today();
     details(ui, p);
@@ -143,9 +143,9 @@ pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, student_id: Uui
     let steps = p.steps();
     let viva_uid = format!("phd-viva-{student_id}");
     let invite_viva = if br {
-        theme::section(ui, "Defence & award", |ui| defence(ui, p, &steps, today, &viva_uid))
+        theme::section(ui, "Defence & award", |ui| defence(ui, p, &steps, today, &viva_uid, (settings, timetable)))
     } else {
-        theme::section(ui, "Viva & award", |ui| viva(ui, p, &steps, today, &viva_uid))
+        theme::section(ui, "Viva & award", |ui| viva(ui, p, &steps, today, &viva_uid, (settings, timetable)))
     };
     if let Some(share) = invite_viva.flatten() {
         invite = Some(share);
@@ -153,7 +153,7 @@ pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, student_id: Uui
 
     ui.add_space(10.0);
     let meetings = theme::section(ui, "Supervision meetings", |ui| {
-        widgets::meetings_editor(ui, "phd-meetings", &mut p.meetings, None, settings)
+        widgets::meetings_editor(ui, "phd-meetings", &mut p.meetings, None, settings, timetable)
     });
     if let Some(share) = meetings.flatten() {
         invite = Some(share);
@@ -163,15 +163,14 @@ pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, student_id: Uui
 
 /// The viva, its outcome, amendments and award. Returns the viva (`uid`)
 /// if it is to be sent.
-fn viva(ui: &mut Ui, p: &mut PhdRecord, steps: &[PhdStep], today: NaiveDate, uid: &str) -> Option<Share> {
+fn viva(ui: &mut Ui, p: &mut PhdRecord, steps: &[PhdStep], today: NaiveDate, uid: &str, clash: (&Settings, &Timetable)) -> Option<Share> {
     let mut invite = None;
+    ui.horizontal_wrapped(|ui| {
+        invite = widgets::share_buttons(ui, p.viva.is_some(), || uid.to_string());
+    });
     widgets::form_grid(ui, "phd-viva", |ui| {
         ui.label("Viva date / time");
-        ui.horizontal(|ui| {
-            widgets::opt_date(ui, "viva", &mut p.viva);
-            widgets::opt_time(ui, "viva-time", &mut p.viva_time);
-            invite = widgets::share_buttons(ui, p.viva.is_some(), || uid.to_string());
-        });
+        widgets::date_time_cell(ui, &mut p.viva, &mut p.viva_time, Some(clash));
         ui.end_row();
         ui.label("Viva location");
         widgets::text_field(ui, &mut p.viva_location, "Room / location");
@@ -204,15 +203,14 @@ fn viva(ui: &mut Ui, p: &mut PhdRecord, steps: &[PhdStep], today: NaiveDate, uid
 
 /// The defence of a Brazilian programme: date, committee, result, final
 /// version and award. Returns the defence (`uid`) if it is to be sent.
-fn defence(ui: &mut Ui, p: &mut PhdRecord, steps: &[PhdStep], today: NaiveDate, uid: &str) -> Option<Share> {
+fn defence(ui: &mut Ui, p: &mut PhdRecord, steps: &[PhdStep], today: NaiveDate, uid: &str, clash: (&Settings, &Timetable)) -> Option<Share> {
     let mut invite = None;
+    ui.horizontal_wrapped(|ui| {
+        invite = widgets::share_buttons(ui, p.viva.is_some(), || uid.to_string());
+    });
     widgets::form_grid(ui, "phd-defence", |ui| {
         ui.label("Defence date / time");
-        ui.horizontal(|ui| {
-            widgets::opt_date(ui, "viva", &mut p.viva);
-            widgets::opt_time(ui, "viva-time", &mut p.viva_time);
-            invite = widgets::share_buttons(ui, p.viva.is_some(), || uid.to_string());
-        });
+        widgets::date_time_cell(ui, &mut p.viva, &mut p.viva_time, Some(clash));
         ui.end_row();
         ui.label("Location");
         widgets::text_field(ui, &mut p.viva_location, "Room, auditorium or link");

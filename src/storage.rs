@@ -160,8 +160,74 @@ pub struct Vault {
     /// The `.bak` was written this session, so it holds the file as it was
     /// when unlocked; later saves leave it alone.
     backed_up: bool,
+    /// Also keep a copy in a folder of the user's choice.
+    copy: Option<BackupCopy>,
     /// Held while unlocked so a second window can't open the same file.
     _lock: Option<fs::File>,
+}
+
+/// A copy of the data file in a folder of the user's choice (another drive, a
+/// USB stick), replaced on every save. It is the sealed bytes, written from
+/// memory, so it is as encrypted as the data file and damage to that file on
+/// disk can't reach it. A problem with it never stops the data file saving.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupCopy {
+    pub file: PathBuf,
+    /// When it was last written, if it is there.
+    pub saved: Option<SystemTime>,
+    /// Why the last attempt failed, or the folder couldn't be reached on unlocking.
+    pub problem: Option<String>,
+}
+
+impl BackupCopy {
+    /// The copy in `folder` of the data file at `data`. The name holds a code
+    /// for the data file, so that two called `data.svt` don't replace each
+    /// other's copy in one folder.
+    fn new(data: &Path, folder: &Path) -> Self {
+        let stem = data.file_stem().unwrap_or_default().to_string_lossy();
+        Self {
+            file: folder.join(format!("{stem}-backup-{}.svt", &path_code(data)[..8])),
+            saved: None,
+            problem: None,
+        }
+    }
+
+    /// The copy of the data file at `data` this computer was asked to keep, as it is now.
+    fn remembered(data: &Path) -> Option<Self> {
+        let folder = fs::read_to_string(copy_config(data)?).ok()?;
+        let folder = Path::new(folder.trim());
+        let mut copy = Self::new(data, folder);
+        if folder.is_dir() {
+            copy.saved = fs::metadata(&copy.file).and_then(|m| m.modified()).ok();
+        } else {
+            copy.problem = Some(FOLDER_MISSING.into());
+        }
+        Some(copy)
+    }
+
+    fn note(&mut self, written: Result<SystemTime, String>) {
+        match written {
+            Ok(time) => {
+                self.saved = Some(time);
+                self.problem = None;
+            }
+            Err(problem) => self.problem = Some(problem),
+        }
+    }
+}
+
+const FOLDER_MISSING: &str = "The folder isn't available. If it's on a USB stick or network drive, check that it's connected.";
+
+/// Write the copy. The folder is not created if missing: with a USB stick
+/// unplugged, that would quietly put the copy on this computer instead.
+fn write_copy(file: &Path, bytes: &[u8]) -> Result<SystemTime, String> {
+    if file.parent().is_none_or(|folder| !folder.is_dir()) {
+        return Err(FOLDER_MISSING.into());
+    }
+    match write_atomic(file, bytes) {
+        Ok(meta) => Ok(meta.modified().unwrap_or_else(|_| SystemTime::now())),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// What the data file was when last read or written. Its length and
@@ -368,6 +434,7 @@ impl Vault {
             seal: Seal::new(password, None, params)?,
             on_disk: None,
             backed_up: false,
+            copy: None,
         };
         // Refuses if a file appeared there in the meantime.
         vault.save(db)?;
@@ -386,6 +453,7 @@ impl Vault {
             seal,
             on_disk: Some(OnDisk::of(&bytes, &meta)),
             backed_up: false,
+            copy: BackupCopy::remembered(path),
             _lock: lock,
         };
         Ok((vault, db))
@@ -430,7 +498,53 @@ impl Vault {
             path: self.path.clone(),
             on_disk: self.on_disk,
             backup: !self.backed_up,
+            copy: self.copy.as_ref().map(|c| c.file.clone()),
         }
+    }
+
+    pub fn backup_copy(&self) -> Option<&BackupCopy> {
+        self.copy.as_ref()
+    }
+
+    /// Keep a copy in `folder` from now on (written straight away, so a
+    /// folder that doesn't work is found out now), or with `None`, stop. A
+    /// copy already written stays where it is. Remembered on this computer
+    /// only: a folder here may mean nothing on another computer sharing the file.
+    pub fn set_backup_folder(&mut self, folder: Option<&Path>, db: &Database) -> Result<()> {
+        let config = copy_config(&self.path).context("no folder for settings on this computer")?;
+        let Some(folder) = folder else {
+            if let Err(e) = fs::remove_file(&config)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                return Err(e).context("forgetting the backup folder");
+            }
+            self.copy = None;
+            return Ok(());
+        };
+        let mut copy = BackupCopy::new(&self.path, folder);
+        if same_folder(&copy.file, &self.path) {
+            bail!("Choose another folder: this is where the data file is, so a problem there would take both.");
+        }
+        if key_file_path().is_some_and(|k| same_folder(&copy.file, &k)) {
+            bail!("Choose another folder: a copy next to the key file would let anyone with that folder open it with just the password.");
+        }
+        let written = write_copy(&copy.file, &self.seal(db)?).map_err(|e| anyhow!(e))?;
+        copy.note(Ok(written));
+        if let Some(dir) = config.parent() {
+            create_private_dir(dir)?;
+        }
+        write_atomic(&config, folder.to_string_lossy().as_bytes()).context("remembering the backup folder")?;
+        self.copy = Some(copy);
+        Ok(())
+    }
+
+    /// Write the copy now, with the data as it is. The result is also in [`Vault::backup_copy`].
+    pub fn backup_now(&mut self, db: &Database) -> Result<()> {
+        let bytes = self.seal(db)?;
+        let Some(copy) = &mut self.copy else { return Ok(()) };
+        let written = write_copy(&copy.file, &bytes);
+        copy.note(written.clone());
+        written.map(|_| ()).map_err(|e| anyhow!(e))
     }
 
     /// Make the file as it is now the next `.bak`: the next save backs it
@@ -443,6 +557,13 @@ impl Vault {
     pub fn saved(&mut self, written: Written) {
         self.on_disk = Some(written.on_disk);
         self.backed_up |= written.backed_up;
+        self.note_copy(written.copied);
+    }
+
+    fn note_copy(&mut self, written: Option<Result<SystemTime, String>>) {
+        if let (Some(copy), Some(written)) = (&mut self.copy, written) {
+            copy.note(written);
+        }
     }
 
     /// Whether `password` is the one the file is sealed with (no disk access).
@@ -470,7 +591,10 @@ impl Vault {
         }
         let next = Seal::new(password, key_file, self.seal.params.at_least_default())?;
         let bytes = sealed(&next, db)?;
-        self.on_disk = Some(self.writer().put(&bytes, true, false)?.on_disk);
+        // The copy is re-sealed here too, so the old password stops opening it.
+        let written = self.writer().put(&bytes, true, false)?;
+        self.on_disk = Some(written.on_disk);
+        self.note_copy(written.copied);
         self.seal = next;
         // The backup is still sealed the old way; don't leave it behind. The
         // next save backs up the file as it is now.
@@ -510,12 +634,16 @@ pub struct Writer {
     on_disk: Option<OnDisk>,
     /// Keep the file as it is now as the `.bak` first.
     backup: bool,
+    /// Also write the same bytes here, once the data file is safely written.
+    copy: Option<PathBuf>,
 }
 
 /// A finished [`Writer::write`], for [`Vault::saved`].
 pub struct Written {
     on_disk: OnDisk,
     backed_up: bool,
+    /// How writing the copy went, if there is one.
+    copied: Option<Result<SystemTime, String>>,
 }
 
 impl Writer {
@@ -556,6 +684,7 @@ impl Writer {
         Ok(Written {
             on_disk: OnDisk::of(bytes, &meta),
             backed_up,
+            copied: self.copy.as_deref().map(|file| write_copy(file, bytes)),
         })
     }
 }
@@ -738,6 +867,22 @@ fn canonical(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
+/// A code for the file at `path` on this computer.
+fn path_code(path: &Path) -> String {
+    hex(&hash(canonical(path).as_os_str().as_encoded_bytes())[..16])
+}
+
+/// Where this computer remembers the backup folder of the data file at `data`.
+fn copy_config(data: &Path) -> Option<PathBuf> {
+    // Tests open throwaway files; keep their settings out of the real app folder.
+    let dir = if cfg!(test) {
+        Some(std::env::temp_dir().join("supervisor-test-config"))
+    } else {
+        project_dirs().map(|d| d.config_dir().to_path_buf())
+    };
+    Some(dir?.join(format!("backup-{}.txt", path_code(data))))
+}
+
 /// Take this computer's lock on `path` for as long as the file is unlocked.
 /// Lock files live in the app's own folder rather than next to the data file,
 /// so nothing extra lands in a synced folder; another computer writing the
@@ -753,7 +898,7 @@ fn lock_file(path: &Path) -> Result<Option<fs::File>> {
     if create_private_dir(&dir).is_err() {
         return Ok(None);
     }
-    let name = hex(&hash(canonical(path).as_os_str().as_encoded_bytes())[..16]);
+    let name = path_code(path);
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -1023,6 +1168,7 @@ mod tests {
             seal: Seal::new("pw", None, FAST).unwrap(),
             on_disk: Some(OnDisk::of(&fs::read(&path).unwrap(), &meta)),
             backed_up: true,
+            copy: None,
             _lock: None,
         };
         other.save(&theirs).unwrap();
@@ -1120,6 +1266,163 @@ mod tests {
         fs::create_dir_all(&usb).unwrap();
         save_key_backup(&key, &usb.join("key-backup.bin"), &data).unwrap();
         assert_eq!(KeyFile::read(&usb.join("key-backup.bin")).unwrap().id(), key.id());
+    }
+
+    /// A vault on a data file in one folder, and another folder for its copy.
+    fn vault_and_folder(dir: &tempfile::TempDir) -> (Vault, PathBuf, Database) {
+        let data = dir.path().join("data");
+        let folder = dir.path().join("usb");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&folder).unwrap();
+        let db = sample();
+        (Vault::create_with_params(&data.join("data.svt"), "pw", &db, FAST).unwrap(), folder, db)
+    }
+
+    fn copy_file(vault: &Vault) -> PathBuf {
+        vault.backup_copy().unwrap().file.clone()
+    }
+
+    #[test]
+    fn backup_copy_follows_every_save_and_is_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut vault, folder, mut db) = vault_and_folder(&dir);
+        vault.set_backup_folder(Some(&folder), &db).unwrap();
+        let file = copy_file(&vault);
+        assert!(file.starts_with(&folder));
+        assert_eq!(file.extension().unwrap(), "svt", "the unlock screen can open it");
+        // Written straight away, before any save.
+        assert_eq!(read_database(&file, "pw", None).unwrap(), db);
+        assert!(!fs::read(&file).unwrap().windows(5).any(|w| w == b"Grace"), "encrypted");
+
+        db.students[0].name = "Saved".into();
+        vault.save(&db).unwrap();
+        assert_eq!(read_database(&file, "pw", None).unwrap().students[0].name, "Saved");
+        assert_eq!(fs::read(&file).unwrap(), fs::read(vault.path()).unwrap());
+        let names: Vec<_> = fs::read_dir(&folder).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 1, "no temp files or backups of the backup: {names:?}");
+        assert!(vault.backup_copy().unwrap().saved.is_some());
+        assert_eq!(vault.backup_copy().unwrap().problem, None);
+
+        // Overwriting after a conflict counts as a save too.
+        fs::write(vault.path(), b"someone else's version").unwrap();
+        db.students[0].name = "Conflict".into();
+        assert_eq!(error_of(vault.save(&db)), Some(VaultError::ChangedOnDisk));
+        assert_eq!(read_database(&file, "pw", None).unwrap().students[0].name, "Saved", "nothing saved, nothing copied");
+        vault.overwrite(&db).unwrap();
+        assert_eq!(read_database(&file, "pw", None).unwrap().students[0].name, "Conflict");
+    }
+
+    #[test]
+    fn data_file_saves_while_the_backup_folder_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut vault, folder, mut db) = vault_and_folder(&dir);
+        vault.set_backup_folder(Some(&folder), &db).unwrap();
+        let file = copy_file(&vault);
+        let unplugged = dir.path().join("unplugged");
+        fs::rename(&folder, &unplugged).unwrap();
+
+        db.students[0].name = "While away".into();
+        vault.save(&db).unwrap();
+        assert_eq!(read_database(vault.path(), "pw", None).unwrap().students[0].name, "While away");
+        assert!(vault.backup_copy().unwrap().problem.as_deref().unwrap().contains("isn't available"));
+        assert!(!folder.exists(), "the folder isn't made on this computer instead");
+        assert!(vault.backup_now(&db).is_err());
+
+        // Back again: the next save puts it right, and reports that it did.
+        fs::rename(&unplugged, &folder).unwrap();
+        vault.save(&db).unwrap();
+        assert_eq!(vault.backup_copy().unwrap().problem, None);
+        assert_eq!(read_database(&file, "pw", None).unwrap().students[0].name, "While away");
+        // So does asking for it, with nothing new to save.
+        fs::remove_file(&file).unwrap();
+        vault.backup_now(&db).unwrap();
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn backup_folder_is_checked_and_nothing_changes_if_it_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut vault, folder, db) = vault_and_folder(&dir);
+        let beside_the_data = vault.path().parent().unwrap().to_path_buf();
+        assert!(vault.set_backup_folder(Some(&beside_the_data), &db).is_err());
+        assert!(vault.set_backup_folder(Some(&dir.path().join("no-such-folder")), &db).is_err());
+        assert!(vault.backup_copy().is_none());
+        assert!(!dir.path().join("no-such-folder").exists());
+        vault.set_backup_folder(Some(&folder), &db).unwrap();
+        // A failed change keeps the one that works.
+        assert!(vault.set_backup_folder(Some(&beside_the_data), &db).is_err());
+        assert!(copy_file(&vault).starts_with(&folder));
+    }
+
+    #[test]
+    fn backup_folder_is_remembered_until_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut vault, folder, db) = vault_and_folder(&dir);
+        let path = vault.path().to_path_buf();
+        vault.set_backup_folder(Some(&folder), &db).unwrap();
+        let file = copy_file(&vault);
+        drop(vault);
+
+        let (vault, _) = Vault::open(&path, "pw", None).unwrap();
+        let copy = vault.backup_copy().unwrap();
+        assert_eq!(copy.file, file);
+        assert!(copy.saved.is_some(), "says when it was last written");
+        assert_eq!(copy.problem, None);
+        drop(vault);
+
+        // Noticed on unlocking, before any work is done.
+        let unplugged = dir.path().join("unplugged");
+        fs::rename(&folder, &unplugged).unwrap();
+        let (vault, _) = Vault::open(&path, "pw", None).unwrap();
+        assert!(vault.backup_copy().unwrap().problem.is_some());
+        drop(vault);
+        fs::rename(&unplugged, &folder).unwrap();
+
+        let (mut vault, _) = Vault::open(&path, "pw", None).unwrap();
+        vault.set_backup_folder(None, &db).unwrap();
+        assert!(vault.backup_copy().is_none());
+        assert!(file.exists(), "the copy already there stays");
+        vault.set_backup_folder(None, &db).unwrap();
+        vault.save(&db).unwrap();
+        drop(vault);
+        assert!(Vault::open(&path, "pw", None).unwrap().0.backup_copy().is_none());
+    }
+
+    #[test]
+    fn backup_copy_changes_with_the_password_and_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut vault, folder, db) = vault_and_folder(&dir);
+        vault.set_backup_folder(Some(&folder), &db).unwrap();
+        let file = copy_file(&vault);
+        vault.change_password("pw", "new", &db).unwrap();
+        assert!(read_database(&file, "pw", None).is_err(), "the old password no longer opens it");
+        assert!(read_database(&file, "new", None).is_ok());
+
+        let key = KeyFile::generate();
+        vault.set_key_file("new", Some(key.clone()), &db).unwrap();
+        assert!(read_database(&file, "new", None).is_err(), "needs the key file as well");
+        assert!(read_database(&file, "new", Some(&key)).is_ok());
+
+        // Not reached: the data file is re-keyed, and the problem is reported.
+        let unplugged = dir.path().join("unplugged");
+        fs::rename(&folder, &unplugged).unwrap();
+        vault.change_password("new", "newer", &db).unwrap();
+        assert!(read_database(vault.path(), "newer", Some(&key)).is_ok());
+        assert!(vault.backup_copy().unwrap().problem.is_some());
+    }
+
+    #[test]
+    fn data_files_with_the_same_name_keep_separate_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut first, folder, db) = vault_and_folder(&dir);
+        let other = dir.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        let mut second = Vault::create_with_params(&other.join("data.svt"), "pw2", &db, FAST).unwrap();
+        first.set_backup_folder(Some(&folder), &db).unwrap();
+        second.set_backup_folder(Some(&folder), &db).unwrap();
+        assert_ne!(copy_file(&first), copy_file(&second));
+        assert!(read_database(&copy_file(&first), "pw", None).is_ok());
+        assert!(read_database(&copy_file(&second), "pw2", None).is_ok());
     }
 
     #[test]

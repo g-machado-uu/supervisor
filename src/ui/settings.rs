@@ -32,6 +32,9 @@ pub struct Security<'a> {
     pub weak_password: bool,
     pub password: &'a mut PasswordForm,
     pub key_file: &'a mut KeyFileForm,
+    pub backup_copy: Option<&'a storage::BackupCopy>,
+    /// How the last thing asked of the backup copy went.
+    pub backup_message: &'a Option<(bool, String)>,
 }
 
 pub enum SettingsAction {
@@ -40,6 +43,9 @@ pub enum SettingsAction {
     AddKeyFile,
     RemoveKeyFile,
     ExportIcs,
+    ChooseBackupFolder,
+    BackupNow,
+    StopBackup,
 }
 
 /// Choices for locking after a while without use (minutes; 0 = never).
@@ -60,7 +66,7 @@ pub fn show(
     security: Security<'_>,
 ) -> SettingsAction {
     let mut action = SettingsAction::None;
-    let Security { data_path, key_file_on, weak_password, password: pw, key_file: kf } = security;
+    let Security { data_path, key_file_on, weak_password, password: pw, key_file: kf, backup_copy, backup_message } = security;
     theme::page_header(ui, "Settings", "Academic calendar, courses, invitations, security and version", |_| {});
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.set_max_width(920.0);
@@ -291,6 +297,13 @@ pub fn show(
         });
 
         ui.add_space(8.0);
+        theme::card(ui, "Backup copy (optional)", |ui| {
+            if let Some(next) = backup_card(ui, backup_copy, backup_message) {
+                action = next;
+            }
+        });
+
+        ui.add_space(8.0);
         theme::card(ui, "Key file (optional)", |ui| {
             if key_file_on {
                 ui.colored_label(
@@ -361,6 +374,61 @@ pub fn show(
             );
         });
     });
+    action
+}
+
+/// Where the extra copy of the data file goes, and how it is doing.
+fn backup_card(ui: &mut Ui, copy: Option<&storage::BackupCopy>, message: &Option<(bool, String)>) -> Option<SettingsAction> {
+    let mut action = None;
+    match copy {
+        Some(copy) => {
+            ui.colored_label(theme::fg(ui, theme::GREEN), format!("{} On – every save also goes to:", icons::FLOPPY_DISK));
+            ui.label(copy.file.display().to_string());
+            let last = copy.saved.map_or_else(
+                || "Not written yet.".to_string(),
+                |time| format!("Last written {}.", chrono::DateTime::<chrono::Local>::from(time).format("%a %d %b %Y at %H:%M")),
+            );
+            ui.label(RichText::new(last).small().color(theme::muted(ui)));
+            if let Some(problem) = &copy.problem {
+                ui.colored_label(
+                    theme::fg(ui, theme::RED),
+                    format!("{} The copy couldn't be saved: {problem} Your data file is still saved as usual.", icons::WARNING),
+                );
+            }
+        }
+        None => {
+            ui.label("Off – the only backup is the one next to your data file.");
+        }
+    }
+    ui.label(
+        RichText::new(
+            "Choose a folder on another drive, a USB stick or a synced folder. Each save then also replaces a copy of \
+             your data file there, so a problem with one disk doesn't take both. It is just as encrypted, and opens with \
+             the same password and key file: on the unlock screen, use Open another file. The folder is remembered on \
+             this computer only. Don't keep a backup of your key file in it.",
+        )
+        .small()
+        .color(theme::muted(ui)),
+    );
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if copy.is_some() {
+            if ui.button(format!("{} Back up now", icons::FLOPPY_DISK)).clicked() {
+                action = Some(SettingsAction::BackupNow);
+            }
+            if ui.button("Change folder…").clicked() {
+                action = Some(SettingsAction::ChooseBackupFolder);
+            }
+            if ui.button("Turn off").clicked() {
+                action = Some(SettingsAction::StopBackup);
+            }
+        } else if ui.button(format!("{} Choose folder…", icons::FLOPPY_DISK)).clicked() {
+            action = Some(SettingsAction::ChooseBackupFolder);
+        }
+    });
+    if let Some((ok, msg)) = message {
+        ui.colored_label(theme::fg(ui, if *ok { theme::GREEN } else { theme::RED }), msg);
+    }
     action
 }
 

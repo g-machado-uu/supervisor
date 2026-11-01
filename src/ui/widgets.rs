@@ -6,7 +6,7 @@ use chrono::{Datelike, Local, NaiveDate, NaiveTime, Timelike};
 use egui::{RichText, Ui};
 use egui_extras::DatePickerButton;
 
-use crate::model::{Meeting, Platform, Repeat, ReplyStatus, Settings, TriState};
+use crate::model::{Meeting, Platform, Repeat, ReplyStatus, Settings, Timetable, TriState};
 use crate::ui::{icons, theme};
 
 pub fn today() -> NaiveDate {
@@ -135,6 +135,25 @@ pub fn inner_frame(ui: &Ui) -> egui::Frame {
         .inner_margin(egui::Margin::same(12))
 }
 
+/// Date and time of a visit or viva, for the second column of a `form_grid`,
+/// with the clash warning. A grid's cells have no width limit of their own, so
+/// without one here a long row would stretch the whole panel.
+pub fn date_time_cell(
+    ui: &mut Ui,
+    date: &mut Option<NaiveDate>,
+    time: &mut Option<NaiveTime>,
+    clash: Option<(&Settings, &Timetable)>,
+) {
+    ui.vertical(|ui| {
+        ui.set_max_width(240.0);
+        opt_date(ui, "date", date);
+        opt_time(ui, "time", time);
+        if let Some((settings, timetable)) = clash {
+            clash_alert(ui, settings, timetable, *date, *time);
+        }
+    });
+}
+
 /// Two-column form grid with consistent spacing.
 pub fn form_grid(ui: &mut Ui, id: impl AsIdSalt, add: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id)
@@ -158,14 +177,6 @@ pub enum Share {
 pub fn share_buttons(ui: &mut Ui, has_date: bool, uid: impl Fn() -> String) -> Option<Share> {
     let mut share = None;
     if ui
-        .add_enabled(has_date, egui::Button::new(format!("{} Invite file…", icons::PAPER_PLANE_TILT)).small())
-        .on_hover_text("Save an .ics with the student as attendee, to upload to Outlook and send")
-        .on_disabled_hover_text("Set a date first")
-        .clicked()
-    {
-        share = Some(Share::File(uid()));
-    }
-    if ui
         .add_enabled(has_date, egui::Button::new(format!("{} Google Calendar", icons::ARROW_SQUARE_OUT)).small())
         .on_hover_text(
             "Open Google Calendar in the browser with this filled in and the student as a guest. \
@@ -175,6 +186,14 @@ pub fn share_buttons(ui: &mut Ui, has_date: bool, uid: impl Fn() -> String) -> O
         .clicked()
     {
         share = Some(Share::Google(uid()));
+    }
+    if ui
+        .add_enabled(has_date, egui::Button::new(format!("{} Invite file…", icons::PAPER_PLANE_TILT)).small())
+        .on_hover_text("Save an .ics with the student as attendee, to upload to Outlook and send")
+        .on_disabled_hover_text("Set a date first")
+        .clicked()
+    {
+        share = Some(Share::File(uid()));
     }
     share
 }
@@ -187,6 +206,48 @@ pub fn week_label(settings: &Settings, date: NaiveDate) -> String {
     }
 }
 
+/// Warns if a meeting on `date` at `time` clashes with the student's
+/// timetable; without a time yet, says when they are busy that day, to help
+/// choose one. Nothing for a date gone by, when it's too late to matter.
+pub fn clash_alert(ui: &mut Ui, settings: &Settings, timetable: &Timetable, date: Option<NaiveDate>, time: Option<NaiveTime>) {
+    let Some(date) = date.filter(|d| *d >= today()) else { return };
+    match time {
+        Some(time) => {
+            if let Some(block) = timetable.clash(settings, date, time) {
+                clash_warning(ui, format!("Clashes with the student's timetable: busy {} on {}", block.label(), date.format("%a %d %b")));
+            }
+        }
+        None => {
+            let busy: Vec<String> = timetable.blocks_on(settings, date).iter().map(|b| b.label()).collect();
+            if !busy.is_empty() {
+                ui.label(
+                    RichText::new(format!("{} The student is busy that day: {}", icons::CLOCK, busy.join(", ")))
+                        .small()
+                        .color(theme::muted(ui)),
+                );
+            }
+        }
+    }
+}
+
+fn clash_warning(ui: &mut Ui, text: String) {
+    ui.colored_label(theme::fg(ui, theme::AMBER), format!("{} {text}", icons::WARNING));
+}
+
+/// `clash_alert` for a meeting: a repeating one is checked in every week still to come.
+fn meeting_clash_alert(ui: &mut Ui, m: &Meeting, settings: &Settings, timetable: &Timetable) {
+    if m.time.is_none() && !m.held {
+        clash_alert(ui, settings, timetable, m.date, None);
+    }
+    let clashes = timetable.meeting_clashes(m, settings, today());
+    let Some(first) = clashes.first() else { return };
+    let when = format!("busy {} on {}", first.block.label(), first.date.format("%a %d %b"));
+    clash_warning(ui, match clashes.len() {
+        1 => format!("Clashes with the student's timetable: {when}"),
+        n => format!("{n} weeks clash with the student's timetable, the first: {when}"),
+    });
+}
+
 /// Editable list of meetings: date, time, online (Teams / Meet) or room, repetition and
 /// notes. `first_label` names the first entry (e.g. "Semester meeting");
 /// later entries become follow-ons. Returns the meeting to send, if its
@@ -197,6 +258,7 @@ pub fn meetings_editor(
     meetings: &mut Vec<Meeting>,
     first_label: Option<&str>,
     settings: &Settings,
+    timetable: &Timetable,
 ) -> Option<Share> {
     let mut invite = None;
     ui.push_id(salt, |ui| {
@@ -227,9 +289,6 @@ pub fn meetings_editor(
                                     {
                                         remove = Some(i);
                                     }
-                                    if let Some(share) = share_buttons(ui, m.date.is_some(), || m.uid()) {
-                                        invite = Some(share);
-                                    }
                                 },
                             );
                         });
@@ -239,7 +298,15 @@ pub fn meetings_editor(
                             if m.repeat.is_none() {
                                 ui.checkbox(&mut m.held, "Held");
                             }
+                            // Here they wrap to a new line when short of room,
+                            // rather than run over the title and its chip.
+                            ui.horizontal(|ui| {
+                                if let Some(share) = share_buttons(ui, m.date.is_some(), || m.uid()) {
+                                    invite = Some(share);
+                                }
+                            });
                         });
+                        meeting_clash_alert(ui, m, settings, timetable);
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut m.online, format!("{} Online", icons::DESKTOP));
                             if m.online {
@@ -268,7 +335,7 @@ pub fn meetings_editor(
                                 );
                             }
                         }
-                        repeat_editor(ui, m, settings);
+                        repeat_editor(ui, m, settings, timetable);
                         notes(ui, &mut m.notes, "Meeting notes…");
                     });
             });
@@ -297,7 +364,7 @@ fn every_label(weeks: u8) -> String {
 }
 
 /// The "Repeats" controls and, for a repeating meeting, its list of weeks.
-fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
+fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings, timetable: &Timetable) {
     let teaching_end = m
         .date
         .and_then(|d| settings.teaching_end(settings.semester_of(d)));
@@ -368,6 +435,7 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
     }
 
     let weeks = m.occurrences(settings);
+    let clashes = timetable.meeting_clashes(m, settings, today());
     let cancelled = weeks.iter().filter(|o| o.cancelled).count();
     let held = weeks.iter().filter(|o| o.held).count();
     let mut header = format!("Weeks ({}", weeks.len());
@@ -402,7 +470,13 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings) {
                         if occ.cancelled {
                             planned = planned.strikethrough().color(theme::muted(ui));
                         }
-                        ui.label(planned);
+                        ui.horizontal(|ui| {
+                            ui.label(planned);
+                            if let Some(clash) = clashes.iter().find(|c| c.planned == occ.planned) {
+                                ui.label(RichText::new(icons::WARNING).color(theme::fg(ui, theme::AMBER)))
+                                    .on_hover_text(format!("The student is busy {} on {}", clash.block.label(), clash.date.format("%a %d %b")));
+                            }
+                        });
                         ui.push_id((occ.planned, "held"), |ui| {
                             ui.checkbox(&mut edited.held, "")
                         });
