@@ -57,6 +57,29 @@ pub enum ReplyStatus {
     NoReply,
 }
 
+/// Why `contacted` can't be when a student was contacted, given their reply.
+pub fn contact_date_problem(contacted: NaiveDate, replied: Option<NaiveDate>, today: NaiveDate) -> Option<&'static str> {
+    if contacted > today {
+        Some("This date is in the future.")
+    } else if replied.is_some_and(|r| contacted > r) {
+        Some("This is after their reply. If they wrote first, leave this date empty.")
+    } else {
+        None
+    }
+}
+
+/// Why `replied` can't be when a student replied. Without a date for the
+/// contact, as when they wrote first, it only can't be in the future.
+pub fn reply_date_problem(replied: NaiveDate, contacted: Option<NaiveDate>, today: NaiveDate) -> Option<&'static str> {
+    if replied > today {
+        Some("This date is in the future.")
+    } else if contacted.is_some_and(|c| replied < c) {
+        Some("This is before you contacted them. If they wrote first, clear the date you contacted them.")
+    } else {
+        None
+    }
+}
+
 impl ReplyStatus {
     pub fn label(self) -> &'static str {
         match self {
@@ -261,6 +284,10 @@ pub struct Settings {
     pub reveal_needs_password: bool,
     /// Calendar weeks start on Sunday rather than Monday.
     pub week_starts_sunday: bool,
+    /// From this many pending modules, the student talks to the course director.
+    pub course_director_from: u32,
+    /// From this many pending modules, the student talks to the Head of School.
+    pub head_of_school_from: u32,
 }
 
 impl Default for Settings {
@@ -284,6 +311,8 @@ impl Default for Settings {
             hide_external_ids: true,
             reveal_needs_password: false,
             week_starts_sunday: false,
+            course_director_from: 2,
+            head_of_school_from: 3,
         }
     }
 }
@@ -440,6 +469,20 @@ impl Settings {
 
     /// Whether a course is taught at SUST: the built-in SUST course, or any
     /// course shown in the SUST list.
+    /// Who a student with `pending` modules to carry needs to talk to.
+    pub fn escalation(&self, pending: usize) -> Option<Escalation> {
+        let pending = pending as u32;
+        if pending == 0 {
+            None
+        } else if pending >= self.head_of_school_from {
+            Some(Escalation::HeadOfSchool)
+        } else if pending >= self.course_director_from {
+            Some(Escalation::CourseDirector)
+        } else {
+            Some(Escalation::Advisor)
+        }
+    }
+
     pub fn is_sust(&self, id: &str) -> bool {
         id == "Sust"
             || self
@@ -999,8 +1042,132 @@ pub struct SemesterContact {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[serde(default)]
 pub struct AdviseeRecord {
+    pub year: Option<StudyYear>,
     pub s1: SemesterContact,
     pub s2: SemesterContact,
+}
+
+/// The year of study of a local advisee.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StudyYear {
+    First,
+    Second,
+    Fourth,
+}
+
+impl StudyYear {
+    pub const ALL: [StudyYear; 3] = [StudyYear::First, StudyYear::Second, StudyYear::Fourth];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StudyYear::First => "1st",
+            StudyYear::Second => "2nd",
+            StudyYear::Fourth => "4th",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Modules carried from the previous semester
+// ---------------------------------------------------------------------------
+
+/// What is known about a student's modules from the previous semester.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ModulesCheck {
+    #[default]
+    NotChecked,
+    AllPassed,
+    Pending,
+}
+
+/// The part of a module that was failed.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FailedComponent {
+    /// Coursework.
+    #[default]
+    Cw,
+    /// Exam.
+    Ex,
+    /// Both.
+    CwEx,
+}
+
+impl FailedComponent {
+    pub const ALL: [FailedComponent; 3] = [FailedComponent::Cw, FailedComponent::Ex, FailedComponent::CwEx];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FailedComponent::Cw => "CW",
+            FailedComponent::Ex => "EX",
+            FailedComponent::CwEx => "CW+EX",
+        }
+    }
+
+    pub fn has_cw(self) -> bool {
+        self != FailedComponent::Ex
+    }
+
+    pub fn has_ex(self) -> bool {
+        self != FailedComponent::Cw
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct FailedModule {
+    pub code: String,
+    pub name: String,
+    pub component: FailedComponent,
+    pub cw_mark: String,
+    pub ex_mark: String,
+    /// Semester 2: talked over with them while they were my advisee.
+    pub discussed: bool,
+}
+
+impl FailedModule {
+    /// Nothing typed in or ticked, so it can go without losing anything.
+    pub fn is_blank(&self) -> bool {
+        !self.discussed && [&self.code, &self.name, &self.cw_mark, &self.ex_mark].iter().all(|t| t.trim().is_empty())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct SemesterModules {
+    pub check: ModulesCheck,
+    pub failed: Vec<FailedModule>,
+}
+
+impl SemesterModules {
+    /// How many modules are being carried, once any are recorded as pending.
+    pub fn pending(&self) -> usize {
+        if self.check == ModulesCheck::Pending { self.failed.len() } else { 0 }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct PendingModules {
+    pub s1: SemesterModules,
+    pub s2: SemesterModules,
+}
+
+/// Who a student needs to talk to about the modules they are carrying.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Escalation {
+    Advisor,
+    CourseDirector,
+    HeadOfSchool,
+}
+
+impl Escalation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Escalation::Advisor => "their advisor",
+            Escalation::CourseDirector => "the course director",
+            Escalation::HeadOfSchool => "the Head of School",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2073,6 +2240,12 @@ pub struct Student {
     pub advisee: Option<AdviseeRecord>,
     pub phd: Option<PhdRecord>,
     pub timetable: Timetable,
+    /// Local students: has reasonable adjustments.
+    pub rar: bool,
+    /// The adjustments; sensitive, so only shown after the password.
+    pub rar_notes: String,
+    /// Modules carried from the previous semester.
+    pub modules: PendingModules,
 }
 
 impl Default for Student {
@@ -2090,6 +2263,9 @@ impl Default for Student {
             advisee: None,
             phd: None,
             timetable: Timetable::default(),
+            rar: false,
+            rar_notes: String::new(),
+            modules: PendingModules::default(),
         }
     }
 }
@@ -2142,6 +2318,16 @@ impl Student {
     /// Registered at another university (an external research student).
     pub fn external(&self) -> bool {
         self.phd.as_ref().is_some_and(|p| p.external)
+    }
+
+    /// Studies here: neither external nor on the SUST programme.
+    pub fn local(&self, settings: &Settings) -> bool {
+        !self.external() && !self.fyp.as_ref().is_some_and(|f| settings.is_sust(&f.programme))
+    }
+
+    /// Local advisees and project students have their modules followed up.
+    pub fn follows_modules(&self, settings: &Settings) -> bool {
+        self.local(settings) && (self.advisee.is_some() || self.fyp.is_some())
     }
 
     /// The registration number is shown as dots until revealed.
@@ -4506,5 +4692,77 @@ mod tests {
             ..Default::default()
         };
         assert!(db.attention(d(2026, 11, 20)).is_empty());
+    }
+
+    #[test]
+    fn contact_comes_before_the_reply_and_neither_is_in_the_future() {
+        let today = d(2026, 11, 2);
+        assert_eq!(contact_date_problem(today, None, today), None, "today is fine");
+        assert!(contact_date_problem(d(2026, 11, 3), None, today).is_some());
+        assert_eq!(contact_date_problem(d(2026, 10, 1), Some(d(2026, 10, 1)), today), None, "same day");
+        assert!(contact_date_problem(d(2026, 10, 2), Some(d(2026, 10, 1)), today).is_some());
+
+        assert_eq!(reply_date_problem(today, Some(d(2026, 10, 1)), today), None);
+        assert!(reply_date_problem(d(2026, 11, 3), None, today).is_some());
+        assert!(reply_date_problem(d(2026, 9, 30), Some(d(2026, 10, 1)), today).is_some());
+        assert_eq!(reply_date_problem(d(2026, 9, 30), None, today), None, "they wrote first");
+    }
+
+    #[test]
+    fn pending_modules_decide_who_the_student_talks_to() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.escalation(0), None);
+        assert_eq!(settings.escalation(1), Some(Escalation::Advisor));
+        assert_eq!(settings.escalation(2), Some(Escalation::CourseDirector));
+        assert_eq!(settings.escalation(3), Some(Escalation::HeadOfSchool));
+        assert_eq!(settings.escalation(9), Some(Escalation::HeadOfSchool));
+        settings.course_director_from = 3;
+        settings.head_of_school_from = 5;
+        assert_eq!(settings.escalation(2), Some(Escalation::Advisor));
+        assert_eq!(settings.escalation(4), Some(Escalation::CourseDirector));
+    }
+
+    #[test]
+    fn only_modules_marked_pending_count() {
+        let mut semester = SemesterModules {
+            check: ModulesCheck::Pending,
+            failed: vec![FailedModule::default(), FailedModule::default()],
+        };
+        assert_eq!(semester.pending(), 2);
+        semester.check = ModulesCheck::AllPassed;
+        assert_eq!(semester.pending(), 0);
+    }
+
+    #[test]
+    fn local_students_exclude_external_and_sust() {
+        let settings = Settings::default();
+        let fyp = |programme: &str| Some(FypRecord { programme: programme.into(), ..Default::default() });
+        let project = Student { fyp: fyp("BEng"), ..Default::default() };
+        assert!(project.local(&settings) && project.follows_modules(&settings));
+        let advisee = Student { advisee: Some(AdviseeRecord::default()), ..Default::default() };
+        assert!(advisee.local(&settings) && advisee.follows_modules(&settings));
+        let sust = Student { fyp: fyp("Sust"), advisee: Some(AdviseeRecord::default()), ..Default::default() };
+        assert!(!sust.local(&settings) && !sust.follows_modules(&settings));
+        let external = Student { phd: Some(ResearchGroup::PhdExternal.new_record()), ..Default::default() };
+        assert!(!external.local(&settings));
+        let research = Student { phd: Some(ResearchGroup::Phd.new_record()), ..Default::default() };
+        assert!(research.local(&settings) && !research.follows_modules(&settings));
+    }
+
+    #[test]
+    fn older_files_open_without_the_new_fields() {
+        let student: Student = serde_json::from_str(r#"{"name":"Old","advisee":{"s1":{},"s2":{}}}"#).unwrap();
+        assert!(!student.rar && student.rar_notes.is_empty());
+        assert_eq!(student.modules, PendingModules::default());
+        assert_eq!(student.advisee.unwrap().year, None);
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!((settings.course_director_from, settings.head_of_school_from), (2, 3));
+    }
+
+    #[test]
+    fn a_module_with_anything_entered_is_not_blank() {
+        assert!(FailedModule::default().is_blank());
+        assert!(!FailedModule { code: "ENG502".into(), ..Default::default() }.is_blank());
+        assert!(!FailedModule { discussed: true, ..Default::default() }.is_blank());
     }
 }

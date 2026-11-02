@@ -2,9 +2,9 @@
 
 use egui::{Align, Layout, RichText, Ui};
 
-use crate::model::{AdviseeRecord, FypRecord, PhdRecord, PlacementRecord, Settings, Student, is_cpf, is_ni_number, masked};
+use crate::model::{AdviseeRecord, FypRecord, PhdRecord, PlacementRecord, Settings, Student, StudyYear, is_cpf, is_ni_number, masked};
 use crate::ui::widgets::Share;
-use crate::ui::{advisee, fyp, icons, phd, placement, theme, widgets};
+use crate::ui::{advisee, fyp, icons, modules, phd, placement, theme, widgets};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -48,6 +48,8 @@ pub enum FormAction {
     Hide,
     /// Open the student's timetable.
     Timetable,
+    /// Open the student's RAR notes, which asks for the password.
+    RarNotes,
 }
 
 /// What of a student's private details is on screen; the eye buttons
@@ -232,6 +234,29 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
                     ui.label("Course");
                     widgets::text_field(ui, &mut s.course, "e.g. BEng Mechanical Engineering");
                     ui.end_row();
+                    let local = s.local(settings);
+                    if let Some(a) = s.advisee.as_mut().filter(|_| local) {
+                        ui.label("Year");
+                        let mut options = vec![(None, "Not set")];
+                        options.extend(StudyYear::ALL.map(|y| (Some(y), y.label())));
+                        theme::segmented(ui, &mut a.year, &options);
+                        ui.end_row();
+                    }
+                    if local {
+                        ui.label("RAR");
+                        if private {
+                            // Dots whatever its value: even that it is ticked is private.
+                            hidden_value(ui, "hidden");
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut s.rar, "");
+                                if s.rar && ui.button("RAR Notes").clicked() {
+                                    action = FormAction::RarNotes;
+                                }
+                            });
+                        }
+                        ui.end_row();
+                    }
                     ui.label("Archived");
                     ui.checkbox(&mut s.archived, "Hide from lists and dashboard");
                     ui.end_row();
@@ -239,6 +264,11 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
                 widgets::notes(ui, &mut s.notes, "General notes…");
             });
         });
+
+        if s.follows_modules(settings) {
+            ui.add_space(10.0);
+            modules::card(ui, s, settings, shown);
+        }
 
         if s.fyp.is_none() || s.phd.is_none() || s.placement.is_none() || s.advisee.is_none() {
             ui.add_space(8.0);

@@ -157,6 +157,30 @@ pub fn show(
         });
 
         ui.add_space(8.0);
+        theme::card(ui, "Pending modules", |ui| {
+            widgets::form_grid(ui, "pending-modules-grid", |ui| {
+                ui.label("Course director from");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut settings.course_director_from).range(1..=20));
+                    ui.label("modules");
+                });
+                ui.end_row();
+                ui.label("Head of School from");
+                ui.horizontal(|ui| {
+                    let from = settings.course_director_from;
+                    ui.add(egui::DragValue::new(&mut settings.head_of_school_from).range(from..=20));
+                    ui.label("modules");
+                });
+                ui.end_row();
+            });
+            ui.label(
+                RichText::new("With fewer pending modules than these, a student only needs to talk to their advisor.")
+                    .small()
+                    .color(theme::muted(ui)),
+            );
+        });
+
+        ui.add_space(8.0);
         theme::card(ui, "Brazilian programmes", |ui| {
             br_rules_editor(ui, &mut settings.br_rules);
         });

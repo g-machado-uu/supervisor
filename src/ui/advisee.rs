@@ -29,7 +29,9 @@ fn semester(
                 ui.label(theme::semibold(title).size(15.0));
                 widgets::form_grid(ui, "sem-grid", |ui| {
                     ui.label("I contacted them");
-                    widgets::opt_date(ui, "contacted", &mut c.contacted_on);
+                    // A reply date stays stored while the status says otherwise, unseen.
+                    let replied = c.replied_on.filter(|_| c.reply == ReplyStatus::Replied);
+                    widgets::contact_date(ui, "contacted", &mut c.contacted_on, replied);
                     ui.end_row();
 
                     ui.label("Their reply");
@@ -38,7 +40,7 @@ fn semester(
 
                     if c.reply == ReplyStatus::Replied {
                         ui.label("Replied on");
-                        widgets::opt_date(ui, "replied", &mut c.replied_on);
+                        widgets::reply_date(ui, "replied", &mut c.replied_on, c.contacted_on);
                         ui.end_row();
                     }
                 });

@@ -138,8 +138,16 @@ enum Confirm {
     RemoveRole(Uuid, Role),
 }
 
-/// Asks for the password before showing a hidden registration number.
+/// What a password prompt is about to show.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reveal {
+    Number,
+    RarNotes,
+}
+
+/// Asks for the password before showing something sensitive of a student.
 struct RevealPrompt {
+    what: Reveal,
     student: Uuid,
     password: Zeroizing<String>,
     error: Option<String>,
@@ -218,6 +226,13 @@ impl NewStudent {
     }
 }
 
+/// A student's RAR notes, open after the password was confirmed.
+struct RarDialog {
+    student: Uuid,
+    /// The cursor has been put in the text.
+    focused: bool,
+}
+
 /// Lists the Dashboard and Calendar draw on every frame, rebuilt only when
 /// the data or the date changes.
 pub(crate) struct Derived {
@@ -257,6 +272,7 @@ struct Session {
     /// The student whose hidden registration number is shown.
     revealed: Option<Uuid>,
     reveal_prompt: Option<RevealPrompt>,
+    rar_notes: Option<RarDialog>,
     /// Privacy mode, switched on the dashboard: names and numbers are
     /// hidden there, in the lists, the calendar and every student's details.
     private: bool,
@@ -280,6 +296,10 @@ struct Session {
     toast: Option<(String, f64)>,
     /// The list of keyboard shortcuts is open.
     shortcuts: bool,
+    /// At the end of the last frame, something would take Esc before the
+    /// student's details. It must be the last frame's: egui takes the focus
+    /// from a field on Esc before this frame's code gets to see it.
+    esc_taken: bool,
     applied_dark: Option<bool>,
     /// Fingerprint of `db` when last checked, to spot edits.
     db_print: [u8; 32],
@@ -318,6 +338,7 @@ impl Session {
             new_student: None,
             revealed: None,
             reveal_prompt: None,
+            rar_notes: None,
             private: false,
             peek: None,
             hidden: HashSet::new(),
@@ -332,6 +353,7 @@ impl Session {
             calendar: CalendarState::default(),
             toast: None,
             shortcuts: false,
+            esc_taken: false,
             applied_dark: None,
             last_active: Instant::now(),
             leaving: None,
@@ -539,6 +561,13 @@ impl Session {
                 *shown = None;
             }
         }
+        // Esc closes the student's details, once nothing else takes it. The
+        // calendar's selection goes first, like a dialog or a field's cursor.
+        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape) && i.modifiers.is_none());
+        let calendar_selection = self.view == View::Calendar && !self.calendar.selected.is_empty();
+        if esc && !self.esc_taken && !calendar_selection && self.view != View::Settings {
+            self.selected = None;
+        }
         self.sidebar(ui, &mut lock, &mut save_now);
         if self.view != View::Settings && self.selected.is_some() {
             self.detail_panel(ui);
@@ -553,6 +582,14 @@ impl Session {
         self.shortcuts(ui);
         self.timetable_dialog(ui);
         self.dialogs(ui);
+        let ctx = ui.ctx();
+        // Anything floating over the app takes it (a date picker, a menu, a
+        // dialog), except a message that is only passing by.
+        let toast = Id::unique("toast");
+        self.esc_taken = ctx.memory(|m| {
+            m.focused().is_some()
+                || m.areas().visible_layer_ids().iter().any(|l| l.order == egui::Order::Foreground && l.id != toast)
+        });
 
         // Every edit needs a click, key press or drag; frames from just moving
         // the mouse or a blinking cursor skip the (whole-database) check.
@@ -639,8 +676,11 @@ impl Session {
                 ],
             ),
             (
-                "Student lists",
-                vec![(key(egui::Modifiers::COMMAND, egui::Key::N), "Add a student")],
+                "Students",
+                vec![
+                    (key(egui::Modifiers::COMMAND, egui::Key::N), "Add a student"),
+                    ("Esc".to_string(), "Leave a field, then close the student"),
+                ],
             ),
             (
                 "Calendar",
@@ -879,6 +919,7 @@ impl Session {
             FormAction::Share(widgets::Share::Google(uid)) => self.open_in_google(ui, id, &uid),
             FormAction::Reveal if self.db.settings.reveal_needs_password => {
                 self.reveal_prompt = Some(RevealPrompt {
+                    what: Reveal::Number,
                     student: id,
                     password: Zeroizing::new(String::new()),
                     error: None,
@@ -886,6 +927,14 @@ impl Session {
             }
             FormAction::Reveal => self.revealed = Some(id),
             FormAction::Hide => self.revealed = None,
+            FormAction::RarNotes => {
+                self.reveal_prompt = Some(RevealPrompt {
+                    what: Reveal::RarNotes,
+                    student: id,
+                    password: Zeroizing::new(String::new()),
+                    error: None,
+                });
+            }
             FormAction::Timetable => self.timetable = Some(TimetableDialog::new(id, &self.db.settings, widgets::today())),
         }
     }
@@ -1587,17 +1636,25 @@ impl Session {
 
         if let Some(prompt) = &mut self.reveal_prompt {
             let name = self.db.student(prompt.student).map(|s| s.display_name()).unwrap_or_default();
+            let (title, explain, button) = match prompt.what {
+                Reveal::Number => (
+                    "Reveal registration number",
+                    format!("Type your password to see the registration number of {name}."),
+                    "Reveal",
+                ),
+                Reveal::RarNotes => ("RAR Notes", format!("Type your password to see the RAR notes of {name}."), "Open"),
+            };
             let mut submit = false;
             let mut cancel = false;
             let resp = egui::Modal::new(Id::unique("reveal")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
                 ui.set_width(420.0);
                 ui.horizontal(|ui| {
                     theme::icon_badge(ui, icons::EYE, theme::ACCENT, 40.0);
-                    ui.label(theme::serif("Reveal registration number", 22.0));
+                    ui.label(theme::serif(title, 22.0));
                 });
                 ui.add_space(4.0);
                 ui.add(
-                    egui::Label::new(format!("Type your password to see the registration number of {name}."))
+                    egui::Label::new(explain)
                         .wrap_mode(egui::TextWrapMode::Wrap),
                 );
                 ui.add_space(6.0);
@@ -1618,7 +1675,7 @@ impl Session {
                 }
                 ui.add_space(12.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(theme::primary_button("Reveal")).clicked() {
+                    if ui.add(theme::primary_button(button)).clicked() {
                         submit = true;
                     }
                     if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 34.0))).clicked() {
@@ -1629,7 +1686,12 @@ impl Session {
             if submit && !prompt.password.is_empty() {
                 match self.vault.check_password(&prompt.password) {
                     Ok(true) => {
-                        self.revealed = Some(prompt.student);
+                        match prompt.what {
+                            Reveal::Number => self.revealed = Some(prompt.student),
+                            Reveal::RarNotes => {
+                                self.rar_notes = Some(RarDialog { student: prompt.student, focused: false });
+                            }
+                        }
                         self.reveal_prompt = None;
                     }
                     Ok(false) => {
@@ -1642,6 +1704,8 @@ impl Session {
                 self.reveal_prompt = None;
             }
         }
+
+        self.rar_notes_dialog(&ctx, ui);
 
         if let Some(confirm) = &self.confirm {
             let (title, body) = match confirm {
@@ -1691,12 +1755,68 @@ impl Session {
                                 Role::Placement => s.placement = None,
                                 Role::Advisee => s.advisee = None,
                             }
+                            // Nothing shows these any more, so nothing should keep them.
+                            if s.fyp.is_none() && s.advisee.is_none() {
+                                s.modules = Default::default();
+                            }
                         }
                     }
                 }
             } else if no || resp.should_close() {
                 self.confirm = None;
             }
+        }
+    }
+}
+
+impl Session {
+    /// A student's RAR notes, in a dialog like the meeting notes.
+    fn rar_notes_dialog(&mut self, ctx: &egui::Context, ui: &Ui) {
+        let Some(dialog) = &mut self.rar_notes else { return };
+        let Some(student) = self.db.student_mut(dialog.student) else {
+            self.rar_notes = None;
+            return;
+        };
+        let name = student.display_name();
+        let edit_id = Id::unique(("rar-notes", dialog.student));
+        let mut done = false;
+        let resp = egui::Modal::new(Id::unique("rar-notes-dialog")).frame(theme::modal_frame(ui)).show(ctx, |ui| {
+            ui.set_width(560.0);
+            ui.horizontal(|ui| {
+                theme::icon_badge(ui, icons::NOTE_PENCIL, theme::ACCENT, 40.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.label(theme::serif("RAR Notes", 22.0));
+                    ui.label(RichText::new(name).color(theme::muted(ui)));
+                });
+            });
+            ui.add_space(10.0);
+            let edit = egui::ScrollArea::vertical()
+                .max_height(340.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut student.rar_notes)
+                            .id(edit_id)
+                            .hint_text("The student's reasonable adjustments…")
+                            .desired_rows(14)
+                            .desired_width(f32::INFINITY),
+                    )
+                })
+                .inner;
+            if !dialog.focused {
+                dialog.focused = true;
+                edit.request_focus();
+            }
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                done = ui.add(theme::primary_button("Done")).clicked();
+            });
+        });
+        if done || resp.should_close() {
+            self.rar_notes = None;
+            // egui keeps an undo history of each text field: don't leave the
+            // notes there once they are behind the password again.
+            ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(edit_id));
         }
     }
 }
@@ -3586,5 +3706,512 @@ mod ui_tests {
         h.get_by_label("Done").click();
         h.run_steps(3);
         assert!(h.query_by_label(&format!("{} Typed after reopening", icons::NOTE)).is_some());
+    }
+
+    fn modules_title() -> String {
+        format!("{}  Modules", icons::BOOK_OPEN_TEXT)
+    }
+
+    fn failed_module(component: FailedComponent) -> FailedModule {
+        FailedModule {
+            code: "EEE526".into(),
+            name: "Advanced Structural Dynamics and Vibration Analysis of Composite Assemblies for Aerospace".into(),
+            component,
+            cw_mark: "38.5".into(),
+            ex_mark: "31.25".into(),
+            discussed: false,
+        }
+    }
+
+    /// Left edge of the detail panel, which moves if its contents stretch it.
+    fn panel_left(h: &Harness<'_, SupervisorApp>) -> f32 {
+        h.get_by_label(&format!("{} Delete student…", icons::TRASH)).rect().left()
+    }
+
+    #[test]
+    fn modules_card_is_collapsed_and_never_stretches_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let student = Student {
+            name: "Aisha Khan".into(),
+            advisee: Some(AdviseeRecord::default()),
+            modules: PendingModules {
+                s1: SemesterModules {
+                    check: ModulesCheck::Pending,
+                    failed: vec![failed_module(FailedComponent::CwEx), failed_module(FailedComponent::Cw)],
+                },
+                s2: SemesterModules {
+                    check: ModulesCheck::Pending,
+                    failed: vec![failed_module(FailedComponent::Ex)],
+                },
+            },
+            ..Default::default()
+        };
+        let id = student.id;
+        {
+            let s = session(&mut h);
+            s.db.students.push(student);
+            s.view = View::List(Category::Advisee);
+            s.selected = Some(id);
+        }
+        h.set_size(egui::vec2(1360.0, 2400.0));
+        h.run_steps(3);
+        // Collapsed by default, with what is pending in its title.
+        assert!(h.query_by_label_contains("Module 1").is_none());
+        let before = panel_left(&h);
+        let title = format!("{} · S1: 2 pending · S2: 1 pending", modules_title());
+        h.get_by_label(&title).click();
+        h.run_steps(4);
+        assert_eq!(h.query_all_by_label("Module 1").count(), 2, "both semesters are open");
+        assert_eq!(panel_left(&h), before, "still as wide");
+        assert!(!all_text(&h).contains("38.5"), "marks are dots until revealed");
+        h.get_all_by_label(&format!("{} Reveal marks", icons::EYE)).next().unwrap().click();
+        h.run_steps(4);
+        assert!(all_text(&h).contains("38.5") && all_text(&h).contains("31.25"));
+        assert_eq!(panel_left(&h), before, "still as wide with the marks shown");
+        // CW+EX has both marks, CW and EX one each.
+        assert_eq!(h.query_all_by_label("CW mark").count(), 2);
+        assert_eq!(h.query_all_by_label("EX mark").count(), 2);
+        // Asked once, in semester 2, as the student is an advisee.
+        let discussed = "Discussed with them whilst my advisee";
+        assert_eq!(h.query_all_by_label(discussed).count(), 1);
+        h.get_by_label(discussed).click();
+        h.run_steps(2);
+        let saved = session(&mut h).db.student(id).unwrap().modules.clone();
+        assert!(saved.s2.failed[0].discussed && !saved.s1.failed[0].discussed);
+        // Who to talk to follows the number of modules.
+        assert!(h.query_by_label_contains("Needs to talk to the course director").is_some());
+        assert!(h.query_by_label_contains("Needs to talk to their advisor").is_some());
+        shot(&mut h, "41_modules_card");
+
+        // At the narrowest the panel goes, the fields still fit.
+        session(&mut h).db.student_mut(id).unwrap().modules.s2.failed.clear();
+        h.set_size(egui::vec2(760.0, 2400.0));
+        h.run_steps(4);
+        for field in h.get_all_by_role(AkRole::TextInput) {
+            assert!(field.rect().right() <= 760.0, "{:?} runs past the window", field.rect());
+        }
+        shot(&mut h, "42_modules_card_narrow");
+    }
+
+    #[test]
+    fn modules_card_asks_how_many_and_only_for_local_students() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let fyp = |programme: &str| FypRecord { programme: programme.into(), ..Default::default() };
+        let (project, sust, external, research) = {
+            let s = session(&mut h);
+            let project = Student { name: "Project".into(), fyp: Some(fyp("BEng")), ..Default::default() };
+            let sust = Student { name: "Sust".into(), fyp: Some(fyp("Sust")), advisee: Some(AdviseeRecord::default()), ..Default::default() };
+            let external = Student { name: "External".into(), phd: Some(ResearchGroup::PhdExternal.new_record()), ..Default::default() };
+            let research = Student { name: "Research".into(), phd: Some(ResearchGroup::Phd.new_record()), ..Default::default() };
+            let ids = (project.id, sust.id, external.id, research.id);
+            s.db.students.extend([project, sust, external, research]);
+            s.view = View::List(Category::Projects("BEng".into()));
+            s.selected = Some(ids.0);
+            ids
+        };
+        h.set_size(egui::vec2(1360.0, 2400.0));
+        h.run_steps(3);
+        // A project student: the card and RAR, no year, and no advisee question.
+        assert!(h.query_by_label("RAR").is_some());
+        assert!(h.query_by_label("Year").is_none());
+        h.get_by_label(&modules_title()).click();
+        h.run_steps(4);
+        assert!(h.query_by_label_contains("Discussed with them").is_none());
+
+        // "All passed" asks for nothing more; "Pending" opens one module.
+        h.get_all_by_label("All passed").next().unwrap().click();
+        h.run_steps(3);
+        assert!(h.query_by_label("How many").is_none());
+        h.get_all_by_label("Pending").next().unwrap().click();
+        h.run_steps(3);
+        assert!(h.query_by_label("How many").is_some());
+        assert_eq!(h.query_all_by_label("Module 1").count(), 1);
+        // The count gives that many modules, and removing a blank one is fine.
+        h.get_by_label(icons::PLUS).click();
+        h.run_steps(3);
+        h.get_by_label(icons::PLUS).click();
+        h.run_steps(3);
+        assert_eq!(session(&mut h).db.student(project).unwrap().modules.s1.pending(), 3);
+        assert!(h.query_by_label_contains("Needs to talk to the Head of School").is_some());
+        h.get_by_label("−").click();
+        h.run_steps(3);
+        assert_eq!(session(&mut h).db.student(project).unwrap().modules.s1.pending(), 2);
+        // ...but one with details can't go by accident.
+        session(&mut h).db.student_mut(project).unwrap().modules.s1.failed[1].code = "EEE526".into();
+        h.run_steps(3);
+        h.get_by_label("−").click();
+        h.run_steps(3);
+        assert_eq!(session(&mut h).db.student(project).unwrap().modules.s1.pending(), 2);
+
+        // Removing the only role that shows them removes the modules too.
+        h.get_by_label("Remove Project supervision record…").click();
+        h.run_steps(3);
+        h.get_by_label("Delete").click();
+        h.run_steps(3);
+        assert_eq!(session(&mut h).db.student(project).unwrap().modules, PendingModules::default());
+
+        // Not on the SUST programme or external; for a local research student, only RAR.
+        session(&mut h).selected = Some(sust);
+        h.run_steps(3);
+        assert!(h.query_by_label("RAR").is_none() && h.query_by_label("Year").is_none());
+        assert!(h.query_by_label(&modules_title()).is_none());
+        session(&mut h).selected = Some(external);
+        h.run_steps(3);
+        assert!(h.query_by_label("RAR").is_none());
+        session(&mut h).selected = Some(research);
+        h.run_steps(3);
+        assert!(h.query_by_label("RAR").is_some());
+        assert!(h.query_by_label(&modules_title()).is_none());
+    }
+
+    #[test]
+    fn advisee_year_is_chosen_in_the_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let student = Student { name: "Year One".into(), advisee: Some(AdviseeRecord::default()), ..Default::default() };
+        let id = student.id;
+        {
+            let s = session(&mut h);
+            s.db.students.push(student);
+            s.view = View::List(Category::Advisee);
+            s.selected = Some(id);
+        }
+        h.run_steps(3);
+        assert!(h.query_by_label("3rd").is_none());
+        h.get_by_label("4th").click();
+        h.run_steps(2);
+        assert_eq!(session(&mut h).db.student(id).unwrap().advisee.as_ref().unwrap().year, Some(StudyYear::Fourth));
+    }
+
+    #[test]
+    fn rar_notes_are_behind_the_password_every_time() {
+        const SECRET: &str = "Extra time in examinations";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let student = Student { name: "Local Student".into(), advisee: Some(AdviseeRecord::default()), ..Default::default() };
+        let id = student.id;
+        {
+            let s = session(&mut h);
+            s.db.students.push(student);
+            s.view = View::List(Category::Advisee);
+            s.selected = Some(id);
+        }
+        h.run_steps(3);
+        // The button only shows once ticked.
+        assert!(h.query_by_label("RAR Notes").is_none());
+        session(&mut h).db.student_mut(id).unwrap().rar = true;
+        h.run_steps(2);
+
+        let open = |h: &mut Harness<'_, SupervisorApp>, password: &str| {
+            let field = h.get_by_role(AkRole::PasswordInput);
+            field.focus();
+            field.type_text(password);
+            h.run_steps(1);
+            h.get_by_label("Open").click();
+            h.run_steps(3);
+        };
+        h.get_by_label("RAR Notes").click();
+        h.run_steps(3);
+        assert!(h.query_by_role(AkRole::PasswordInput).is_some(), "asks even with the privacy option off");
+        open(&mut h, "wrong-password-000");
+        assert!(h.query_by_label("Wrong password.").is_some());
+        open(&mut h, PASSWORD);
+        assert!(h.query_by_role(AkRole::PasswordInput).is_none());
+        // Ready to type straight away, like the meeting notes.
+        h.event(egui::Event::Text(SECRET.into()));
+        h.run_steps(2);
+        assert!(all_text(&h).contains(SECRET));
+        shot(&mut h, "43_rar_notes");
+        h.get_by_label("Done").click();
+        h.run_steps(3);
+        assert_eq!(session(&mut h).db.student(id).unwrap().rar_notes, SECRET);
+        assert!(!all_text(&h).contains(SECRET), "not on screen once closed");
+
+        // Asked for again the next time, with the same notes after it.
+        h.get_by_label("RAR Notes").click();
+        h.run_steps(3);
+        assert!(!all_text(&h).contains(SECRET));
+        open(&mut h, PASSWORD);
+        assert!(all_text(&h).contains(SECRET));
+        h.get_by_label("Done").click();
+        h.run_steps(3);
+
+        // In privacy mode, not even whether it is ticked shows.
+        session(&mut h).private = true;
+        h.run_steps(3);
+        assert!(h.query_by_label("RAR").is_some());
+        assert!(h.query_by_label("RAR Notes").is_none());
+        session(&mut h).private = false;
+        h.run_steps(3);
+
+        // Saved encrypted with the rest, and in no calendar file.
+        h.get_by_label(&format!("{}  Lock", icons::LOCK_SIMPLE)).click();
+        wait_until(&mut h, "locked", locked);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()));
+        let saved = storage::read_database(&path, PASSWORD, None).unwrap();
+        assert_eq!(saved.student(id).unwrap().rar_notes, SECRET);
+    }
+
+    fn with_open_advisee(path: &std::path::Path, record: AdviseeRecord) -> (Harness<'static, SupervisorApp>, Uuid) {
+        let mut h = create_and_unlock(path, false);
+        let student = Student { name: "Open Student".into(), advisee: Some(record), ..Default::default() };
+        let id = student.id;
+        {
+            let s = session(&mut h);
+            s.db.students.push(student);
+            s.view = View::List(Category::Advisee);
+            s.selected = Some(id);
+        }
+        h.set_size(egui::vec2(1360.0, 1600.0));
+        h.run_steps(3);
+        (h, id)
+    }
+
+    #[test]
+    fn esc_leaves_what_is_open_then_closes_the_student() {
+        let dir = tempfile::tempdir().unwrap();
+        let contact = SemesterContact { contacted_on: Some(crate::ui::widgets::today()), ..Default::default() };
+        let (mut h, id) = with_open_advisee(&dir.path().join("data.svt"), AdviseeRecord { s1: contact, ..Default::default() });
+        let press = |h: &mut Harness<'_, SupervisorApp>| {
+            h.key_press(egui::Key::Escape);
+            h.run_steps(3);
+        };
+        let open = |h: &mut Harness<'_, SupervisorApp>| session(h).selected.is_some();
+
+        // In a field: the first Esc leaves it, and the student stays open.
+        h.get_all_by_role(AkRole::TextInput).find(|f| f.value().as_deref() == Some("Open Student")).unwrap().focus();
+        h.run_steps(3);
+        assert!(h.ctx.memory(|m| m.focused().is_some()));
+        press(&mut h);
+        assert!(h.ctx.memory(|m| m.focused().is_none()), "out of the field");
+        assert!(open(&mut h), "the student stays open");
+
+        // A date picker: Esc closes it first.
+        let date = crate::ui::widgets::today().format("%a %d %b %Y").to_string();
+        h.get_all_by_label_contains(&date).next().unwrap().click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Save").is_some(), "picker open");
+        press(&mut h);
+        assert!(h.query_by_label("Save").is_none(), "picker closed");
+        assert!(open(&mut h), "the student stays open");
+
+        // A dialog: Esc closes it first.
+        h.get_by_label("Timetable").click();
+        h.run_steps(3);
+        assert!(session(&mut h).timetable.is_some());
+        press(&mut h);
+        assert!(session(&mut h).timetable.is_none());
+        assert!(open(&mut h), "the student stays open");
+
+        // With nothing else, it closes the student, as the X does.
+        press(&mut h);
+        assert!(!open(&mut h));
+        assert!(session(&mut h).db.student(id).is_some(), "only the view closed");
+
+        // In the calendar, the selection goes first.
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = calendar_with_selection(&dir.path().join("data.svt"));
+        let any = session(&mut h).db.students[0].id;
+        session(&mut h).selected = Some(any);
+        h.run_steps(3);
+        press(&mut h);
+        assert!(session(&mut h).calendar.selected.is_empty());
+        assert!(open(&mut h), "the student stays open");
+        press(&mut h);
+        assert!(!open(&mut h));
+    }
+
+    /// Opens the date picker showing `date`, moves it a day on, and saves.
+    fn pick_next_day(h: &mut Harness<'_, SupervisorApp>, date: chrono::NaiveDate) {
+        h.get_all_by_label_contains(&date.format("%a %d %b %Y").to_string()).next().unwrap().click();
+        h.run_steps(3);
+        h.get_by_label(">").click();
+        h.run_steps(3);
+        h.get_by_label("Save").click();
+        h.run_steps(3);
+    }
+
+    #[test]
+    fn contact_dates_in_the_future_or_after_the_reply_are_refused() {
+        let today = crate::ui::widgets::today();
+        let dir = tempfile::tempdir().unwrap();
+        let contact = SemesterContact { contacted_on: Some(today), ..Default::default() };
+        let (mut h, id) = with_open_advisee(&dir.path().join("data.svt"), AdviseeRecord { s2: contact, ..Default::default() });
+        let s1 = |h: &mut Harness<'_, SupervisorApp>| session(h).db.student(id).unwrap().advisee.as_ref().unwrap().s1.clone();
+
+        // Tomorrow is refused, with the reason.
+        pick_next_day(&mut h, today);
+        let s2 = session(&mut h).db.student(id).unwrap().advisee.as_ref().unwrap().s2.clone();
+        assert_eq!(s2.contacted_on, Some(today));
+        assert!(h.query_by_label_contains("This date is in the future").is_some());
+
+        {
+            let s = session(&mut h);
+            let c = &mut s.db.student_mut(id).unwrap().advisee.as_mut().unwrap().s1;
+            c.contacted_on = Some(today - Days::days(5));
+            c.reply = ReplyStatus::Replied;
+            c.replied_on = Some(today - Days::days(6));
+        }
+        h.run_steps(3);
+        // One saved before this check stays, with a warning on both dates.
+        assert_eq!(h.query_all_by_label_contains("If they wrote first").count(), 2);
+        shot(&mut h, "44_contact_dates_warning");
+        assert_eq!(s1(&mut h).replied_on, Some(today - Days::days(6)));
+
+        // A contact date can't move past a good reply.
+        {
+            let s = session(&mut h);
+            s.db.student_mut(id).unwrap().advisee.as_mut().unwrap().s1.replied_on = Some(today - Days::days(5));
+        }
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("If they wrote first").is_none());
+        let contacted = today - Days::days(5);
+        pick_next_day(&mut h, contacted);
+        assert_eq!(s1(&mut h).contacted_on, Some(contacted));
+        assert!(h.query_by_label_contains("after their reply").is_some());
+
+        // If they wrote first, leaving the contact empty lets the reply stand.
+        {
+            let s = session(&mut h);
+            let c = &mut s.db.student_mut(id).unwrap().advisee.as_mut().unwrap().s1;
+            c.contacted_on = None;
+            c.replied_on = Some(today - Days::days(20));
+        }
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("before you contacted").is_none());
+        // Set date then starts at the reply, not after it.
+        h.get_all_by_label(&format!("{} Set date", icons::CALENDAR_BLANK)).next().unwrap().click();
+        h.run_steps(3);
+        assert_eq!(s1(&mut h).contacted_on, Some(today - Days::days(20)));
+    }
+
+    /// Saves the pictures in the README, with `SUPERVISOR_SHOTS` set; made up
+    /// of invented students only. Frames named `gif_*` become its animations.
+    #[test]
+    fn readme_pictures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let today = crate::ui::widgets::today();
+        let sean = {
+            let s = session(&mut h);
+            s.db.settings.sem1_start = Some(today - Days::days(30));
+            s.db.settings.sem2_start = Some(today + Days::days(90));
+            s.db.students.extend(demo_students(today));
+            let sean = s.db.students.iter_mut().find(|s| s.name == "Sean O'Neill").unwrap();
+            sean.email = "oneill-s@uni.ac.uk".into();
+            sean.advisee.as_mut().unwrap().year = Some(StudyYear::Second);
+            for (day, hour) in [(0, 9), (0, 10), (1, 14), (1, 15), (2, 11), (3, 9), (3, 10), (3, 11), (4, 13)] {
+                sean.timetable.set_busy(Semester::S1, BusySlot { day, hour }, true);
+            }
+            let id = sean.id;
+            // The dashboard and calendar work from this, normally updated on input.
+            s.db_print = storage::fingerprint(&s.db);
+            id
+        };
+        h.run_steps(3);
+        shot(&mut h, "dashboard");
+        {
+            let s = session(&mut h);
+            s.view = View::Calendar;
+            s.calendar.layout = crate::ui::calendar::Layout::Month;
+            s.calendar.month = today.with_day(1).unwrap();
+        }
+        h.run_steps(3);
+        shot(&mut h, "calendar");
+        {
+            let s = session(&mut h);
+            s.view = View::List(Category::Advisee);
+            s.selected = Some(sean);
+        }
+        h.run_steps(3);
+        shot(&mut h, "student");
+        h.get_by_label("Timetable").click();
+        h.run_steps(3);
+        shot(&mut h, "timetable");
+        session(&mut h).timetable = None;
+        h.run_steps(3);
+
+        // The modules card, being filled in, with room for all of it.
+        h.set_size(egui::vec2(1360.0, 1120.0));
+        h.run_steps(3);
+        let type_in = |h: &mut Harness<'_, SupervisorApp>, hint_index: usize, text: &str| {
+            let fields = h.get_all_by_role(AkRole::TextInput).collect::<Vec<_>>();
+            fields[hint_index].focus();
+            fields[hint_index].type_text(text);
+            h.run_steps(2);
+        };
+        let mut frame = 0;
+        let mut film = |h: &mut Harness<'_, SupervisorApp>, name: &str| {
+            frame += 1;
+            shot(h, &format!("gif_{name}_{frame:02}"));
+        };
+        film(&mut h, "modules");
+        h.get_by_label(&modules_title()).click();
+        h.run_steps(6);
+        film(&mut h, "modules");
+        h.get_all_by_label("Pending").next().unwrap().click();
+        h.run_steps(4);
+        film(&mut h, "modules");
+        // The new fields come after the search box and the details' fields.
+        let code = h.get_all_by_role(AkRole::TextInput).position(|f| f.value().is_some_and(|v| v.is_empty())
+            && f.rect().top() > h.get_by_label("How many").rect().top()).expect("code field");
+        type_in(&mut h, code, "ENG502");
+        film(&mut h, "modules");
+        type_in(&mut h, code + 1, "Thermofluids");
+        film(&mut h, "modules");
+        h.get_all_by_label("CW+EX").next().unwrap().click();
+        h.run_steps(4);
+        film(&mut h, "modules");
+        h.get_all_by_label(&format!("{} Reveal marks", icons::EYE)).next().unwrap().click();
+        h.run_steps(4);
+        {
+            let s = session(&mut h);
+            let m = &mut s.db.student_mut(sean).unwrap().modules.s1.failed[0];
+            m.cw_mark = "38".into();
+            m.ex_mark = "34".into();
+        }
+        h.run_steps(4);
+        film(&mut h, "modules");
+        film(&mut h, "modules");
+
+        // The RAR notes, behind the password.
+        h.get_all_by_label(&format!("{} Hide marks", icons::EYE_SLASH)).next().unwrap().click();
+        h.run_steps(3);
+        h.get_by_label(&format!("{} · S1: 1 pending", modules_title())).click();
+        session(&mut h).db.student_mut(sean).unwrap().rar = true;
+        h.set_size(egui::vec2(1360.0, 860.0));
+        h.run_steps(6);
+        frame = 0;
+        let mut film = |h: &mut Harness<'_, SupervisorApp>, name: &str| {
+            frame += 1;
+            shot(h, &format!("gif_{name}_{frame:02}"));
+        };
+        film(&mut h, "rar");
+        h.get_by_label("RAR Notes").click();
+        h.run_steps(4);
+        film(&mut h, "rar");
+        let field = h.get_by_role(AkRole::PasswordInput);
+        field.focus();
+        field.type_text(PASSWORD);
+        h.run_steps(3);
+        film(&mut h, "rar");
+        h.get_by_label("Open").click();
+        h.run_steps(4);
+        film(&mut h, "rar");
+        h.event(egui::Event::Text("Extra time in examinations. Slides shared in advance of lectures.".into()));
+        h.run_steps(3);
+        film(&mut h, "rar");
+        film(&mut h, "rar");
+        h.get_by_label("Done").click();
+        h.run_steps(4);
+        film(&mut h, "rar");
     }
 }

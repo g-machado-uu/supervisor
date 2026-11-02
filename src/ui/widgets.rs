@@ -6,7 +6,7 @@ use chrono::{Datelike, Local, NaiveDate, NaiveTime, Timelike};
 use egui::{RichText, Ui};
 use egui_extras::DatePickerButton;
 
-use crate::model::{Meeting, Platform, Repeat, ReplyStatus, Settings, Timetable, TriState};
+use crate::model::{Meeting, Platform, Repeat, ReplyStatus, Settings, Timetable, TriState, contact_date_problem, reply_date_problem};
 use crate::ui::{icons, theme};
 
 pub fn today() -> NaiveDate {
@@ -31,28 +31,92 @@ fn from_jiff(d: jiff::civil::Date) -> NaiveDate {
 
 /// An optional date: a "Set date" button when empty, otherwise a picker plus clear button.
 pub fn opt_date(ui: &mut Ui, salt: impl AsIdSalt, value: &mut Option<NaiveDate>) {
+    ui.push_id(salt, |ui| date_field(ui, value, today()));
+}
+
+/// `opt_date`, with "Set date" starting from `default`.
+fn date_field(ui: &mut Ui, value: &mut Option<NaiveDate>, default: NaiveDate) {
+    ui.horizontal(|ui| match value {
+        Some(date) => {
+            let mut j = to_jiff(*date);
+            ui.add(
+                DatePickerButton::new(&mut j)
+                    .id_salt("date")
+                    .format("%a %d %b %Y")
+                    .calendar_week(false),
+            );
+            *date = from_jiff(j);
+            if ui.small_button(icons::X).on_hover_text("Clear date").clicked() {
+                *value = None;
+            }
+        }
+        None => {
+            if ui.button(format!("{} Set date", icons::CALENDAR_BLANK)).clicked() {
+                *value = Some(default);
+            }
+        }
+    });
+}
+
+/// How long a refused date is explained for, in seconds.
+const REFUSED_FOR: f64 = 8.0;
+
+/// A date that must make sense, for the second column of a `form_grid`: a
+/// choice `problem` objects to is refused and explained. One already saved
+/// that way is kept, with a warning, for the user to correct.
+pub fn checked_date(
+    ui: &mut Ui,
+    salt: impl AsIdSalt,
+    value: &mut Option<NaiveDate>,
+    default: NaiveDate,
+    problem: impl Fn(NaiveDate) -> Option<&'static str>,
+) {
     ui.push_id(salt, |ui| {
-        ui.horizontal(|ui| match value {
-            Some(date) => {
-                let mut j = to_jiff(*date);
-                ui.add(
-                    DatePickerButton::new(&mut j)
-                        .id_salt("date")
-                        .format("%a %d %b %Y")
-                        .calendar_week(false),
-                );
-                *date = from_jiff(j);
-                if ui.small_button(icons::X).on_hover_text("Clear date").clicked() {
-                    *value = None;
+        ui.vertical(|ui| {
+            // A grid's cells have no width limit of their own: see `date_time_cell`.
+            ui.set_max_width(270.0);
+            let before = *value;
+            date_field(ui, value, default);
+            let refused_id = ui.scope_id().with("refused");
+            let now = ui.input(|i| i.time);
+            if *value != before {
+                if let Some(why) = value.and_then(&problem) {
+                    *value = before;
+                    ui.data_mut(|d| d.insert_temp(refused_id, (why, now)));
+                } else {
+                    ui.data_mut(|d| d.remove::<(&'static str, f64)>(refused_id));
                 }
             }
-            None => {
-                if ui.button(format!("{} Set date", icons::CALENDAR_BLANK)).clicked() {
-                    *value = Some(today());
+            let refused = ui
+                .data(|d| d.get_temp::<(&'static str, f64)>(refused_id))
+                .filter(|(_, at)| now - at < REFUSED_FOR);
+            let (why, color) = match refused {
+                Some((why, at)) => {
+                    ui.ctx().request_repaint_after_secs((REFUSED_FOR - (now - at)) as f32);
+                    (Some(why), theme::RED)
                 }
+                None => (value.and_then(&problem), theme::AMBER),
+            };
+            if let Some(why) = why {
+                let text = RichText::new(format!("{} {why}", icons::WARNING)).color(theme::fg(ui, color));
+                ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Wrap));
             }
         });
     });
+}
+
+/// The date a student was contacted, for the second column of a `form_grid`.
+/// `replied`: when they replied, if they have.
+pub fn contact_date(ui: &mut Ui, salt: impl AsIdSalt, value: &mut Option<NaiveDate>, replied: Option<NaiveDate>) {
+    let today = today();
+    let default = replied.map_or(today, |r| r.min(today));
+    checked_date(ui, salt, value, default, |d| contact_date_problem(d, replied, today));
+}
+
+/// The date a student replied, for the second column of a `form_grid`.
+pub fn reply_date(ui: &mut Ui, salt: impl AsIdSalt, value: &mut Option<NaiveDate>, contacted: Option<NaiveDate>) {
+    let today = today();
+    checked_date(ui, salt, value, today, |d| reply_date_problem(d, contacted, today));
 }
 
 /// An optional time of day, edited as hour/minute drag values.

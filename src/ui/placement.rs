@@ -55,7 +55,8 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord, settings: &Settings, timetable
                         ui.end_row();
 
                         ui.label("Request sent");
-                        widgets::opt_date(ui, "request", &mut v.request_sent);
+                        let replied = v.responded_on.filter(|_| v.response == ReplyStatus::Replied);
+                        widgets::contact_date(ui, "request", &mut v.request_sent, replied);
                         ui.end_row();
 
                         ui.label("Student response");
@@ -64,7 +65,7 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord, settings: &Settings, timetable
 
                         if v.response == ReplyStatus::Replied {
                             ui.label("Responded on");
-                            widgets::opt_date(ui, "responded", &mut v.responded_on);
+                            widgets::reply_date(ui, "responded", &mut v.responded_on, v.request_sent);
                             ui.end_row();
                         }
 

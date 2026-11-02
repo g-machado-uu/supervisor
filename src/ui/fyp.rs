@@ -56,7 +56,7 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings, timetable: &T
             ui.horizontal(|ui| {
                 ui.checkbox(&mut fyp.initial_contact, "Made contact");
                 if fyp.initial_contact {
-                    widgets::opt_date(ui, "initial-contact", &mut fyp.initial_contact_on);
+                    widgets::contact_date(ui, "initial-contact", &mut fyp.initial_contact_on, None);
                 }
             });
             ui.end_row();
@@ -206,7 +206,8 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings, timetable: &T
 fn sust_contact(ui: &mut Ui, fyp: &mut FypRecord) {
     let before = (fyp.initial_contact_on, fyp.reply);
     ui.label("I contacted them");
-    widgets::opt_date(ui, "initial-contact", &mut fyp.initial_contact_on);
+    let replied = fyp.replied_on.filter(|_| fyp.reply == ReplyStatus::Replied);
+    widgets::contact_date(ui, "initial-contact", &mut fyp.initial_contact_on, replied);
     ui.end_row();
 
     ui.label("Their reply");
@@ -215,7 +216,7 @@ fn sust_contact(ui: &mut Ui, fyp: &mut FypRecord) {
 
     if fyp.reply == ReplyStatus::Replied {
         ui.label("Replied on");
-        widgets::opt_date(ui, "replied", &mut fyp.replied_on);
+        widgets::reply_date(ui, "replied", &mut fyp.replied_on, fyp.initial_contact_on);
         ui.end_row();
     }
     // Only on a change, so contact ticked in older versions without a date stays.
@@ -265,8 +266,13 @@ fn agreed_note(ui: &mut Ui, status: &mut CwStatus, shown: bool, reference: &str)
 /// A mark, as dots until the marks are revealed. Returns true when a
 /// hidden one is clicked, to reveal them.
 fn mark(ui: &mut Ui, shown: bool, value: &mut String) -> bool {
+    mark_of_width(ui, shown, value, 56.0)
+}
+
+/// `mark`, in a field `width` wide.
+pub fn mark_of_width(ui: &mut Ui, shown: bool, value: &mut String, width: f32) -> bool {
     if shown {
-        ui.add(egui::TextEdit::singleline(value).hint_text("–").desired_width(56.0));
+        ui.add(egui::TextEdit::singleline(value).hint_text("–").desired_width(width));
         return false;
     }
     let text = if value.trim().is_empty() { "–".to_string() } else { "•".repeat(8) };
