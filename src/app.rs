@@ -21,7 +21,8 @@ use crate::ui::dashboard::{self, DashAction};
 use crate::ui::lock::{LockScreen, Unlocked};
 use crate::ui::settings::{self, KeyFileForm, PasswordForm, SettingsAction};
 use crate::ui::student_form::{self, FormAction, Role, Shown};
-use crate::ui::student_list::{self, Category, ListState};
+use crate::ui::student_import::{self, StudentImport};
+use crate::ui::student_list::{self, Category, ListAction, ListState};
 use crate::ui::timetable::{self, TimetableDialog};
 use crate::ui::{icons, theme, widgets};
 
@@ -269,6 +270,8 @@ struct Session {
     dirty_since: Option<f64>,
     status: SaveStatus,
     new_student: Option<NewStudent>,
+    /// Students from a spreadsheet, while they are being chosen.
+    student_import: Option<(StudentImport, crate::sheet_import::SheetKind)>,
     /// The student whose hidden registration number is shown.
     revealed: Option<Uuid>,
     reveal_prompt: Option<RevealPrompt>,
@@ -336,6 +339,7 @@ impl Session {
             dirty_since: None,
             status: SaveStatus::Saved,
             new_student: None,
+            student_import: None,
             revealed: None,
             reveal_prompt: None,
             rar_notes: None,
@@ -581,6 +585,7 @@ impl Session {
         self.toast(ui);
         self.shortcuts(ui);
         self.timetable_dialog(ui);
+        self.student_import_dialog(ui);
         self.dialogs(ui);
         let ctx = ui.ctx();
         // Anything floating over the app takes it (a date picker, a menu, a
@@ -1023,7 +1028,7 @@ impl Session {
                 }
             }
             View::List(cat) => {
-                let add = student_list::show(
+                let action = student_list::show(
                     ui,
                     &self.db,
                     &cat,
@@ -1034,7 +1039,12 @@ impl Session {
                         private: self.private,
                     },
                 );
-                if add
+                if action == ListAction::Import
+                    && let Some(kind) = cat.import_kind()
+                {
+                    self.pick_sheet(ui, kind, &cat);
+                }
+                if action == ListAction::Add
                     || ui.input_mut(|i| {
                         i.consume_shortcut(&egui::KeyboardShortcut::new(
                             egui::Modifiers::COMMAND,
@@ -1233,6 +1243,57 @@ impl Session {
         }
         let file = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
         self.calendar.import = Some(calendar::ImportDialog::new(file, events, &self.db));
+    }
+
+    /// Ask for a spreadsheet and show its students for importing into `cat`.
+    fn pick_sheet(&mut self, ui: &Ui, kind: crate::sheet_import::SheetKind, cat: &Category) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import students from a spreadsheet")
+            .add_filter("Spreadsheet", &["xlsx", "xlsm", "xls", "xlsb", "ods"])
+            .pick_file()
+        else {
+            return;
+        };
+        let sheet = crate::sheet_import::read_first_sheet(&path).and_then(|rows| crate::sheet_import::students(&rows));
+        let sheet = match sheet {
+            Ok(sheet) if sheet.students.is_empty() => {
+                self.notify(ui, "No students found in the first sheet of that file");
+                return;
+            }
+            Ok(sheet) => sheet,
+            Err(e) => {
+                self.notify(ui, e);
+                return;
+            }
+        };
+        let file = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let list = match cat {
+            Category::Projects(list) => Some(list.as_str()),
+            _ => None,
+        };
+        self.student_import = Some((StudentImport::new(kind, file, sheet, &self.db, list), kind));
+    }
+
+    /// The students of a spreadsheet, while they are being chosen.
+    fn student_import_dialog(&mut self, ui: &mut Ui) {
+        let Some((dialog, kind)) = &mut self.student_import else { return };
+        let kind = *kind;
+        match dialog.show(ui) {
+            student_import::Outcome::Open => {}
+            student_import::Outcome::Closed => self.student_import = None,
+            student_import::Outcome::Add(choices) => {
+                self.student_import = None;
+                let added = crate::sheet_import::add_students(&mut self.db, kind, choices);
+                let students = |n: usize| if n == 1 { "1 student".to_string() } else { format!("{n} students") };
+                let msg = match (added.new, added.existing) {
+                    (0, 0) => "Nothing added".to_string(),
+                    (n, 0) => format!("Added {}", students(n)),
+                    (0, e) => format!("Added {} already in Supervisor to this list", students(e)),
+                    (n, e) => format!("Added {}, and {e} already in Supervisor", students(n)),
+                };
+                self.notify(ui, msg);
+            }
+        }
     }
 
     fn change_password(&mut self, ui: &Ui) {
@@ -3886,6 +3947,73 @@ mod ui_tests {
         h.get_by_label("4th").click();
         h.run_steps(2);
         assert_eq!(session(&mut h).db.student(id).unwrap().advisee.as_ref().unwrap().year, Some(StudyYear::Fourth));
+    }
+
+    #[test]
+    fn students_are_imported_from_a_spreadsheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let aisha = Student {
+            b_number: "B00111111".into(),
+            name: "Aisha Khan".into(),
+            advisee: Some(AdviseeRecord::default()),
+            ..Default::default()
+        };
+        let ana = Student { b_number: "B00333333".into(), fyp: Some(FypRecord::default()), ..Default::default() };
+        let aisha_id = aisha.id;
+        {
+            let s = session(&mut h);
+            s.db.settings.my_email = "me@ulster.ac.uk".into();
+            s.db.students.extend([aisha, ana]);
+            s.view = View::List(Category::Advisee);
+        }
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("Import…").is_none(), "no spreadsheet layout for advisees yet");
+        session(&mut h).view = View::List(Category::Projects("SUST".into()));
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("Import…").is_some(), "SUST students too");
+        session(&mut h).view = View::List(Category::Projects("BEng".into()));
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("Import…").is_some());
+
+        let cells: Vec<Vec<String>> = [
+            ["B Number", "Name", "Project Title", "Supervisor Email", "Supervisor Name"],
+            ["B00111111", "Khan, Aisha", "Drone arm", "me@ulster.ac.uk", "Me"],
+            ["B00222222", "Murphy, Sean", "Wind tunnel", "other@ulster.ac.uk", "Other"],
+            ["B00333333", "Silva, Ana", "Heat pipes", "me@ulster.ac.uk", "Me"],
+            ["B00444444", "Brown, Tom", "Gearbox", "ME@ulster.ac.uk", "Me"],
+        ]
+        .iter()
+        .map(|r| r.iter().map(|c| c.to_string()).collect())
+        .collect();
+        {
+            let s = session(&mut h);
+            let sheet = crate::sheet_import::students(&cells).unwrap();
+            let kind = crate::sheet_import::SheetKind::Projects;
+            s.student_import = Some((StudentImport::new(kind, "allocations.xlsx".into(), sheet, &s.db, Some("BEng")), kind));
+        }
+        h.run_steps(3);
+        // Only the rows with your email show, and those not yet in the list are ticked.
+        assert!(h.query_by_label_contains("3 of the 4 rows have me@ulster.ac.uk").is_some());
+        assert!(h.query_by_label("2 students to add · 1 already in this list").is_some());
+        assert!(h.query_by_label("Already in this list").is_some());
+        assert!(h.query_by_label("In another list").is_some());
+        assert!(h.query_by_label("Sean Murphy").is_none());
+        h.get_by_label("Show other staff's students (1)").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Sean Murphy").is_some());
+        shot(&mut h, "student_import");
+        h.get_by_label("Add 2 students").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Added 1 student, and 1 already in Supervisor").is_some());
+        let s = session(&mut h);
+        assert!(s.student_import.is_none());
+        assert_eq!(s.db.students.len(), 3, "Sean was not ticked");
+        let fyp = s.db.student(aisha_id).unwrap().fyp.as_ref().unwrap();
+        assert_eq!((fyp.programme.as_str(), fyp.project_title.as_str()), ("BEng", "Drone arm"));
+        let tom = s.db.students.iter().find(|s| s.b_number == "B00444444").unwrap();
+        assert_eq!(tom.name, "Tom Brown");
     }
 
     #[test]

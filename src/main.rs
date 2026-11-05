@@ -7,6 +7,7 @@ mod ics_import;
 mod model;
 #[cfg(test)]
 mod perf_tests;
+mod sheet_import;
 mod storage;
 mod ui;
 

@@ -62,9 +62,30 @@ pub struct ListState<'a> {
     pub private: bool,
 }
 
-/// Returns true when "Add student" was clicked.
-pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bool {
-    let mut add = false;
+/// A button of the list's header.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ListAction {
+    None,
+    Add,
+    /// Import students from a spreadsheet.
+    Import,
+}
+
+impl Category {
+    /// Lists that students can be imported into from a spreadsheet: the
+    /// project students and the placement students.
+    pub fn import_kind(&self) -> Option<crate::sheet_import::SheetKind> {
+        use crate::sheet_import::SheetKind;
+        match self {
+            Category::Projects(_) => Some(SheetKind::Projects),
+            Category::Placement => Some(SheetKind::Placement),
+            _ => None,
+        }
+    }
+}
+
+pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> ListAction {
+    let mut add = ListAction::None;
     let count = cat.count(db);
     let subtitle = match count {
         0 => "No current students".to_string(),
@@ -77,7 +98,15 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> bo
             .on_hover_text("Ctrl+N")
             .clicked()
         {
-            add = true;
+            add = ListAction::Add;
+        }
+        if cat.import_kind().is_some()
+            && ui
+                .add(egui::Button::new(format!("{}  Import…", icons::DOWNLOAD_SIMPLE)).min_size(egui::vec2(0.0, 34.0)))
+                .on_hover_text("Add students from an Excel spreadsheet")
+                .clicked()
+        {
+            add = ListAction::Import;
         }
     });
     ui.horizontal(|ui| {

@@ -10,6 +10,7 @@ pub mod phd;
 pub mod placement;
 pub mod settings;
 pub mod student_form;
+pub mod student_import;
 pub mod student_list;
 pub mod theme;
 pub mod timetable;
