@@ -1,5 +1,6 @@
-//! Choosing which students of a spreadsheet to add: those with your email
-//! as their supervisor or academic visitor are ticked.
+//! Choosing which students of a spreadsheet to add: those with your email,
+//! or your name, as their supervisor or academic visitor are ticked. When
+//! neither is found, “Filter by” picks the supervisor by hand.
 
 use egui::{RichText, Ui};
 
@@ -14,16 +15,32 @@ pub struct StudentImport {
     /// Courses a project student can be on.
     programmes: Vec<Course>,
     my_email: String,
-    has_staff_email: bool,
-    /// Rows of other members of staff are shown too.
-    show_all: bool,
+    my_name: String,
+    has_staff: bool,
+    emails_filled: usize,
+    /// The supervisors (or visitors) of the sheet: `name_key`, the name as
+    /// the sheet first gives it, and how many rows.
+    staff: Vec<(String, String, usize)>,
+    filter: Filter,
     search: String,
+}
+
+/// Whose rows are shown.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Filter {
+    /// The rows found to be yours.
+    Mine,
+    Everyone,
+    /// One supervisor's rows (`name_key`), chosen by hand.
+    Staff(String),
 }
 
 struct Row {
     student: SheetStudent,
     take: bool,
     mine: bool,
+    /// `name_key` of each supervisor (or visitor) of the row.
+    staff: Vec<String>,
     existing: Option<Existing>,
     /// The same student is on an earlier row.
     repeat: bool,
@@ -64,15 +81,30 @@ impl StudentImport {
             .or_else(|| programmes.first().map(|(id, _, _)| id.clone()))
             .unwrap_or_default();
         let my_email = settings.my_email.trim().to_string();
+        let my_name = settings.my_name.trim().to_string();
         let mut rows: Vec<Row> = Vec::with_capacity(sheet.students.len());
+        let mut staff: Vec<(String, String, usize)> = Vec::new();
         for student in sheet.students {
             let repeat = rows.iter().any(|r| sheet_import::same_student(&r.student, &student));
             let existing = sheet_import::existing(db, &student, kind);
-            let mine = student.is_mine(&my_email);
-            let mut row = Row { take: false, mine, existing, repeat, programme: suggested.clone(), student };
+            let mine = student.is_mine(&my_email, &my_name);
+            let mut keys = Vec::new();
+            for name in student.staff() {
+                let key = sheet_import::name_key(&name);
+                if keys.contains(&key) {
+                    continue;
+                }
+                match staff.iter_mut().find(|(k, _, _)| *k == key) {
+                    Some((_, _, n)) => *n += 1,
+                    None => staff.push((key.clone(), name, 1)),
+                }
+                keys.push(key);
+            }
+            let mut row = Row { take: false, mine, staff: keys, existing, repeat, programme: suggested.clone(), student };
             row.take = mine && !row.locked();
             rows.push(row);
         }
+        staff.sort_by_key(|(_, name, _)| name.to_lowercase());
         let any_mine = rows.iter().any(|r| r.mine);
         Self {
             kind,
@@ -80,14 +112,57 @@ impl StudentImport {
             rows,
             programmes,
             my_email,
-            has_staff_email: sheet.has_staff_email,
-            show_all: !any_mine,
+            my_name,
+            has_staff: sheet.has_staff,
+            emails_filled: sheet.emails_filled,
+            staff,
+            filter: if any_mine { Filter::Mine } else { Filter::Everyone },
             search: String::new(),
         }
     }
 
+    fn in_filter(&self, row: &Row) -> bool {
+        match &self.filter {
+            Filter::Mine => row.mine,
+            Filter::Everyone => true,
+            Filter::Staff(key) => row.staff.contains(key),
+        }
+    }
+
     fn visible(&self, row: &Row) -> bool {
-        (self.show_all || row.mine) && row.student.matches(&self.search)
+        self.in_filter(row) && row.student.matches(&self.search)
+    }
+
+    /// Shows only `filter`'s rows. Choosing yours or one supervisor ticks
+    /// their rows, and only theirs.
+    fn set_filter(&mut self, filter: Filter) {
+        if filter == self.filter {
+            return;
+        }
+        self.filter = filter;
+        if self.filter != Filter::Everyone {
+            for i in 0..self.rows.len() {
+                let take = self.in_filter(&self.rows[i]) && !self.rows[i].locked();
+                self.rows[i].take = take;
+            }
+        }
+    }
+
+    fn filter_text(&self, filter: &Filter) -> String {
+        match filter {
+            Filter::Mine => format!("You ({})", self.rows.iter().filter(|r| r.mine).count()),
+            Filter::Everyone => format!("Everyone ({})", self.rows.len()),
+            Filter::Staff(key) => self
+                .staff
+                .iter()
+                .find(|(k, _, _)| k == key)
+                .map_or_else(String::new, |(_, name, n)| format!("{name} ({n})")),
+        }
+    }
+
+    /// You, as Settings gives you: name and email.
+    fn you(&self) -> String {
+        [self.my_name.as_str(), self.my_email.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", ")
     }
 
     fn choices(&self) -> Vec<Choice> {
@@ -102,21 +177,30 @@ impl StudentImport {
     fn explanation(&self) -> (String, bool) {
         let staff = self.kind.staff();
         let mine = self.rows.iter().filter(|r| r.mine).count();
-        if !self.has_staff_email {
-            (format!("This sheet has no {staff} email column, so nothing is ticked. Tick your students by hand."), true)
-        } else if self.my_email.is_empty() {
+        if !self.has_staff {
+            (format!("This sheet has no {staff} column, so nothing is ticked. Tick your students by hand."), true)
+        } else if let Filter::Staff(_) = self.filter {
+            (format!("The rows of the {staff} chosen under “Filter by” are ticked."), false)
+        } else if self.my_email.is_empty() && self.my_name.is_empty() {
             (
                 format!(
-                    "Add your email in Settings › Invitations to have the rows with you as {staff} ticked. \
-                     Until then, tick your students by hand."
+                    "Add your name and email in Settings › Invitations to have the rows with you as {staff} ticked. \
+                     Until then, choose your name under “Filter by”, or tick your students by hand."
                 ),
                 true,
             )
         } else if mine == 0 {
-            (format!("No row has {} as the {staff}. Tick your students by hand.", self.my_email), true)
+            (
+                format!(
+                    "No row has you ({}) as the {staff}. Choose your name under “Filter by”, or tick your students \
+                     by hand.",
+                    self.you()
+                ),
+                true,
+            )
         } else {
             let of = self.rows.len();
-            (format!("{mine} of the {of} rows have {} as the {staff}.", self.my_email), false)
+            (format!("{mine} of the {of} rows have you ({}) as the {staff}.", self.you()), false)
         }
     }
 
@@ -144,8 +228,17 @@ impl StudentImport {
             ui.add(
                 egui::Label::new(
                     RichText::new(
-                        "Students already in Supervisor are matched by their B number. Only the first sheet of the \
-                         file is read.",
+                        &if self.emails_filled > 0 {
+                            format!(
+                                "Students already in Supervisor are matched by their B number. Students are read from \
+                                 the first sheet; {} missing emails were found by name on the other sheets.",
+                                self.emails_filled
+                            )
+                        } else {
+                            "Students already in Supervisor are matched by their B number. Students are read from the \
+                             first sheet."
+                                .to_string()
+                        },
                     )
                     .small()
                     .color(theme::muted(ui)),
@@ -153,13 +246,41 @@ impl StudentImport {
                 .wrap(),
             );
             ui.add_space(8.0);
-            let others = self.rows.iter().filter(|r| !r.mine).count();
             let any_mine = self.rows.iter().any(|r| r.mine);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(icons::MAGNIFYING_GLASS).color(theme::muted(ui)));
                 ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search").desired_width(200.0));
-                if any_mine && others > 0 {
-                    ui.checkbox(&mut self.show_all, format!("Show other staff's students ({others})"));
+                if !self.staff.is_empty() {
+                    ui.separator();
+                    ui.label(format!("Filter by {}", self.kind.staff()));
+                    let mut options = Vec::with_capacity(self.staff.len() + 2);
+                    if any_mine {
+                        options.push(Filter::Mine);
+                    }
+                    options.push(Filter::Everyone);
+                    options.extend(self.staff.iter().map(|(key, _, _)| Filter::Staff(key.clone())));
+                    let mut chosen = None;
+                    egui::ComboBox::from_id_salt("filter-staff")
+                        .selected_text(self.filter_text(&self.filter))
+                        .width(220.0)
+                        .height(360.0)
+                        .show_ui(ui, |ui| {
+                            for option in options {
+                                let text = self.filter_text(&option);
+                                if ui.selectable_label(self.filter == option, text).clicked() {
+                                    chosen = Some(option);
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(format!(
+                            "Show one {}'s students, and tick them. “Everyone” shows every row and leaves the ticks as \
+                             they are.",
+                            self.kind.staff()
+                        ));
+                    if let Some(filter) = chosen {
+                        self.set_filter(filter);
+                    }
                 }
                 ui.separator();
                 let shown: Vec<usize> = (0..self.rows.len()).filter(|&i| self.visible(&self.rows[i])).collect();
@@ -181,7 +302,7 @@ impl StudentImport {
             let row_height = 30.0;
             let list_height = (screen.height() - 380.0).clamp(160.0, 520.0);
             let kind = self.kind;
-            let show_staff = self.show_all;
+            let show_staff = self.filter == Filter::Everyone;
             egui::Frame::NONE
                 .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
                 .corner_radius(egui::CornerRadius::same(10))

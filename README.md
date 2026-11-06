@@ -12,7 +12,7 @@ Supervisor is a desktop application for the administration of student supervisio
 - **Research students:** four lists (PhD, PhD External, MSc and MSc External) with assessments, annual reports, submission, viva and reminders. External students have their own list of deadlines.
 - **Brazilian programmes:** academic and professional levels, funding bodies, standard stages, the defence committee and suggested deadlines.
 - **Placement visits:** requests, replies and the attendance of the line manager.
-- **Importing students:** project and placement students can be added from an Excel spreadsheet, such as the list of project allocations or of placement visits. The rows with the user's email as supervisor or academic visitor are selected.
+- **Importing students:** project and placement students can be added from an Excel spreadsheet, such as the list of project allocations or of placement visits. The rows with the user's email or name as supervisor or academic visitor are selected, and another can be chosen with **Filter by**.
 - **Studies advisees:** contact, replies and meetings for each semester, together with the year of study (1st, 2nd or 4th).
 - **Modules:** a card, collapsed by default, for local advisees and project students. For each semester it records whether modules are pending from the previous semester. For each pending module it records the code, the name, the failed component (CW, EX or CW+EX) and the marks. In Semester 2 it also records whether the module was discussed with an advisee. The number of pending modules determines whether the student needs to talk to their advisor, the course director or the Head of School. These thresholds are set in Settings.
 - **Reasonable adjustments:** a RAR option for local students, with notes that open only after password confirmation.
@@ -107,7 +107,7 @@ As an alternative to **Import key file…**, the backup can be copied into that 
 
 1. Set a password on first launch.
 2. In **Settings**, enter the academic year and the date on which week 1 starts in each semester.
-3. In **Settings › Invitations**, enter your email. It is used for invitations and to find your students in spreadsheets.
+3. In **Settings › Invitations**, enter your name and email. They are used for invitations and to find your students in spreadsheets.
 4. Add students with **Add student** (`Ctrl+N`), or with **Import…** (see below), and complete the remaining fields in the details panel.
 
 The keyboard button next to **Settings** (or `F1`) lists the keyboard shortcuts.
@@ -116,7 +116,7 @@ The keyboard button next to **Settings** (or `F1`) lists the keyboard shortcuts.
 
 **Import…** appears in the lists of project students and of placement students. It reads `.xlsx`, `.xls` and `.ods` files.
 
-- Only the **first sheet** of the file is read.
+- Students are read from the **first sheet** of the file. A list of people by *Name* and *Email* on another sheet (for example the SUST and Ulster supervisors on the second sheet of the SUST allocations) fills in the emails the first sheet leaves out, matched by name. When two people share a name, the department in brackets after it, such as *(Mechanical Eng)*, is compared with the student's course; if that doesn't decide, the email is left empty.
 - The columns are recognised by the words in their headings, in any order and with any capitals or punctuation. Other columns are ignored.
 
   | Heading, for example | Fills in |
@@ -124,8 +124,8 @@ The keyboard button next to **Settings** (or `F1`) lists the keyboard shortcuts.
   | *B Number*, *Registration*, *Student ID* | B number |
   | *Name*, or *First Name* and *Last Name* | Name (*Last, First* is turned round) |
   | *E-Mail*, *UU Email* | Email |
-  | *Course* (not *Course Code*) | Course |
-  | *Supervisor Email*, *UU Supervisor Email*, *Academic visitors email* | Used to find your students |
+  | *Course*, *Major* (not *Course Code*) | Course |
+  | *Supervisor*, *UU Supervisor*, *Supervisor Email*, *Academic visitors email* | Used to find your students |
   | *Project Title* | Project title |
   | *SUST Supervisor*, *SUST Supervisor Email* | SUST supervisor (SUST students) |
   | *Second Marker*, *Second Marker Email* | Second marker (other project students) |
@@ -133,7 +133,8 @@ The keyboard button next to **Settings** (or `F1`) lists the keyboard shortcuts.
   | *Placement*, *Company*, *Employer* | Placement company |
   | *Line Manager*, *Line Manager Email*, *Professional Email* | Placement details |
 
-- The rows with your email as supervisor or academic visitor are ticked. A *SUST Supervisor* column never counts as yours. The rows of other staff are hidden until **Show other staff's students** is selected.
+- The rows with your email, or your name, as supervisor or academic visitor are ticked. Names match whatever their titles, capitals, punctuation and order (*Machado, Dr Gabriel* is *Gabriel Machado*). A *SUST Supervisor* column never counts as yours. The rows of other staff are hidden.
+- **Filter by** chooses whose rows are shown: **You**, **Everyone**, or one supervisor or academic visitor of the sheet. Choosing one person ticks their rows, which helps when your rows are not found automatically. **Everyone** leaves the ticks as they are.
 - Students already in Supervisor are matched by their B number. A student who is already in the list is not added again. A student in another list, such as an advisee, receives the project or placement in the same record, and an archived student is restored.
 - For project students, the course of each row is chosen in the dialog. It starts as the course of the list in which **Import…** was selected.
 

@@ -1254,7 +1254,7 @@ impl Session {
         else {
             return;
         };
-        let sheet = crate::sheet_import::read_first_sheet(&path).and_then(|rows| crate::sheet_import::students(&rows));
+        let sheet = crate::sheet_import::read_workbook(&path).and_then(|sheets| crate::sheet_import::import(&sheets));
         let sheet = match sheet {
             Ok(sheet) if sheet.students.is_empty() => {
                 self.notify(ui, "No students found in the first sheet of that file");
@@ -3995,14 +3995,17 @@ mod ui_tests {
         }
         h.run_steps(3);
         // Only the rows with your email show, and those not yet in the list are ticked.
-        assert!(h.query_by_label_contains("3 of the 4 rows have me@ulster.ac.uk").is_some());
+        assert!(h.query_by_label_contains("3 of the 4 rows have you (me@ulster.ac.uk)").is_some());
         assert!(h.query_by_label("2 students to add · 1 already in this list").is_some());
         assert!(h.query_by_label("Already in this list").is_some());
         assert!(h.query_by_label("In another list").is_some());
         assert!(h.query_by_label("Sean Murphy").is_none());
-        h.get_by_label("Show other staff's students (1)").click();
+        h.get_by_value("You (3)").click();
+        h.run_steps(2);
+        h.get_by_label("Everyone (4)").click();
         h.run_steps(2);
         assert!(h.query_by_label("Sean Murphy").is_some());
+        assert!(h.query_by_label("2 students to add · 1 already in this list").is_some(), "the ticks are kept");
         shot(&mut h, "student_import");
         h.get_by_label("Add 2 students").click();
         h.run_steps(3);
@@ -4014,6 +4017,51 @@ mod ui_tests {
         assert_eq!((fyp.programme.as_str(), fyp.project_title.as_str()), ("BEng", "Drone arm"));
         let tom = s.db.students.iter().find(|s| s.b_number == "B00444444").unwrap();
         assert_eq!(tom.name, "Tom Brown");
+    }
+
+    #[test]
+    fn import_finds_you_by_name_or_lets_you_choose_the_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        // The SUST allocations: names only, no emails.
+        let cells: Vec<Vec<String>> = [
+            ["Student ID", "Student names", "Project Title", "SUST Supervisor", "UU supervisor"],
+            ["B01000001", "Wei Li", "Solar still", "Dongxu Zhang", "Machado, Dr Gabriel"],
+            ["B01000002", "Fang Chen", "Gearbox", "Tao Jiang", "Ralph, Dr Calvin"],
+            ["B01000003", "Min Wu", "Drone", "Tao Jiang", "Ralph, Dr Calvin"],
+        ]
+        .iter()
+        .map(|r| r.iter().map(|c| c.to_string()).collect())
+        .collect();
+        let open = |h: &mut Harness<'_, SupervisorApp>| {
+            let s = session(h);
+            let sheet = crate::sheet_import::import(std::slice::from_ref(&cells)).unwrap();
+            let kind = crate::sheet_import::SheetKind::Projects;
+            s.student_import = Some((StudentImport::new(kind, "sust.xlsx".into(), sheet, &s.db, Some("SUST")), kind));
+            h.run_steps(3);
+        };
+        session(&mut h).db.settings.my_name = "Gabriel Machado".into();
+        open(&mut h);
+        assert!(h.query_by_label_contains("1 of the 3 rows have you (Gabriel Machado)").is_some());
+        assert!(h.query_by_label("1 student to add").is_some());
+        session(&mut h).student_import = None;
+
+        // A name the sheet spells differently: choose the supervisor by hand.
+        session(&mut h).db.settings.my_name = "Cal Ralph".into();
+        open(&mut h);
+        assert!(h.query_by_label_contains("No row has you (Cal Ralph)").is_some());
+        assert!(h.query_by_label("Nothing ticked").is_some());
+        h.get_by_value("Everyone (3)").click();
+        h.run_steps(2);
+        h.get_by_label("Ralph, Dr Calvin (2)").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("2 students to add").is_some());
+        assert!(h.query_by_label("Wei Li").is_none(), "only the chosen supervisor's rows");
+        h.get_by_label("Add 2 students").click();
+        h.run_steps(3);
+        let names: Vec<String> = session(&mut h).db.students.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, ["Fang Chen", "Min Wu"]);
     }
 
     #[test]
