@@ -5,11 +5,20 @@ use egui::Ui;
 use uuid::Uuid;
 
 use crate::model::{PlacementRecord, ReplyStatus, Settings, Timetable, VisitMode, visit_uid};
-use crate::ui::{icons, theme, widgets};
+use crate::ui::student_form::Shown;
+use crate::ui::{fyp, icons, theme, widgets};
 
 /// Returns the visit to send, if asked.
-pub fn show(ui: &mut Ui, p: &mut PlacementRecord, settings: &Settings, timetable: &Timetable, student_id: Uuid) -> Option<widgets::Share> {
+pub fn show(
+    ui: &mut Ui,
+    p: &mut PlacementRecord,
+    settings: &Settings,
+    timetable: &Timetable,
+    student_id: Uuid,
+    shown: &mut Shown,
+) -> Option<widgets::Share> {
     let mut invite = None;
+    let mut switch_marks = false;
     widgets::form_grid(ui, "placement-grid", |ui| {
         ui.label("Company");
         widgets::text_field(ui, &mut p.company, "Placement company");
@@ -23,12 +32,15 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord, settings: &Settings, timetable
         ui.label("Line manager email");
         widgets::text_field(ui, &mut p.line_manager_email, "manager@company.com");
         ui.end_row();
-        ui.label("Second marker");
-        widgets::text_field(ui, &mut p.second_marker_name, "Name");
-        ui.end_row();
-        ui.label("Second marker email");
-        widgets::text_field(ui, &mut p.second_marker_email, "Email");
-        ui.end_row();
+        // Placements have no second marker; kept only for what older versions stored.
+        if !p.second_marker_name.trim().is_empty() || !p.second_marker_email.trim().is_empty() {
+            ui.label("Second marker");
+            widgets::text_field(ui, &mut p.second_marker_name, "Name");
+            ui.end_row();
+            ui.label("Second marker email");
+            widgets::text_field(ui, &mut p.second_marker_email, "Email");
+            ui.end_row();
+        }
     });
 
     for (i, v) in p.visits.iter_mut().enumerate() {
@@ -81,10 +93,23 @@ pub fn show(ui: &mut Ui, p: &mut PlacementRecord, settings: &Settings, timetable
                         ui.label("Completed");
                         ui.checkbox(&mut v.completed, "Visit done");
                         ui.end_row();
+
+                        ui.label("My mark");
+                        ui.horizontal(|ui| {
+                            switch_marks |= fyp::mark_of_width(ui, shown.marks, &mut v.mark, 56.0);
+                            let text = if shown.marks { "Hide marks" } else { "Reveal marks" };
+                            if ui.small_button(text).clicked() {
+                                switch_marks = true;
+                            }
+                        });
+                        ui.end_row();
                     });
                     widgets::notes(ui, &mut v.notes, "Visit notes…");
                 });
         });
+    }
+    if switch_marks {
+        shown.marks = !shown.marks;
     }
     invite
 }

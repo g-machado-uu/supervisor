@@ -6,7 +6,9 @@ use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Timelike};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const DB_VERSION: u32 = 1;
+/// Files from before version 2 have their modules brought up to date on
+/// opening (`Database::upgrade`).
+pub const DB_VERSION: u32 = 2;
 
 /// How long before a PhD student's visa ends to flag it on the dashboard.
 const VISA_WARNING_DAYS: i64 = 90;
@@ -131,6 +133,40 @@ impl Platform {
 // Settings & modules
 // ---------------------------------------------------------------------------
 
+/// Who marks a coursework of a project student.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Markers {
+    /// The supervisor and the second marker, who then agree the mark.
+    #[default]
+    Both,
+    /// The supervisor alone (e.g. MEC526, or the MEng interim report).
+    Supervisor,
+    /// The second marker alone (the poster).
+    Second,
+}
+
+impl Markers {
+    pub const ALL: [Markers; 3] = [Markers::Both, Markers::Supervisor, Markers::Second];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Markers::Both => "Supervisor + 2nd marker",
+            Markers::Supervisor => "Supervisor only",
+            Markers::Second => "2nd marker only",
+        }
+    }
+
+    /// The supervisor gives a mark.
+    pub fn supervisor(self) -> bool {
+        self != Markers::Second
+    }
+
+    /// The second marker gives a mark.
+    pub fn second(self) -> bool {
+        self != Markers::Supervisor
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct CourseworkTemplate {
@@ -140,6 +176,9 @@ pub struct CourseworkTemplate {
     pub week: Option<u8>,
     /// An explicit deadline; takes precedence over `week`.
     pub deadline: Option<NaiveDate>,
+    pub markers: Markers,
+    /// Share of the module mark, in percent, when known.
+    pub weight: Option<u8>,
 }
 
 impl Default for CourseworkTemplate {
@@ -149,6 +188,8 @@ impl Default for CourseworkTemplate {
             title: "New coursework".into(),
             week: None,
             deadline: None,
+            markers: Markers::Both,
+            weight: None,
         }
     }
 }
@@ -169,6 +210,46 @@ impl CourseworkTemplate {
             week,
             ..Default::default()
         }
+    }
+
+    fn marked(title: &str, markers: Markers, weight: Option<u8>) -> Self {
+        Self {
+            title: title.into(),
+            markers,
+            weight,
+            ..Default::default()
+        }
+    }
+
+    /// The poster, marked at the poster session.
+    pub fn is_poster(&self) -> bool {
+        self.title.to_lowercase().contains("poster")
+    }
+}
+
+impl Module {
+    /// The module mark: the courseworks' final marks, by their weights.
+    /// Only when every coursework has a weight and a final mark.
+    pub fn weighted_mark(&self, marks: &HashMap<Uuid, CwStatus>) -> Option<f64> {
+        if self.courseworks.is_empty() {
+            return None;
+        }
+        let mut total = 0.0;
+        let mut weights = 0.0;
+        for cw in &self.courseworks {
+            let weight = f64::from(cw.weight?);
+            total += weight * marks.get(&cw.id)?.final_mark(cw.markers)?;
+            weights += weight;
+        }
+        (weights > 0.0).then(|| total / weights)
+    }
+
+    /// The weights add up to this, when every coursework has one and they
+    /// don't make 100%.
+    pub fn weights_off(&self) -> Option<u32> {
+        let weights: Option<Vec<u8>> = self.courseworks.iter().map(|cw| cw.weight).collect();
+        let sum: u32 = weights?.iter().map(|&w| u32::from(w)).sum();
+        (!self.courseworks.is_empty() && sum != 100).then_some(sum)
     }
 }
 
@@ -317,6 +398,16 @@ impl Default for Settings {
     }
 }
 
+/// EEE840 and EEE802: the interim report (supervisor), the poster (second
+/// marker) and the dissertation (both), 10%, 10% and 80%.
+fn meng_courseworks() -> Vec<CourseworkTemplate> {
+    vec![
+        CourseworkTemplate::marked("Interim report", Markers::Supervisor, Some(10)),
+        CourseworkTemplate::marked("Poster", Markers::Second, Some(10)),
+        CourseworkTemplate::marked("Dissertation", Markers::Both, Some(80)),
+    ]
+}
+
 pub fn default_modules() -> Vec<Module> {
     let module = |code: &str, name: &str, semester, programmes: &[&str], cws| Module {
         code: code.into(),
@@ -333,8 +424,16 @@ pub fn default_modules() -> Vec<Module> {
             Semester::S1,
             &["BEng"],
             vec![
-                CourseworkTemplate::new("Coursework 1", Some(8)),
-                CourseworkTemplate::new("Coursework 2", Some(12)),
+                CourseworkTemplate {
+                    markers: Markers::Supervisor,
+                    weight: Some(50),
+                    ..CourseworkTemplate::new("Coursework 1", Some(8))
+                },
+                CourseworkTemplate {
+                    markers: Markers::Supervisor,
+                    weight: Some(50),
+                    ..CourseworkTemplate::new("Coursework 2", Some(12))
+                },
             ],
         ),
         module(
@@ -343,8 +442,8 @@ pub fn default_modules() -> Vec<Module> {
             Semester::S2,
             &["BEng"],
             vec![
-                CourseworkTemplate::new("Poster", None),
-                CourseworkTemplate::new("Coursework 2", None),
+                CourseworkTemplate::marked("Poster", Markers::Second, Some(10)),
+                CourseworkTemplate::marked("Dissertation", Markers::Both, Some(90)),
             ],
         ),
         module(
@@ -366,14 +465,14 @@ pub fn default_modules() -> Vec<Module> {
             "MEng Final Year Dissertation",
             Semester::FullYear,
             &["MEng"],
-            Vec::new(),
+            meng_courseworks(),
         ),
         module(
             "EEE802",
             "MEng Final Year Dissertation",
             Semester::FullYear,
             &["MEngGermany"],
-            Vec::new(),
+            meng_courseworks(),
         ),
     ]
 }
@@ -449,6 +548,14 @@ impl Settings {
         status
             .and_then(|s| s.deadline_override)
             .or_else(|| self.template_deadline(module, cw))
+    }
+
+    /// The courseworks of a course a second marker marks (with the module
+    /// they belong to): the poster and the dissertation.
+    pub fn second_marked<'a>(&'a self, programme: &'a str) -> Vec<(&'a Module, &'a CourseworkTemplate)> {
+        self.modules_for(programme)
+            .flat_map(|m| m.courseworks.iter().filter(|cw| cw.markers.second()).map(move |cw| (m, cw)))
+            .collect()
     }
 
     pub fn modules_for<'a>(&'a self, programme: &'a str) -> impl Iterator<Item = &'a Module> {
@@ -906,6 +1013,21 @@ pub fn fmt_mark(mark: f64) -> String {
 }
 
 impl CwStatus {
+    /// The mark that counts: the agreed mark when both mark, otherwise the
+    /// one marker's.
+    pub fn final_mark(&self, markers: Markers) -> Option<f64> {
+        parse_mark(match markers {
+            Markers::Both => &self.agreed_mark,
+            Markers::Supervisor => &self.mark_1,
+            Markers::Second => &self.mark_2,
+        })
+    }
+
+    /// Marked, and agreed when both mark: nothing left to do.
+    pub fn marked(&self, markers: Markers) -> bool {
+        self.final_mark(markers).is_some() && !(markers == Markers::Both && self.agreed_unconfirmed)
+    }
+
     /// Both markers' marks, when both are numbers.
     pub fn marks(&self) -> Option<(f64, f64)> {
         Some((parse_mark(&self.mark_1)?, parse_mark(&self.mark_2)?))
@@ -963,6 +1085,8 @@ pub struct FypRecord {
     pub second_marker_email: String,
     /// The student's own SUST email, when known.
     pub sust_email: String,
+    /// Where their poster is at the poster session.
+    pub poster_number: String,
 }
 
 impl Default for FypRecord {
@@ -979,6 +1103,7 @@ impl Default for FypRecord {
             second_marker_name: String::new(),
             second_marker_email: String::new(),
             sust_email: String::new(),
+            poster_number: String::new(),
         }
     }
 }
@@ -995,6 +1120,8 @@ pub struct Visit {
     pub line_manager_attending: TriState,
     pub completed: bool,
     pub notes: String,
+    /// My mark for the visit, as typed in.
+    pub mark: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -1026,6 +1153,121 @@ impl Default for PlacementRecord {
             second_marker_name: String::new(),
             second_marker_email: String::new(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Marking students I don't supervise
+// ---------------------------------------------------------------------------
+
+/// What I mark of a student who isn't mine.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MarkingKind {
+    /// A BEng or MEng final-year project: as second marker, the poster and
+    /// the dissertation.
+    #[default]
+    Project,
+    /// An MSc dissertation, as second marker.
+    Msc,
+    /// The final placement report, marked by me alone.
+    Placement,
+}
+
+impl MarkingKind {
+    pub const ALL: [MarkingKind; 3] = [MarkingKind::Project, MarkingKind::Msc, MarkingKind::Placement];
+
+    /// The sidebar list.
+    pub fn label(self) -> &'static str {
+        match self {
+            MarkingKind::Project => "Final-year projects",
+            MarkingKind::Msc => "MSc dissertations",
+            MarkingKind::Placement => "Placement reports",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            MarkingKind::Project => "Project",
+            MarkingKind::Msc => "MSc",
+            MarkingKind::Placement => "Placement report",
+        }
+    }
+
+    /// Who the student's own member of staff is.
+    pub fn staff(self) -> &'static str {
+        match self {
+            MarkingKind::Project | MarkingKind::Msc => "Supervisor",
+            MarkingKind::Placement => "Academic visitor",
+        }
+    }
+
+    /// The one piece of work marked, for an MSc student or a placement
+    /// report: its title, and who marks it. A project's are the courseworks
+    /// of its modules.
+    pub fn report(self) -> Option<(&'static str, Markers)> {
+        match self {
+            MarkingKind::Project => None,
+            MarkingKind::Msc => Some(("Dissertation", Markers::Both)),
+            MarkingKind::Placement => Some(("Final report", Markers::Second)),
+        }
+    }
+}
+
+/// A student I mark the work of, without supervising them. Marks are kept
+/// as for my own students: `mark_1` is the supervisor's, `mark_2` mine.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct MarkingRecord {
+    pub kind: MarkingKind,
+    /// Projects: `Programme::id` (BEng, MEng…), whose modules give the
+    /// courseworks a second marker marks.
+    pub programme: String,
+    /// The student's supervisor, or academic visitor for a placement.
+    pub supervisor_name: String,
+    pub supervisor_email: String,
+    /// Project or dissertation title.
+    pub title: String,
+    /// Placement reports: the company.
+    pub company: String,
+    /// Where their poster is at the poster session.
+    pub poster_number: String,
+    /// Projects: keyed by `CourseworkTemplate::id`.
+    pub coursework: HashMap<Uuid, CwStatus>,
+    /// MSc dissertation or placement report.
+    pub report: CwStatus,
+}
+
+impl MarkingRecord {
+    /// What there is to mark, and whether it is done: (done, all).
+    pub fn progress(&self, settings: &Settings) -> (usize, usize) {
+        if let Some((_, markers)) = self.kind.report() {
+            return (usize::from(self.report.marked(markers)), 1);
+        }
+        let items = settings.second_marked(&self.programme);
+        let done = items
+            .iter()
+            .filter(|(_, cw)| self.coursework.get(&cw.id).is_some_and(|st| st.marked(cw.markers)))
+            .count();
+        (done, items.len())
+    }
+
+    /// A mark to agree with the supervisor: too far apart, or an average
+    /// still to confirm.
+    pub fn to_agree(&self, settings: &Settings) -> bool {
+        let open = |st: &CwStatus| st.marks_apart().is_some() || st.agreed_unconfirmed;
+        match self.kind.report() {
+            Some((_, Markers::Both)) => open(&self.report),
+            Some(_) => false,
+            None => settings
+                .second_marked(&self.programme)
+                .iter()
+                .any(|(_, cw)| cw.markers == Markers::Both && self.coursework.get(&cw.id).is_some_and(open)),
+        }
+    }
+
+    /// The poster number as a number, for walking the poster session in order.
+    pub fn poster_order(&self) -> Option<u32> {
+        self.poster_number.trim().trim_start_matches('#').trim().parse().ok()
     }
 }
 
@@ -2239,6 +2481,8 @@ pub struct Student {
     pub placement: Option<PlacementRecord>,
     pub advisee: Option<AdviseeRecord>,
     pub phd: Option<PhdRecord>,
+    /// Their work is marked by me, though I don't supervise them.
+    pub marking: Option<MarkingRecord>,
     pub timetable: Timetable,
     /// Local students: has reasonable adjustments.
     pub rar: bool,
@@ -2262,6 +2506,7 @@ impl Default for Student {
             placement: None,
             advisee: None,
             phd: None,
+            marking: None,
             timetable: Timetable::default(),
             rar: false,
             rar_notes: String::new(),
@@ -2385,6 +2630,7 @@ impl Student {
         let q = query.to_lowercase();
         let company = self.placement.as_ref().map(|p| p.company.as_str());
         let thesis = self.phd.as_ref().map(|p| p.title.as_str());
+        let marking = self.marking.as_ref();
         [
             Some(self.name.as_str()),
             Some(self.b_number.as_str()),
@@ -2392,6 +2638,9 @@ impl Student {
             Some(self.course.as_str()),
             company,
             thesis,
+            marking.map(|m| m.title.as_str()),
+            marking.map(|m| m.company.as_str()),
+            marking.map(|m| m.supervisor_name.as_str()),
         ]
         .into_iter()
         .flatten()
@@ -2738,6 +2987,56 @@ pub fn upcoming(events: &[Event], today: NaiveDate, days: u32) -> Vec<&Event> {
 }
 
 impl Database {
+    /// Brings a file from an older version up to date. Version 2 says who
+    /// marks each coursework and its weight: MEC526's two are marked by the
+    /// supervisor alone, 50% each; the MEC528 poster (10%) by the second
+    /// marker alone, and its “Coursework 2” is the dissertation (90%); and
+    /// the MEng modules get their three courseworks if they had none.
+    /// Weights already set, and SUST modules, are left as they are.
+    pub fn upgrade(&mut self) {
+        if self.version < 2 {
+            let settings = &mut self.settings;
+            let sust: Vec<String> =
+                settings.programmes.iter().filter(|p| settings.is_sust(&p.id)).map(|p| p.id.clone()).collect();
+            for m in &mut settings.modules {
+                if m.applies_to.iter().any(|p| sust.contains(p)) {
+                    continue;
+                }
+                let two = m.courseworks.len() == 2;
+                match m.code.trim().to_uppercase().as_str() {
+                    "MEC526" => {
+                        for cw in &mut m.courseworks {
+                            cw.markers = Markers::Supervisor;
+                            if two {
+                                cw.weight.get_or_insert(50);
+                            }
+                        }
+                    }
+                    "MEC528" => {
+                        for cw in &mut m.courseworks {
+                            if cw.is_poster() {
+                                cw.markers = Markers::Second;
+                                if two {
+                                    cw.weight.get_or_insert(10);
+                                }
+                            } else {
+                                if cw.title.trim() == "Coursework 2" {
+                                    cw.title = "Dissertation".into();
+                                }
+                                if two {
+                                    cw.weight.get_or_insert(90);
+                                }
+                            }
+                        }
+                    }
+                    "EEE840" | "EEE802" if m.courseworks.is_empty() => m.courseworks = meng_courseworks(),
+                    _ => {}
+                }
+            }
+        }
+        self.version = self.version.max(DB_VERSION);
+    }
+
     pub fn student(&self, id: Uuid) -> Option<&Student> {
         self.students.iter().find(|s| s.id == id)
     }
@@ -4764,5 +5063,118 @@ mod tests {
         assert!(FailedModule::default().is_blank());
         assert!(!FailedModule { code: "ENG502".into(), ..Default::default() }.is_blank());
         assert!(!FailedModule { discussed: true, ..Default::default() }.is_blank());
+    }
+
+    #[test]
+    fn older_files_learn_who_marks_each_coursework() {
+        let cw = |title: &str| CourseworkTemplate::new(title, None);
+        let mut db = Database { version: 1, ..Default::default() };
+        let module = |code: &str, applies: &str, cws: Vec<CourseworkTemplate>| Module {
+            code: code.into(),
+            applies_to: vec![applies.into()],
+            courseworks: cws,
+            ..Default::default()
+        };
+        let mut weighted = cw("Coursework 2");
+        weighted.weight = Some(70);
+        db.settings.modules = vec![
+            module("MEC526", "BEng", vec![cw("Coursework 1"), weighted]),
+            module("MEC528", "BEng", vec![cw("Poster"), cw("Coursework 2")]),
+            module("MEC528", "Sust", vec![cw("Poster"), cw("Coursework 2")]),
+            module("EEE840", "MEng", Vec::new()),
+            module("EEE802", "MEngGermany", vec![cw("Thesis")]),
+        ];
+        db.upgrade();
+        assert_eq!(db.version, DB_VERSION);
+        let summary = |m: &Module| -> Vec<(String, Markers, Option<u8>)> {
+            m.courseworks.iter().map(|c| (c.title.clone(), c.markers, c.weight)).collect()
+        };
+        let [mec526, mec528, sust, eee840, eee802] = &db.settings.modules[..] else { panic!() };
+        let row = |t: &str, m, w| (t.to_string(), m, w);
+        assert_eq!(
+            summary(mec526),
+            [row("Coursework 1", Markers::Supervisor, Some(50)), row("Coursework 2", Markers::Supervisor, Some(70))],
+            "a weight already set is kept"
+        );
+        assert_eq!(
+            summary(mec528),
+            [row("Poster", Markers::Second, Some(10)), row("Dissertation", Markers::Both, Some(90))]
+        );
+        assert_eq!(summary(sust), [row("Poster", Markers::Both, None), row("Coursework 2", Markers::Both, None)]);
+        assert_eq!(
+            summary(eee840),
+            [
+                row("Interim report", Markers::Supervisor, Some(10)),
+                row("Poster", Markers::Second, Some(10)),
+                row("Dissertation", Markers::Both, Some(80)),
+            ]
+        );
+        assert_eq!(summary(eee802), [row("Thesis", Markers::Both, None)], "courseworks already there are kept");
+
+        // New files start with the same.
+        assert_eq!(summary(&Database::default().settings.modules[1]), summary(mec528));
+        // Once upgraded, a module emptied by hand stays empty.
+        db.settings.modules[3].courseworks.clear();
+        db.upgrade();
+        assert!(db.settings.modules[3].courseworks.is_empty());
+    }
+
+    #[test]
+    fn final_and_module_marks() {
+        let modules = default_modules();
+        let meng = modules.iter().find(|m| m.code == "EEE840").unwrap();
+        let [interim, poster, dissertation] = &meng.courseworks[..] else { panic!() };
+        let status = |m1: &str, m2: &str, agreed: &str| CwStatus {
+            mark_1: m1.into(),
+            mark_2: m2.into(),
+            agreed_mark: agreed.into(),
+            ..Default::default()
+        };
+        let mut marks = HashMap::from([
+            (interim.id, status("70", "", "")),
+            (poster.id, status("", "60", "")),
+            (dissertation.id, status("66", "70", "")),
+        ]);
+        assert_eq!(marks[&interim.id].final_mark(Markers::Supervisor), Some(70.0));
+        assert_eq!(marks[&poster.id].final_mark(Markers::Second), Some(60.0));
+        assert_eq!(meng.weighted_mark(&marks), None, "the dissertation is not agreed yet");
+        marks.get_mut(&dissertation.id).unwrap().suggest_agreed();
+        assert!(!marks[&dissertation.id].marked(Markers::Both), "an average still to confirm");
+        assert_eq!(meng.weighted_mark(&marks), Some(0.1 * 70.0 + 0.1 * 60.0 + 0.8 * 68.0));
+        assert_eq!(meng.weights_off(), None);
+        let mut odd = meng.clone();
+        odd.courseworks[2].weight = Some(70);
+        assert_eq!(odd.weights_off(), Some(90));
+        odd.courseworks[0].weight = None;
+        assert_eq!((odd.weights_off(), odd.weighted_mark(&marks)), (None, None), "not every weight is known");
+    }
+
+    #[test]
+    fn marking_progress() {
+        let settings = Settings::default();
+        let modules = settings.modules_for("BEng").collect::<Vec<_>>();
+        let second: Vec<&str> = settings.second_marked("BEng").iter().map(|(_, cw)| cw.title.as_str()).collect();
+        assert_eq!(second, ["Poster", "Dissertation"], "MEC526 has no second marker");
+        assert!(settings.second_marked("Sust").is_empty());
+        let poster = modules[1].courseworks[0].id;
+        let dissertation = modules[1].courseworks[1].id;
+        let mut m = MarkingRecord { programme: "BEng".into(), ..Default::default() };
+        assert_eq!(m.progress(&settings), (0, 2));
+        m.coursework.insert(poster, CwStatus { mark_2: "64".into(), ..Default::default() });
+        assert_eq!(m.progress(&settings), (1, 2));
+        m.coursework.insert(dissertation, CwStatus { mark_1: "70".into(), mark_2: "55".into(), ..Default::default() });
+        assert!(m.to_agree(&settings), "15 marks apart");
+        let d = m.coursework.get_mut(&dissertation).unwrap();
+        d.agreed_mark = "63".into();
+        assert_eq!(m.progress(&settings), (2, 2));
+
+        let mut report = MarkingRecord { kind: MarkingKind::Placement, ..Default::default() };
+        assert_eq!(report.progress(&settings), (0, 1));
+        report.report.mark_2 = "72".into();
+        assert_eq!(report.progress(&settings), (1, 1));
+        assert!(!report.to_agree(&settings), "marked by me alone");
+
+        let posters = ["12", "#3", " 7 ", "", "B"].map(|n| MarkingRecord { poster_number: n.into(), ..Default::default() }.poster_order());
+        assert_eq!(posters, [Some(12), Some(3), Some(7), None, None]);
     }
 }

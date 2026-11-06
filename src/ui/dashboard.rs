@@ -146,6 +146,7 @@ fn tiles(ui: &mut Ui, db: &Database, events: &[Event], today: NaiveDate, action:
                     Category::Research(group) => (icons::GRADUATION_CAP, theme::PLUM, format!("{} students", group.label())),
                     Category::Placement => (icons::BUILDINGS, theme::AMBER, "Placements".into()),
                     Category::Advisee => (icons::CHAT_CIRCLE_TEXT, theme::GREEN, "Studies advisees".into()),
+                    Category::Marking(kind) => (icons::EXAM, theme::GREY, kind.label().into()),
                     Category::All => (icons::USERS_THREE, theme::GREY, "All students".into()),
                 };
                 let this_week = events

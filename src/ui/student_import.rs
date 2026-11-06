@@ -1,10 +1,11 @@
 //! Choosing which students of a spreadsheet to add: those with your email,
-//! or your name, as their supervisor or academic visitor are ticked. When
-//! neither is found, “Filter by” picks the supervisor by hand.
+//! or your name, as their supervisor, academic visitor or mentor (or, for
+//! marking, as second marker) are ticked. When neither is found, “Filter
+//! by” picks the member of staff by hand.
 
 use egui::{RichText, Ui};
 
-use crate::model::Database;
+use crate::model::{Database, MarkingKind};
 use crate::sheet_import::{self, Choice, Existing, Sheet, SheetKind, SheetStudent};
 use crate::ui::{icons, theme};
 
@@ -18,6 +19,7 @@ pub struct StudentImport {
     my_name: String,
     has_staff: bool,
     emails_filled: usize,
+    merged: usize,
     /// The supervisors (or visitors) of the sheet: `name_key`, the name as
     /// the sheet first gives it, and how many rows.
     staff: Vec<(String, String, usize)>,
@@ -48,9 +50,15 @@ struct Row {
 }
 
 impl Row {
-    /// Nothing to add: in this list already, or a repeated row.
+    /// Nothing to add: in this list already with nothing to fill in, or a
+    /// repeated row.
     fn locked(&self) -> bool {
-        self.repeat || self.existing.is_some_and(|e| e.has_role)
+        self.repeat || self.existing.as_ref().is_some_and(|e| e.nothing_to_do())
+    }
+
+    /// In this list already, with details to fill in.
+    fn update(&self) -> bool {
+        self.existing.as_ref().is_some_and(|e| e.has_role)
     }
 }
 
@@ -65,31 +73,37 @@ pub enum Outcome {
 
 impl StudentImport {
     /// `list` is the sidebar list of project students it was opened from;
-    /// its first course is the one suggested.
+    /// its first course is the one suggested, unless a row's course names
+    /// another. Students marked as second marker are never on SUST.
     pub fn new(kind: SheetKind, file: String, sheet: Sheet, db: &Database, list: Option<&str>) -> Self {
         let settings = &db.settings;
+        let marking = kind == SheetKind::Marking(MarkingKind::Project);
         let programmes: Vec<Course> = settings
             .programmes
             .iter()
+            .filter(|p| !(marking && settings.is_sust(&p.id)))
             .map(|p| (p.id.clone(), p.short.clone(), p.name.clone()))
             .collect();
+        let ids: Vec<String> = programmes.iter().map(|(id, _, _)| id.clone()).collect();
         let suggested = settings
             .programmes
             .iter()
             .find(|p| Some(p.list_name()) == list)
             .map(|p| p.id.clone())
-            .or_else(|| programmes.first().map(|(id, _, _)| id.clone()))
+            .or_else(|| ids.first().cloned())
             .unwrap_or_default();
         let my_email = settings.my_email.trim().to_string();
         let my_name = settings.my_name.trim().to_string();
         let mut rows: Vec<Row> = Vec::with_capacity(sheet.students.len());
         let mut staff: Vec<(String, String, usize)> = Vec::new();
+        let has_staff = sheet.has_person(kind);
         for student in sheet.students {
             let repeat = rows.iter().any(|r| sheet_import::same_student(&r.student, &student));
             let existing = sheet_import::existing(db, &student, kind);
-            let mine = student.is_mine(&my_email, &my_name);
+            let mine = student.is_mine(kind, &my_email, &my_name);
+            let programme = sheet_import::course_in(&student.course, settings, &ids).unwrap_or_else(|| suggested.clone());
             let mut keys = Vec::new();
-            for name in student.staff() {
+            for name in student.staff(kind) {
                 let key = sheet_import::name_key(&name);
                 if keys.contains(&key) {
                     continue;
@@ -100,7 +114,7 @@ impl StudentImport {
                 }
                 keys.push(key);
             }
-            let mut row = Row { take: false, mine, staff: keys, existing, repeat, programme: suggested.clone(), student };
+            let mut row = Row { take: false, mine, staff: keys, existing, repeat, programme, student };
             row.take = mine && !row.locked();
             rows.push(row);
         }
@@ -113,8 +127,9 @@ impl StudentImport {
             programmes,
             my_email,
             my_name,
-            has_staff: sheet.has_staff,
+            has_staff,
             emails_filled: sheet.emails_filled,
+            merged: sheet.merged,
             staff,
             filter: if any_mine { Filter::Mine } else { Filter::Everyone },
             search: String::new(),
@@ -216,6 +231,10 @@ impl StudentImport {
                     let what = match self.kind {
                         SheetKind::Projects => "Import project students",
                         SheetKind::Placement => "Import placement students",
+                        SheetKind::Advisees => "Import studies advisees",
+                        SheetKind::Marking(MarkingKind::Project) => "Import projects you second-mark",
+                        SheetKind::Marking(MarkingKind::Msc) => "Import MSc dissertations you second-mark",
+                        SheetKind::Marking(MarkingKind::Placement) => "Import placement reports you mark",
                     };
                     ui.label(theme::serif(what, 22.0));
                     ui.label(RichText::new(&self.file).small().color(theme::muted(ui)));
@@ -225,26 +244,20 @@ impl StudentImport {
             let (explain, warn) = self.explanation();
             let color = if warn { theme::fg(ui, theme::AMBER) } else { theme::muted(ui) };
             ui.add(egui::Label::new(RichText::new(explain).color(color)).wrap());
-            ui.add(
-                egui::Label::new(
-                    RichText::new(
-                        &if self.emails_filled > 0 {
-                            format!(
-                                "Students already in Supervisor are matched by their B number. Students are read from \
-                                 the first sheet; {} missing emails were found by name on the other sheets.",
-                                self.emails_filled
-                            )
-                        } else {
-                            "Students already in Supervisor are matched by their B number. Students are read from the \
-                             first sheet."
-                                .to_string()
-                        },
-                    )
-                    .small()
-                    .color(theme::muted(ui)),
-                )
-                .wrap(),
-            );
+            let mut about = "Students already in Supervisor are matched by their B number. Students are read from the \
+                             first sheet"
+                .to_string();
+            if self.merged > 0 {
+                about.push_str(&format!(
+                    "; details missing there (such as poster numbers) were found for {} of them on the other sheets",
+                    self.merged
+                ));
+            }
+            if self.emails_filled > 0 {
+                about.push_str(&format!("; {} missing emails were found by name on the other sheets", self.emails_filled));
+            }
+            about.push('.');
+            ui.add(egui::Label::new(RichText::new(about).small().color(theme::muted(ui))).wrap());
             ui.add_space(8.0);
             let any_mine = self.rows.iter().any(|r| r.mine);
             ui.horizontal_wrapped(|ui| {
@@ -327,13 +340,16 @@ impl StudentImport {
 
             ui.add_space(10.0);
             let taken = self.rows.iter().filter(|r| r.take && !r.locked()).count();
+            let updates = self.rows.iter().filter(|r| r.take && !r.locked() && r.update()).count();
             let hidden = self.rows.iter().filter(|r| r.take && !r.locked() && !self.visible(r)).count();
-            let already = self.rows.iter().filter(|r| r.existing.is_some_and(|e| e.has_role) && !r.repeat).count();
+            let already = self.rows.iter().filter(|r| r.locked() && !r.repeat).count();
             ui.horizontal(|ui| {
-                let mut summary = match taken {
-                    0 => "Nothing ticked".to_string(),
-                    1 => "1 student to add".to_string(),
-                    n => format!("{n} students to add"),
+                let students = |n: usize| if n == 1 { "1 student".to_string() } else { format!("{n} students") };
+                let mut summary = match (taken - updates, updates) {
+                    (0, 0) => "Nothing ticked".to_string(),
+                    (n, 0) => format!("{} to add", students(n)),
+                    (0, u) => format!("{} to fill in", students(u)),
+                    (n, u) => format!("{} to add, {u} to fill in", students(n)),
                 };
                 if hidden > 0 {
                     summary.push_str(&format!(" ({hidden} not shown)"));
@@ -343,9 +359,11 @@ impl StudentImport {
                 }
                 ui.label(RichText::new(summary).color(theme::muted(ui)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let label = match taken {
-                        1 => "Add 1 student".to_string(),
-                        n => format!("Add {n} students"),
+                    let label = match (taken, updates) {
+                        (1, 1) => "Fill in 1 student".to_string(),
+                        (n, u) if n == u => format!("Fill in {n} students"),
+                        (1, _) => "Add 1 student".to_string(),
+                        (n, _) => format!("Add {n} students"),
                     };
                     if ui.add_enabled(taken > 0, theme::primary_button(label)).clicked() {
                         add = true;
@@ -370,7 +388,7 @@ impl StudentImport {
 /// adding them does.
 fn row_ui(ui: &mut Ui, kind: SheetKind, row: &mut Row, programmes: &[Course], show_staff: bool, height: f32) {
     let locked = row.locked();
-    let (existing, repeat) = (row.existing, row.repeat);
+    let (existing, repeat) = (row.existing.clone(), row.repeat);
     let Row { student: s, take, programme, .. } = row;
     ui.horizontal(|ui| {
         ui.set_height(height - 4.0);
@@ -394,24 +412,20 @@ fn row_ui(ui: &mut Ui, kind: SheetKind, row: &mut Row, programmes: &[Course], sh
         about.extend(s.details());
         cell(ui, 170.0, name, color, Some(about.join("\n")));
         let detail = match kind {
-            SheetKind::Projects => &s.project_title,
-            SheetKind::Placement => &s.company,
+            SheetKind::Projects | SheetKind::Marking(MarkingKind::Project | MarkingKind::Msc) => &s.project_title,
+            SheetKind::Placement | SheetKind::Marking(MarkingKind::Placement) => &s.company,
+            SheetKind::Advisees => &s.course,
         };
-        let staff = match (s.staff_name.is_empty(), s.staff_email.is_empty()) {
-            (_, true) => s.staff_name.clone(),
-            (true, false) => s.staff_email.clone(),
-            (false, false) => format!("{} ({})", s.staff_name, s.staff_email),
-        };
+        let staff = s.staff(kind).join(" / ");
         // The same room on every row, so that the columns line up.
-        let course_picker = kind == SheetKind::Projects && programmes.len() > 1;
+        let course_picker = kind.has_course() && programmes.len() > 1;
         let staff_width = if show_staff { 150.0 } else { 0.0 };
         let right = if course_picker { 250.0 } else { 140.0 };
         let detail_width = (ui.available_width() - right - staff_width).max(100.0);
         let hover = (!detail.is_empty()).then(|| detail.clone());
         cell(ui, detail_width, detail, color, hover);
         if show_staff {
-            let shown = if s.staff_name.is_empty() { &s.staff_email } else { &s.staff_name };
-            cell(ui, staff_width, shown, theme::muted(ui), (!staff.is_empty()).then_some(staff));
+            cell(ui, staff_width, &staff, theme::muted(ui), (!staff.is_empty()).then(|| staff.clone()));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if course_picker && !locked {
@@ -433,12 +447,19 @@ fn row_ui(ui: &mut Ui, kind: SheetKind, row: &mut Row, programmes: &[Course], sh
             let role = match kind {
                 SheetKind::Projects => "the project",
                 SheetKind::Placement => "the placement",
+                SheetKind::Advisees => "the advisee role",
+                SheetKind::Marking(_) => "the marking",
             };
             if repeat {
                 theme::chip(ui, "Repeated row", theme::GREY).on_hover_text("This student is on an earlier row of the sheet");
             } else if let Some(e) = existing {
-                if e.has_role {
+                if e.nothing_to_do() {
                     theme::chip(ui, "Already in this list", theme::GREY);
+                } else if e.has_role {
+                    theme::chip(ui, "Fills in details", theme::ACCENT).on_hover_text(format!(
+                        "Already in this list. Ticked, the sheet fills in what is still empty: {}",
+                        e.fills.join(", ")
+                    ));
                 } else if e.archived {
                     theme::chip(ui, "Archived student", theme::AMBER)
                         .on_hover_text(format!("Adding {role} brings this student back from the archive"));

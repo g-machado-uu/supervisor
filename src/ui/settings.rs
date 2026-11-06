@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use egui::{RichText, Ui};
 use zeroize::Zeroizing;
 
-use crate::model::{BrLevel, BrRule, CourseworkTemplate, Module, Programme, Semester, Settings, default_br_rules};
+use crate::model::{BrLevel, BrRule, CourseworkTemplate, Markers, Module, Programme, Semester, Settings, default_br_rules};
 use crate::storage;
 use crate::ui::{icons, theme, widgets};
 
@@ -504,11 +504,11 @@ fn module_editor(
     }
     let mut remove_cw = None;
     egui::Grid::new("cw-template-grid")
-        .num_columns(5)
+        .num_columns(7)
         .spacing([10.0, 6.0])
         .show(ui, |ui| {
             if !module.courseworks.is_empty() {
-                for h in ["Title", "Teaching week", "Fixed deadline", "Resolves to", ""] {
+                for h in ["Title", "Teaching week", "Fixed deadline", "Resolves to", "Marked by", "Weight", ""] {
                     ui.label(RichText::new(h).small().color(theme::muted(ui)));
                 }
                 ui.end_row();
@@ -530,6 +530,27 @@ fn module_editor(
                 });
                 widgets::opt_date(ui, (cw.id, "deadline"), &mut cw.deadline);
                 ui.label(widgets::fmt_date(cw.resolve_deadline(semester_start)));
+                egui::ComboBox::from_id_salt((cw.id, "markers"))
+                    .selected_text(cw.markers.label())
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        for m in Markers::ALL {
+                            ui.selectable_value(&mut cw.markers, m, m.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text("Who marks it. The second marker's courseworks are the ones shown when you are the second marker.");
+                ui.push_id((cw.id, "weight"), |ui| {
+                    ui.horizontal(|ui| {
+                        let mut has_weight = cw.weight.is_some();
+                        if ui.checkbox(&mut has_weight, "").on_hover_text("Share of the module mark").changed() {
+                            cw.weight = has_weight.then_some(0);
+                        }
+                        if let Some(w) = &mut cw.weight {
+                            ui.add(egui::DragValue::new(w).range(0..=100).suffix("%"));
+                        }
+                    });
+                });
                 if ui.small_button("🗑").on_hover_text("Remove coursework").clicked() {
                     remove_cw = Some(i);
                 }
@@ -538,6 +559,12 @@ fn module_editor(
         });
     if let Some(i) = remove_cw {
         module.courseworks.remove(i);
+    }
+    if let Some(sum) = module.weights_off() {
+        ui.colored_label(
+            theme::fg(ui, theme::AMBER),
+            format!("{} The weights add up to {sum}%, not 100%", icons::WARNING),
+        );
     }
     ui.horizontal(|ui| {
         if ui.button("➕ Add coursework").clicked() {

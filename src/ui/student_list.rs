@@ -6,8 +6,8 @@ use egui_extras::{Column, TableBuilder};
 use uuid::Uuid;
 
 use crate::model::{
-    Database, FypRecord, masked, Meeting, PhdRecord, ReplyStatus, ResearchGroup, SemesterContact, Settings, Student,
-    Visit,
+    Database, FypRecord, MarkingKind, MarkingRecord, masked, Meeting, PhdRecord, ReplyStatus, ResearchGroup,
+    SemesterContact, Settings, Student, Visit,
 };
 use crate::ui::{icons, theme, widgets};
 
@@ -18,6 +18,8 @@ pub enum Category {
     Research(ResearchGroup),
     Placement,
     Advisee,
+    /// Students whose work I mark, without supervising them.
+    Marking(MarkingKind),
     All,
 }
 
@@ -28,6 +30,7 @@ impl Category {
             Category::Research(group) => format!("{} Students", group.label()),
             Category::Placement => "Placement Students".into(),
             Category::Advisee => "Studies Advisees".into(),
+            Category::Marking(kind) => kind.label().into(),
             Category::All => "All Students".into(),
         }
     }
@@ -42,6 +45,7 @@ impl Category {
             Category::Research(group) => s.phd.as_ref().is_some_and(|p| p.group() == *group),
             Category::Placement => s.placement.is_some(),
             Category::Advisee => s.advisee.is_some(),
+            Category::Marking(kind) => s.marking.as_ref().is_some_and(|m| m.kind == *kind),
             Category::All => true,
         }
     }
@@ -72,14 +76,16 @@ pub enum ListAction {
 }
 
 impl Category {
-    /// Lists that students can be imported into from a spreadsheet: the
-    /// project students and the placement students.
+    /// Lists that students can be imported into from a spreadsheet: all
+    /// but research students.
     pub fn import_kind(&self) -> Option<crate::sheet_import::SheetKind> {
         use crate::sheet_import::SheetKind;
         match self {
             Category::Projects(_) => Some(SheetKind::Projects),
             Category::Placement => Some(SheetKind::Placement),
-            _ => None,
+            Category::Advisee => Some(SheetKind::Advisees),
+            Category::Marking(kind) => Some(SheetKind::Marking(*kind)),
+            Category::Research(_) | Category::All => None,
         }
     }
 }
@@ -143,6 +149,11 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> Li
         .collect();
     let mut rows = rows;
     rows.sort_by_cached_key(|s| s.name.to_lowercase());
+    // Posters in the order they are walked round at the session; those
+    // without a number after.
+    if *cat == Category::Marking(MarkingKind::Project) {
+        rows.sort_by_key(|s| s.marking.as_ref().and_then(MarkingRecord::poster_order).unwrap_or(u32::MAX));
+    }
 
     if rows.is_empty() {
         theme::card(ui, "", |ui| {
@@ -189,6 +200,9 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> Li
         Category::Research(_) => &["Name", "B Number", "Year", "Meetings", "Next deadline"],
         Category::Placement => &["Name", "B Number", "Company", "Visit 1", "Visit 2"],
         Category::Advisee => &["Name", "B Number", "Course", "Semester 1", "Semester 2"],
+        Category::Marking(MarkingKind::Project) => &["Name", "B Number", "Course", "Supervisor", "Poster", "Marks"],
+        Category::Marking(MarkingKind::Msc) => &["Name", "B Number", "Supervisor", "Title", "Marks"],
+        Category::Marking(MarkingKind::Placement) => &["Name", "B Number", "Company", "Academic visitor", "Mark"],
         Category::All => &["Name", "B Number", "Email", "Course", "Roles"],
     };
 
@@ -330,6 +344,39 @@ fn table(
                             });
                         }
                     }
+                    Category::Marking(kind) => {
+                        let m = s.marking.as_ref().expect("filtered");
+                        match kind {
+                            MarkingKind::Project => {
+                                row.col(|ui| {
+                                    theme::chip(ui, db.settings.programme_short(&m.programme), theme::ACCENT);
+                                });
+                                row.col(|ui| {
+                                    ui.label(&m.supervisor_name);
+                                });
+                                row.col(|ui| {
+                                    ui.label(theme::semibold(&m.poster_number));
+                                });
+                            }
+                            MarkingKind::Msc => {
+                                row.col(|ui| {
+                                    ui.label(&m.supervisor_name);
+                                });
+                                row.col(|ui| {
+                                    ui.label(&m.title);
+                                });
+                            }
+                            MarkingKind::Placement => {
+                                row.col(|ui| {
+                                    ui.label(&m.company);
+                                });
+                                row.col(|ui| {
+                                    ui.label(&m.supervisor_name);
+                                });
+                            }
+                        }
+                        row.col(|ui| marking_chip(ui, m, &db.settings));
+                    }
                     Category::All => {
                         row.col(|ui| {
                             ui.label(if private { "" } else { &s.email });
@@ -354,6 +401,9 @@ fn table(
                             if s.advisee.is_some() {
                                 theme::chip(ui, "Advisee", theme::AMBER);
                             }
+                            if s.marking.is_some() {
+                                theme::chip(ui, "Marking", theme::GREY);
+                            }
                         });
                     }
                 }
@@ -372,9 +422,26 @@ fn project_title<'a>(cat: &Category, s: &'a Student) -> Option<&'a str> {
         Category::Projects(_) => fyp(),
         Category::Research(_) => phd(),
         Category::All => fyp().filter(|t| !t.trim().is_empty()).or_else(phd),
+        Category::Marking(_) => s.marking.as_ref().map(|m| m.title.as_str()),
         Category::Placement | Category::Advisee => None,
     }?;
     Some(title.trim()).filter(|t| !t.is_empty())
+}
+
+/// How far the marking is: to agree with the supervisor, all marked, or
+/// how many of how many. Never the marks themselves.
+fn marking_chip(ui: &mut Ui, m: &MarkingRecord, settings: &Settings) {
+    let (done, all) = m.progress(settings);
+    if all == 0 {
+        theme::chip(ui, "nothing to mark", theme::GREY)
+            .on_hover_text("No coursework of this course is marked by the second marker – see Settings › Modules");
+    } else if m.to_agree(settings) {
+        theme::chip(ui, "to agree", theme::AMBER);
+    } else if done == all {
+        theme::chip(ui, format!("{} marked", icons::CHECK), theme::GREEN);
+    } else {
+        theme::chip(ui, format!("{done}/{all} marked"), theme::ACCENT);
+    }
 }
 
 /// Next planned meeting on or after `today` and how many have been held,

@@ -2,9 +2,12 @@
 
 use egui::{Align, Layout, RichText, Ui};
 
-use crate::model::{AdviseeRecord, FypRecord, PhdRecord, PlacementRecord, Settings, Student, StudyYear, is_cpf, is_ni_number, masked};
+use crate::model::{
+    AdviseeRecord, FypRecord, MarkingRecord, PhdRecord, PlacementRecord, Settings, Student, StudyYear, is_cpf, is_ni_number,
+    masked,
+};
 use crate::ui::widgets::Share;
-use crate::ui::{advisee, fyp, icons, modules, phd, placement, theme, widgets};
+use crate::ui::{advisee, fyp, icons, marking, modules, phd, placement, theme, widgets};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -12,6 +15,7 @@ pub enum Role {
     Phd,
     Placement,
     Advisee,
+    Marking,
 }
 
 impl Role {
@@ -22,6 +26,7 @@ impl Role {
             Role::Phd => (icons::GRADUATION_CAP, theme::PLUM),
             Role::Placement => (icons::BUILDINGS, theme::AMBER),
             Role::Advisee => (icons::CHAT_CIRCLE_TEXT, theme::GREEN),
+            Role::Marking => (icons::EXAM, theme::GREY),
         }
     }
 
@@ -31,6 +36,7 @@ impl Role {
             Role::Phd => "Research supervision",
             Role::Placement => "Placement",
             Role::Advisee => "Studies Advisee",
+            Role::Marking => "Marking",
         }
     }
 }
@@ -149,6 +155,14 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
         }
         if s.advisee.is_some() {
             role_chip(ui, Role::Advisee, "Advisee".into());
+        }
+        if let Some(m) = &s.marking {
+            let what = match m.kind {
+                crate::model::MarkingKind::Project => format!("2nd marker · {}", settings.programme_short(&m.programme)),
+                crate::model::MarkingKind::Msc => "2nd marker · MSc".into(),
+                crate::model::MarkingKind::Placement => "Marking · Placement report".into(),
+            };
+            role_chip(ui, Role::Marking, what);
         }
         if s.archived {
             theme::chip(ui, format!("{} archived", icons::ARCHIVE), theme::GREY);
@@ -270,7 +284,7 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
             modules::card(ui, s, settings, shown);
         }
 
-        if s.fyp.is_none() || s.phd.is_none() || s.placement.is_none() || s.advisee.is_none() {
+        if s.fyp.is_none() || s.phd.is_none() || s.placement.is_none() || s.advisee.is_none() || s.marking.is_none() {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Add role").color(theme::muted(ui)));
@@ -285,6 +299,14 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
                 }
                 if s.advisee.is_none() && ui.button(format!("{} Studies Advisee", icons::PLUS)).clicked() {
                     s.advisee = Some(AdviseeRecord::default());
+                }
+                if s.marking.is_none()
+                    && ui
+                        .button(format!("{} Marking", icons::PLUS))
+                        .on_hover_text("I mark their work (second marker, or a placement report) but don't supervise them")
+                        .clicked()
+                {
+                    s.marking = Some(MarkingRecord::default());
                 }
             });
         }
@@ -309,7 +331,7 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
         }
         if let Some(p) = &mut s.placement {
             role_section(ui, Role::Placement, jump, &mut action, |ui| {
-                if let Some(share) = placement::show(ui, p, settings, timetable, id) {
+                if let Some(share) = placement::show(ui, p, settings, timetable, id, shown) {
                     invite = Some(share);
                 }
             });
@@ -320,6 +342,9 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
                     invite = Some(share);
                 }
             });
+        }
+        if let Some(m) = &mut s.marking {
+            role_section(ui, Role::Marking, jump, &mut action, |ui| marking::show(ui, m, settings, shown));
         }
         if let Some(share) = invite {
             action = FormAction::Share(share);

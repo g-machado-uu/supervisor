@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use egui::{RichText, Ui};
 use uuid::Uuid;
 
-use crate::model::{CwStatus, FypRecord, MARK_TOLERANCE, ReplyStatus, Settings, Timetable, fmt_mark};
+use crate::model::{CourseworkTemplate, CwStatus, FypRecord, MARK_TOLERANCE, Markers, ReplyStatus, Settings, Timetable, fmt_mark};
 use crate::ui::student_form::{Shown, hidden_value};
 use crate::ui::{icons, theme, widgets};
 
@@ -152,34 +152,25 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings, timetable: &T
                     }
                     ui.end_row();
                     for cw in &module.courseworks {
-                        ui.label(&cw.title);
+                        ui.horizontal(|ui| {
+                            item_label(ui, cw);
+                            if cw.is_poster() && !sust {
+                                poster_field(ui, &mut fyp.poster_number);
+                            }
+                        });
                         edit_status(&mut fyp.coursework, cw.id, |status| {
-                            let before = status.clone();
-                            let mut mark = |ui: &mut Ui, value: &mut String| {
-                                switch_marks |= mark(ui, marks_shown, value);
-                            };
                             if sust {
                                 ui.checkbox(&mut status.marks_received, "")
                                     .on_hover_text("The SUST supervisor has sent their marks");
-                                mark(ui, &mut status.mark_2);
-                                mark(ui, &mut status.mark_1);
-                            } else {
-                                mark(ui, &mut status.mark_1);
-                                mark(ui, &mut status.mark_2);
                             }
-                            ui.horizontal(|ui| {
-                                mark(ui, &mut status.agreed_mark);
-                                agreed_note(ui, status, marks_shown, if sust { "my mark" } else { "Marker 1" });
-                            });
-                            if (&status.mark_1, &status.mark_2) != (&before.mark_1, &before.mark_2) {
-                                status.suggest_agreed();
-                            } else if status.agreed_mark != before.agreed_mark {
-                                status.agreed_unconfirmed = false;
-                            }
+                            let reference = if sust { "my mark" } else { "Marker 1" };
+                            let cols = Cols { first: true, agreed: true, second_first: sust };
+                            switch_marks |= marks_cells(ui, status, cw.markers, marks_shown, reference, cols);
                         });
                         ui.end_row();
                     }
                 });
+            module_mark(ui, module.weighted_mark(&fyp.coursework), module.courseworks.iter().any(|cw| cw.weight.is_some()), marks_shown);
         }
         if !any_module {
             ui.label(
@@ -225,8 +216,99 @@ fn sust_contact(ui: &mut Ui, fyp: &mut FypRecord) {
     }
 }
 
+/// A coursework's title, and its weight when known.
+pub(crate) fn item_label(ui: &mut Ui, cw: &CourseworkTemplate) {
+    ui.label(&cw.title);
+    if let Some(w) = cw.weight {
+        ui.label(RichText::new(format!("{w}%")).small().color(theme::muted(ui)))
+            .on_hover_text("Weight in the module mark");
+    }
+}
+
+/// The poster number, to find the poster at the session.
+pub(crate) fn poster_field(ui: &mut Ui, number: &mut String) {
+    ui.label(RichText::new("#").color(theme::muted(ui)));
+    ui.add(egui::TextEdit::singleline(number).hint_text("No.").desired_width(48.0))
+        .on_hover_text("Poster number at the poster session");
+}
+
+/// Under a module's marks: the module mark from the courseworks' weights,
+/// once they all have a final mark.
+fn module_mark(ui: &mut Ui, mark: Option<f64>, weighted: bool, shown: bool) {
+    if !weighted {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Module mark").small().color(theme::muted(ui)));
+        let text = match mark {
+            Some(_) if !shown => "•".repeat(8),
+            Some(m) => fmt_mark(m),
+            None => "–".into(),
+        };
+        ui.label(theme::semibold(text)).on_hover_text(
+            "From the final marks (agreed, or the one marker's) and the weights set in Settings › Modules. Shown once \
+             every coursework has its mark and weight.",
+        );
+    });
+}
+
+/// Which mark columns a marks grid has.
+#[derive(Clone, Copy)]
+pub(crate) struct Cols {
+    /// The supervisor's (marker 1) column; left out when no coursework has it.
+    pub first: bool,
+    pub agreed: bool,
+    /// The second marker's column comes first (SUST: their mark, then mine).
+    pub second_first: bool,
+}
+
+/// One coursework's marks: marker 1's (the supervisor's) and marker 2's,
+/// in the order `cols` gives, then the agreed mark. A marker who doesn't
+/// mark this coursework gets a dash, and with one marker there is nothing
+/// to agree. Returns true when a hidden mark is clicked, to reveal them.
+pub(crate) fn marks_cells(ui: &mut Ui, status: &mut CwStatus, markers: Markers, shown: bool, reference: &str, cols: Cols) -> bool {
+    let before = status.clone();
+    let mut switch = false;
+    let mut slot = |ui: &mut Ui, on: bool, value: &mut String, why: &str| {
+        if on {
+            switch |= mark(ui, shown, value);
+        } else {
+            ui.label(RichText::new("n/a").small().color(theme::muted(ui))).on_hover_text(why);
+        }
+    };
+    let first = |ui: &mut Ui, slot: &mut dyn FnMut(&mut Ui, bool, &mut String, &str), value: &mut String| {
+        if cols.first {
+            slot(ui, markers.supervisor(), value, "Only the second marker marks this");
+        }
+    };
+    if cols.second_first {
+        slot(ui, markers.second(), &mut status.mark_2, "Only the supervisor marks this");
+        first(ui, &mut slot, &mut status.mark_1);
+    } else {
+        first(ui, &mut slot, &mut status.mark_1);
+        slot(ui, markers.second(), &mut status.mark_2, "Only the supervisor marks this");
+    }
+    if cols.agreed {
+        if markers == Markers::Both {
+            ui.horizontal(|ui| {
+                switch |= mark(ui, shown, &mut status.agreed_mark);
+                agreed_note(ui, status, shown, reference);
+            });
+        } else {
+            ui.label(RichText::new("n/a").small().color(theme::muted(ui)))
+                .on_hover_text("One marker: their mark is the final mark");
+        }
+    }
+    if markers == Markers::Both && (&status.mark_1, &status.mark_2) != (&before.mark_1, &before.mark_2) {
+        status.suggest_agreed();
+    } else if status.agreed_mark != before.agreed_mark {
+        status.agreed_unconfirmed = false;
+    }
+    switch
+}
+
 /// Edits a coursework's status; viewing it doesn't create (and save) an empty one.
-fn edit_status(coursework: &mut HashMap<Uuid, CwStatus>, id: Uuid, edit: impl FnOnce(&mut CwStatus)) {
+pub(crate) fn edit_status(coursework: &mut HashMap<Uuid, CwStatus>, id: Uuid, edit: impl FnOnce(&mut CwStatus)) {
     let original = coursework.get(&id).cloned().unwrap_or_default();
     let mut edited = original.clone();
     edit(&mut edited);

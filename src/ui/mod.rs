@@ -5,6 +5,7 @@ pub mod dashboard;
 pub mod fyp;
 pub mod icons;
 pub mod lock;
+pub mod marking;
 pub mod modules;
 pub mod phd;
 pub mod placement;

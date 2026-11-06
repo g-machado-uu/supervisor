@@ -411,7 +411,8 @@ fn decrypt(bytes: &[u8], path: &Path, password: &str, key_file: Option<&KeyFile>
             )
             .map_err(|_| VaultError::WrongPassword)?,
     );
-    let db = serde_json::from_slice(&plaintext).context("decrypted data could not be read")?;
+    let mut db: Database = serde_json::from_slice(&plaintext).context("decrypted data could not be read")?;
+    db.upgrade();
     let seal = Seal {
         params: header.params,
         salt: header.salt,

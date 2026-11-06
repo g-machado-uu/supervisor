@@ -13,7 +13,8 @@ use zeroize::Zeroizing;
 
 use crate::ics;
 use crate::model::{
-    AdviseeRecord, Attention, CalItem, Database, Event, FypRecord, MeetingChange, PlacementRecord, ResearchGroup, Student,
+    AdviseeRecord, Attention, CalItem, Database, Event, FypRecord, MarkingKind, MarkingRecord, MeetingChange, PlacementRecord,
+    ResearchGroup, Student,
 };
 use crate::storage::{self, KeyFile, Vault, VaultError, Written};
 use crate::ui::calendar::{self, CalAction, CalendarState};
@@ -164,6 +165,10 @@ struct NewStudent {
     company: String,
     professional_email: String,
     advisee: bool,
+    /// I mark their work without supervising them.
+    marking: Option<MarkingKind>,
+    /// For marking a project: `Programme::id`.
+    marking_programme: String,
 }
 
 impl NewStudent {
@@ -183,6 +188,13 @@ impl NewStudent {
             company: String::new(),
             professional_email: String::new(),
             advisee: false,
+            marking: None,
+            marking_programme: settings
+                .programmes
+                .iter()
+                .find(|p| !settings.is_sust(&p.id))
+                .map(|p| p.id.clone())
+                .unwrap_or_default(),
         };
         match cat {
             Some(Category::Projects(list)) => {
@@ -197,6 +209,7 @@ impl NewStudent {
             }
             Some(Category::Placement) => n.placement = true,
             Some(Category::Advisee) => n.advisee = true,
+            Some(Category::Marking(kind)) => n.marking = Some(*kind),
             _ => {}
         }
         n
@@ -222,6 +235,10 @@ impl NewStudent {
         }
         if self.advisee {
             s.advisee = Some(AdviseeRecord::default());
+        }
+        if let Some(kind) = self.marking {
+            let programme = if kind == MarkingKind::Project { self.marking_programme } else { String::new() };
+            s.marking = Some(MarkingRecord { kind, programme, ..Default::default() });
         }
         s
     }
@@ -783,22 +800,37 @@ impl Session {
                 };
                 nav(ui, View::Dashboard, icons::HOUSE, "Dashboard", None);
                 nav(ui, View::Calendar, icons::CALENDAR_DOTS, "Calendar", None);
-                section(ui, "PROJECT STUDENTS");
-                for list in lists {
-                    let cat = Category::Projects(list.clone());
-                    let count = cat.count(&self.db);
-                    nav(ui, View::List(cat), icons::BOOK_OPEN_TEXT, &list, Some(count));
-                }
-                section(ui, "RESEARCH");
-                for group in ResearchGroup::ALL {
-                    let cat = Category::Research(group);
-                    let count = cat.count(&self.db);
-                    nav(ui, View::List(cat), icons::GRADUATION_CAP, group.label(), Some(count));
-                }
-                section(ui, "OTHER");
-                nav(ui, View::List(Category::Placement), icons::BUILDINGS, "Placement", Some(Category::Placement.count(&self.db)));
-                nav(ui, View::List(Category::Advisee), icons::CHAT_CIRCLE_TEXT, "Studies Advisees", Some(Category::Advisee.count(&self.db)));
-                nav(ui, View::List(Category::All), icons::USERS_THREE, "All Students", Some(Category::All.count(&self.db)));
+                // The lists scroll when the window is too short for them, so the
+                // buttons at the bottom always show.
+                let lists_height = (ui.available_height() - 96.0).max(120.0);
+                egui::ScrollArea::vertical()
+                    .max_height(lists_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        section(ui, "PROJECT STUDENTS");
+                        for list in lists {
+                            let cat = Category::Projects(list.clone());
+                            let count = cat.count(&self.db);
+                            nav(ui, View::List(cat), icons::BOOK_OPEN_TEXT, &list, Some(count));
+                        }
+                        section(ui, "RESEARCH");
+                        for group in ResearchGroup::ALL {
+                            let cat = Category::Research(group);
+                            let count = cat.count(&self.db);
+                            nav(ui, View::List(cat), icons::GRADUATION_CAP, group.label(), Some(count));
+                        }
+                        section(ui, "OTHER");
+                        nav(ui, View::List(Category::Placement), icons::BUILDINGS, "Placement", Some(Category::Placement.count(&self.db)));
+                        nav(ui, View::List(Category::Advisee), icons::CHAT_CIRCLE_TEXT, "Studies Advisees", Some(Category::Advisee.count(&self.db)));
+                        section(ui, "MARKING");
+                        for kind in MarkingKind::ALL {
+                            let cat = Category::Marking(kind);
+                            let count = cat.count(&self.db);
+                            nav(ui, View::List(cat), icons::EXAM, kind.label(), Some(count));
+                        }
+                        ui.add_space(10.0);
+                        nav(ui, View::List(Category::All), icons::USERS_THREE, "All Students", Some(Category::All.count(&self.db)));
+                    });
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.spacing_mut().item_spacing.y = 6.0;
@@ -1285,12 +1317,19 @@ impl Session {
                 self.student_import = None;
                 let added = crate::sheet_import::add_students(&mut self.db, kind, choices);
                 let students = |n: usize| if n == 1 { "1 student".to_string() } else { format!("{n} students") };
-                let msg = match (added.new, added.existing) {
-                    (0, 0) => "Nothing added".to_string(),
+                let mut msg = match (added.new, added.existing) {
+                    (0, 0) => String::new(),
                     (n, 0) => format!("Added {}", students(n)),
                     (0, e) => format!("Added {} already in Supervisor to this list", students(e)),
                     (n, e) => format!("Added {}, and {e} already in Supervisor", students(n)),
                 };
+                if added.updated > 0 {
+                    let filled = format!("filled in details of {}", students(added.updated));
+                    msg = if msg.is_empty() { format!("Filled in details of {}", students(added.updated)) } else { format!("{msg}; {filled}") };
+                }
+                if msg.is_empty() {
+                    msg = "Nothing added".into();
+                }
                 self.notify(ui, msg);
             }
         }
@@ -1675,6 +1714,26 @@ impl Session {
                     });
                 }
                 ui.checkbox(&mut n.advisee, "Studies advisee");
+                let mut marks = n.marking.is_some();
+                if ui.checkbox(&mut marks, "I mark their work, but don't supervise them").changed() {
+                    n.marking = marks.then_some(MarkingKind::Project);
+                }
+                if let Some(kind) = &mut n.marking {
+                    ui.indent("marking", |ui| {
+                        for k in MarkingKind::ALL {
+                            ui.radio_value(kind, k, k.label());
+                        }
+                        if *kind == MarkingKind::Project {
+                            egui::ComboBox::from_id_salt("marking-course")
+                                .selected_text(self.db.settings.programme_short(&n.marking_programme))
+                                .show_ui(ui, |ui| {
+                                    for p in self.db.settings.programmes.iter().filter(|p| !self.db.settings.is_sust(&p.id)) {
+                                        ui.selectable_value(&mut n.marking_programme, p.id.clone(), &p.name);
+                                    }
+                                });
+                        }
+                    });
+                }
                 ui.add_space(12.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let valid = !n.student.name.trim().is_empty() || !n.student.b_number.trim().is_empty();
@@ -1815,6 +1874,7 @@ impl Session {
                                 Role::Phd => s.phd = None,
                                 Role::Placement => s.placement = None,
                                 Role::Advisee => s.advisee = None,
+                                Role::Marking => s.marking = None,
                             }
                             // Nothing shows these any more, so nothing should keep them.
                             if s.fyp.is_none() && s.advisee.is_none() {
@@ -2745,6 +2805,9 @@ mod ui_tests {
             let s = session(&mut h);
             let sust = s.db.settings.modules.iter_mut().find(|m| m.applies_to == ["Sust"]).unwrap();
             sust.courseworks.push(CourseworkTemplate { title: "Report".into(), ..Default::default() });
+            // MEC526 is marked by the supervisor alone; here, by both.
+            s.db.settings.modules.iter_mut().find(|m| m.applies_to == ["BEng"]).unwrap().courseworks[0].markers =
+                crate::model::Markers::Both;
             let first_cw = |programme: &str| s.db.settings.modules_for(programme).next().unwrap().courseworks[0].id;
             let marked = |cw| {
                 std::collections::HashMap::from([(cw, CwStatus { mark_1: "71.5".into(), mark_2: "64.5".into(), ..Default::default() })])
@@ -3909,6 +3972,8 @@ mod ui_tests {
         assert_eq!(session(&mut h).db.student(project).unwrap().modules.s1.pending(), 2);
 
         // Removing the only role that shows them removes the modules too.
+        h.set_size(egui::vec2(1360.0, 3000.0));
+        h.run_steps(3);
         h.get_by_label("Remove Project supervision record…").click();
         h.run_steps(3);
         h.get_by_label("Delete").click();
@@ -3969,7 +4034,7 @@ mod ui_tests {
             s.view = View::List(Category::Advisee);
         }
         h.run_steps(3);
-        assert!(h.query_by_label_contains("Import…").is_none(), "no spreadsheet layout for advisees yet");
+        assert!(h.query_by_label_contains("Import…").is_some(), "advisees too");
         session(&mut h).view = View::List(Category::Projects("SUST".into()));
         h.run_steps(3);
         assert!(h.query_by_label_contains("Import…").is_some(), "SUST students too");
@@ -3994,10 +4059,11 @@ mod ui_tests {
             s.student_import = Some((StudentImport::new(kind, "allocations.xlsx".into(), sheet, &s.db, Some("BEng")), kind));
         }
         h.run_steps(3);
-        // Only the rows with your email show, and those not yet in the list are ticked.
+        // Only the rows with your email show, and those not yet in the list are
+        // ticked, as is Ana, in the list already but without her name and title.
         assert!(h.query_by_label_contains("3 of the 4 rows have you (me@ulster.ac.uk)").is_some());
-        assert!(h.query_by_label("2 students to add · 1 already in this list").is_some());
-        assert!(h.query_by_label("Already in this list").is_some());
+        assert!(h.query_by_label("2 students to add, 1 to fill in").is_some());
+        assert!(h.query_by_label("Fills in details").is_some());
         assert!(h.query_by_label("In another list").is_some());
         assert!(h.query_by_label("Sean Murphy").is_none());
         h.get_by_value("You (3)").click();
@@ -4005,11 +4071,11 @@ mod ui_tests {
         h.get_by_label("Everyone (4)").click();
         h.run_steps(2);
         assert!(h.query_by_label("Sean Murphy").is_some());
-        assert!(h.query_by_label("2 students to add · 1 already in this list").is_some(), "the ticks are kept");
+        assert!(h.query_by_label("2 students to add, 1 to fill in").is_some(), "the ticks are kept");
         shot(&mut h, "student_import");
-        h.get_by_label("Add 2 students").click();
+        h.get_by_label("Add 3 students").click();
         h.run_steps(3);
-        assert!(h.query_by_label("Added 1 student, and 1 already in Supervisor").is_some());
+        assert!(h.query_by_label("Added 1 student, and 1 already in Supervisor; filled in details of 1 student").is_some());
         let s = session(&mut h);
         assert!(s.student_import.is_none());
         assert_eq!(s.db.students.len(), 3, "Sean was not ticked");
@@ -4017,6 +4083,8 @@ mod ui_tests {
         assert_eq!((fyp.programme.as_str(), fyp.project_title.as_str()), ("BEng", "Drone arm"));
         let tom = s.db.students.iter().find(|s| s.b_number == "B00444444").unwrap();
         assert_eq!(tom.name, "Tom Brown");
+        let ana = s.db.students.iter().find(|s| s.b_number == "B00333333").unwrap();
+        assert_eq!((ana.name.as_str(), ana.fyp.as_ref().unwrap().project_title.as_str()), ("Ana Silva", "Heat pipes"));
     }
 
     #[test]
@@ -4389,5 +4457,91 @@ mod ui_tests {
         h.get_by_label("Done").click();
         h.run_steps(4);
         film(&mut h, "rar");
+    }
+
+    #[test]
+    fn students_i_mark_are_listed_by_poster_and_marked_as_second_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let marked = |name: &str, poster: &str| Student {
+            name: name.into(),
+            marking: Some(MarkingRecord {
+                programme: "MEng".into(),
+                supervisor_name: "Bhalla, Dr Nikhil".into(),
+                title: "Plasma modelling".into(),
+                poster_number: poster.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (late, early) = (marked("Aaron Late", "190"), marked("Zoe Early", "71"));
+        let report = Student {
+            name: "Placement Report".into(),
+            marking: Some(MarkingRecord { kind: MarkingKind::Placement, company: "Acme".into(), ..Default::default() }),
+            ..Default::default()
+        };
+        let early_id = early.id;
+        {
+            let s = session(&mut h);
+            s.db.students.extend([late, early, report]);
+            s.view = View::List(Category::Marking(MarkingKind::Project));
+        }
+        h.set_size(egui::vec2(1360.0, 1300.0));
+        h.run_steps(3);
+        // In the order of the posters, whatever the names.
+        let zoe = h.get_by_label("Zoe Early").rect().top();
+        assert!(zoe < h.get_by_label("Aaron Late").rect().top());
+        assert!(h.query_by_label("Placement Report").is_none(), "in its own list");
+        assert!(h.query_all_by_label("0/2 marked").next().is_some());
+        shot(&mut h, "50_marking_list");
+
+        session(&mut h).selected = Some(early_id);
+        h.run_steps(3);
+        // As second marker of an MEng project: the poster (mine alone) and the
+        // dissertation (agreed with the supervisor), not the interim report.
+        for label in ["Poster", "Dissertation", "Supervisor", "My mark", "Agreed", "EEE840"] {
+            assert!(h.query_all_by_label(label).next().is_some(), "{label}");
+        }
+        assert!(h.query_by_label("Interim report").is_none());
+        h.get_all_by_label(&format!("{} Reveal marks", icons::EYE)).next().unwrap().click();
+        h.run_steps(2);
+        shot(&mut h, "51_marking_panel");
+        let poster = session(&mut h).db.settings.second_marked("MEng")[0].1.id;
+        let dissertation = session(&mut h).db.settings.second_marked("MEng")[1].1.id;
+        {
+            let m = session(&mut h).db.student_mut(early_id).unwrap().marking.as_mut().unwrap();
+            m.coursework.insert(poster, CwStatus { mark_2: "64".into(), ..Default::default() });
+            m.coursework.insert(dissertation, CwStatus { mark_1: "70".into(), mark_2: "55".into(), ..Default::default() });
+        }
+        h.run_steps(3);
+        assert!(h.query_by_label(&format!("{} 21.4% from the supervisor's mark", icons::WARNING)).is_some());
+        assert!(h.query_all_by_label("to agree").next().is_some());
+        shot(&mut h, "52_marking_to_agree");
+
+        // A placement report: my mark alone.
+        session(&mut h).view = View::List(Category::Marking(MarkingKind::Placement));
+        let id = session(&mut h).db.students[2].id;
+        session(&mut h).selected = Some(id);
+        h.run_steps(3);
+        assert!(h.query_by_label("Final report").is_some());
+        assert!(h.query_by_label("Agreed").is_none() && h.query_by_label("Visitor").is_none());
+        shot(&mut h, "53_marking_placement");
+
+        // Who marks each coursework, and its weight, are set in Settings.
+        session(&mut h).view = View::Settings;
+        h.set_size(egui::vec2(1360.0, 1800.0));
+        h.run_steps(3);
+        h.get_by_label("EEE840 – MEng Final Year Dissertation (Full year)").click();
+        h.run_steps(3);
+        let text = all_text(&h);
+        for label in ["Marked by", "Weight", "Supervisor only", "2nd marker only", "Supervisor + 2nd marker"] {
+            assert!(text.contains(label), "{label}");
+        }
+        assert!(h.query_by_label_contains("The weights add up to").is_none());
+        session(&mut h).db.settings.modules[4].courseworks[2].weight = Some(70);
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("The weights add up to 90%, not 100%").is_some());
+        shot(&mut h, "54_module_markers");
     }
 }

@@ -8,11 +8,12 @@ Supervisor is a desktop application for the administration of student supervisio
 
 - **Dashboard:** upcoming events and items that require attention, such as unanswered contact, overdue coursework, research deadlines and the end of visas or grants.
 - **Student lists:** one list for each group of students, with the details of the selected student in a side panel.
-- **Project supervision:** second markers, coursework deadlines derived from the teaching weeks, and marks from each marker with a suggested agreed mark. Separate fields apply to SUST students.
+- **Project supervision:** second markers, coursework deadlines derived from the teaching weeks, and marks from each marker with a suggested agreed mark. Each coursework records who marks it (the supervisor, the second marker, or both) and its weight, from which the module mark is calculated. The poster number is recorded next to the poster. Separate fields apply to SUST students.
 - **Research students:** four lists (PhD, PhD External, MSc and MSc External) with assessments, annual reports, submission, viva and reminders. External students have their own list of deadlines.
 - **Brazilian programmes:** academic and professional levels, funding bodies, standard stages, the defence committee and suggested deadlines.
-- **Placement visits:** requests, replies and the attendance of the line manager.
-- **Importing students:** project and placement students can be added from an Excel spreadsheet, such as the list of project allocations or of placement visits. The rows with the user's email or name as supervisor or academic visitor are selected, and another can be chosen with **Filter by**.
+- **Placement visits:** requests, replies, the attendance of the line manager and the mark of each visit.
+- **Marking:** three lists for students whose work is marked but who are not supervised: final-year projects (BEng and MEng, as second marker: poster and dissertation, sorted by poster number), MSc dissertations (as second marker) and placement reports (single marker). Each list shows the progress of the marking and the marks still to be agreed.
+- **Importing students:** project, placement, advisee and marking students can be added from an Excel spreadsheet, such as the list of project allocations, the poster list, the list of placement visits or of advisees. The rows with the user's email or name as supervisor, academic visitor, mentor or second marker are selected, and another can be chosen with **Filter by**.
 - **Studies advisees:** contact, replies and meetings for each semester, together with the year of study (1st, 2nd or 4th).
 - **Modules:** a card, collapsed by default, for local advisees and project students. For each semester it records whether modules are pending from the previous semester. For each pending module it records the code, the name, the failed component (CW, EX or CW+EX) and the marks. In Semester 2 it also records whether the module was discussed with an advisee. The number of pending modules determines whether the student needs to talk to their advisor, the course director or the Head of School. These thresholds are set in Settings.
 - **Reasonable adjustments:** a RAR option for local students, with notes that open only after password confirmation.
@@ -114,9 +115,9 @@ The keyboard button next to **Settings** (or `F1`) lists the keyboard shortcuts.
 
 ### Importing from a spreadsheet
 
-**Import…** appears in the lists of project students and of placement students. It reads `.xlsx`, `.xls` and `.ods` files.
+**Import…** appears in every list except the research lists. It reads `.xlsx`, `.xls` and `.ods` files.
 
-- Students are read from the **first sheet** of the file. A list of people by *Name* and *Email* on another sheet (for example the SUST and Ulster supervisors on the second sheet of the SUST allocations) fills in the emails the first sheet leaves out, matched by name. When two people share a name, the department in brackets after it, such as *(Mechanical Eng)*, is compared with the student's course; if that doesn't decide, the email is left empty.
+- Students are read from the **first sheet** of the file. Another sheet listing the same students by B number (for example the *FYP Poster arrangements* sheet of the poster list) fills in what the first sheet leaves out, such as the poster number or a missing second marker. Rows that hold only a B number are skipped. A list of people by *Name* and *Email* on another sheet (for example the SUST and Ulster supervisors on the second sheet of the SUST allocations) fills in the emails the first sheet leaves out, matched by name. When two people share a name, the department in brackets after it, such as *(Mechanical Eng)*, is compared with the student's course; if that doesn't decide, the email is left empty.
 - The columns are recognised by the words in their headings, in any order and with any capitals or punctuation. Other columns are ignored.
 
   | Heading, for example | Fills in |
@@ -124,19 +125,20 @@ The keyboard button next to **Settings** (or `F1`) lists the keyboard shortcuts.
   | *B Number*, *Registration*, *Student ID* | B number |
   | *Name*, or *First Name* and *Last Name* | Name (*Last, First* is turned round) |
   | *E-Mail*, *UU Email* | Email |
-  | *Course*, *Major* (not *Course Code*) | Course |
-  | *Supervisor*, *UU Supervisor*, *Supervisor Email*, *Academic visitors email* | Used to find your students |
-  | *Project Title* | Project title |
+  | *Course*, *Programme*, *Major* (not *Course Code* or *Programme Code*) | Course |
+  | *Supervisor*, *FYP Supervisor*, *UU Supervisor*, *Supervisor Email*, *Academic visitors email*, *Mentor* | Used to find your students; for marking, the student's supervisor |
+  | *Project Title*, *Title of the project* | Project title |
   | *SUST Supervisor*, *SUST Supervisor Email* | SUST supervisor (SUST students) |
-  | *Second Marker*, *Second Marker Email* | Second marker (other project students) |
+  | *Second Marker*, *2nd Marker*, *Second Marker Email* | Second marker (other project students); for marking, used to find your students |
+  | *Poster Number*, *Poster* | Poster number |
   | *SUST Email* | The student's SUST email |
   | *Placement*, *Company*, *Employer* | Placement company |
-  | *Line Manager*, *Line Manager Email*, *Professional Email* | Placement details |
+  | *Line Manager*, *Workplace Mentor*, *Line Manager Email*, *Professional Email* | Placement details |
 
-- The rows with your email, or your name, as supervisor or academic visitor are ticked. Names match whatever their titles, capitals, punctuation and order (*Machado, Dr Gabriel* is *Gabriel Machado*). A *SUST Supervisor* column never counts as yours. The rows of other staff are hidden.
+- The rows with your email, or your name, as supervisor, academic visitor or mentor are ticked; in the marking lists, those with you as second marker. Names match whatever their titles, capitals, punctuation and order (*Machado, Dr Gabriel* is *Gabriel Machado*). A *SUST Supervisor* column never counts as yours. The rows of other staff are hidden.
 - **Filter by** chooses whose rows are shown: **You**, **Everyone**, or one supervisor or academic visitor of the sheet. Choosing one person ticks their rows, which helps when your rows are not found automatically. **Everyone** leaves the ticks as they are.
-- Students already in Supervisor are matched by their B number. A student who is already in the list is not added again. A student in another list, such as an advisee, receives the project or placement in the same record, and an archived student is restored.
-- For project students, the course of each row is chosen in the dialog. It starts as the course of the list in which **Import…** was selected.
+- Students already in Supervisor are matched by their B number. A student who is already in the list is not added again, but when the sheet has details still empty in Supervisor (for example the poster number), the row is marked **Fills in details** and, if ticked, those details are filled in; nothing already typed is replaced. A student in another list, such as an advisee, receives the project, placement, advisee or marking role in the same record, and an archived student is restored.
+- For project students, and projects marked as second marker, the course of each row is chosen in the dialog. It starts as the course named in the row's course column, if any, or else the course of the list in which **Import…** was selected. SUST is not offered for marking.
 
 ## Installation
 
