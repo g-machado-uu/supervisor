@@ -284,6 +284,9 @@ struct Session {
     selected: Option<Uuid>,
     search: String,
     show_archived: bool,
+    /// Students ticked in a list to copy their emails, and that list.
+    /// Leaving the list unticks them.
+    ticked: (Option<Category>, HashSet<Uuid>),
     dirty_since: Option<f64>,
     status: SaveStatus,
     new_student: Option<NewStudent>,
@@ -353,6 +356,7 @@ impl Session {
             selected: None,
             search: String::new(),
             show_archived: false,
+            ticked: (None, HashSet::new()),
             dirty_since: None,
             status: SaveStatus::Saved,
             new_student: None,
@@ -538,6 +542,36 @@ impl Session {
 
     fn notify(&mut self, ui: &Ui, msg: impl Into<String>) {
         self.toast = Some((msg.into(), ui.input(|i| i.time)));
+    }
+
+    /// Puts the emails of these students on the clipboard, ready to paste
+    /// into To, and says who has none.
+    fn copy_emails(&mut self, ui: &Ui, ids: &[Uuid]) {
+        let students: Vec<&Student> = ids.iter().filter_map(|id| self.db.student(*id)).collect();
+        let (emails, missing) = student_list::email_list(&students);
+        let copied = students.len() - missing.len();
+        let mut msg = match copied {
+            0 => "Nothing copied".to_string(),
+            1 => "Copied 1 email".to_string(),
+            n => format!("Copied {n} emails"),
+        };
+        if copied > 0 {
+            ui.ctx().copy_text(emails);
+            msg.push_str(" – paste them into To");
+        }
+        if !missing.is_empty() {
+            let mut names: Vec<String> =
+                missing.iter().take(3).map(|s| if s.name.trim().is_empty() { "(no name)".into() } else { s.name.trim().to_string() }).collect();
+            if missing.len() > 3 {
+                names.push(format!("{} more", missing.len() - 3));
+            }
+            msg.push_str(&match (missing.len(), self.private) {
+                (1, true) => ". 1 student has no email".to_string(),
+                (n, true) => format!(". {n} students have no email"),
+                (_, false) => format!(". No email for {}", names.join(", ")),
+            });
+        }
+        self.notify(ui, msg);
     }
 
     /// Says once when the backup copy stops working, and when it works again.
@@ -1060,6 +1094,9 @@ impl Session {
                 }
             }
             View::List(cat) => {
+                if self.ticked.0.as_ref() != Some(&cat) {
+                    self.ticked = (Some(cat.clone()), HashSet::new());
+                }
                 let action = student_list::show(
                     ui,
                     &self.db,
@@ -1068,9 +1105,13 @@ impl Session {
                         search: &mut self.search,
                         show_archived: &mut self.show_archived,
                         selected: &mut self.selected,
+                        ticked: &mut self.ticked.1,
                         private: self.private,
                     },
                 );
+                if let ListAction::CopyEmails(ids) = &action {
+                    self.copy_emails(ui, ids);
+                }
                 if action == ListAction::Import
                     && let Some(kind) = cat.import_kind()
                 {
@@ -4457,6 +4498,87 @@ mod ui_tests {
         h.get_by_label("Done").click();
         h.run_steps(4);
         film(&mut h, "rar");
+    }
+
+    fn copied(h: &Harness<'_, SupervisorApp>) -> Vec<String> {
+        h.output()
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ticked_students_emails_are_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let advisee = |name: &str, email: &str| Student {
+            name: name.into(),
+            email: email.into(),
+            advisee: Some(AdviseeRecord::default()),
+            ..Default::default()
+        };
+        {
+            let s = session(&mut h);
+            s.db.students.extend([
+                advisee("Ana Silva", "ana@ulster.ac.uk"),
+                advisee("Bob Jones", " bob@ulster.ac.uk "),
+                advisee("Cara Byrne", ""),
+                advisee("Dan Doyle", "dan@ulster.ac.uk"),
+            ]);
+            s.view = View::List(Category::Advisee);
+        }
+        h.run_steps(3);
+        let copy = format!("{}  Copy emails", icons::ENVELOPE_SIMPLE);
+        assert!(h.get_by_label(&copy).accesskit_node().is_disabled(), "nothing ticked yet");
+
+        // Ticking one doesn't open the student.
+        h.get_by_label("Tick Bob Jones").click();
+        h.run_steps(2);
+        assert_eq!(session(&mut h).selected, None);
+        h.get_by_label("Tick Ana Silva").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("2 students ticked").is_some());
+        h.get_by_label(&copy).click();
+        h.run_steps(1);
+        assert_eq!(copied(&h), ["ana@ulster.ac.uk; bob@ulster.ac.uk"]);
+        h.run_steps(1);
+        assert!(h.query_by_label_contains("Copied 2 emails").is_some());
+
+        // Everyone shown: the student without an email is named.
+        h.get_by_label("Tick everyone shown").click();
+        h.run_steps(2);
+        h.get_by_label(&copy).click();
+        h.run_steps(1);
+        assert_eq!(copied(&h), ["ana@ulster.ac.uk; bob@ulster.ac.uk; dan@ulster.ac.uk"]);
+        h.run_steps(1);
+        assert!(h.query_by_label_contains("No email for Cara Byrne").is_some());
+        shot(&mut h, "60_copy_emails");
+
+        // A search narrows what is copied.
+        session(&mut h).search = "dan".into();
+        h.run_steps(2);
+        assert!(h.query_by_label("1 student ticked").is_some());
+        h.get_by_label(&copy).click();
+        h.run_steps(1);
+        assert_eq!(copied(&h), ["dan@ulster.ac.uk"]);
+
+        // Another list starts with nothing ticked.
+        {
+            let s = session(&mut h);
+            s.search.clear();
+            s.view = View::List(Category::All);
+        }
+        h.run_steps(2);
+        assert!(h.get_by_label(&copy).accesskit_node().is_disabled());
+        session(&mut h).view = View::List(Category::Advisee);
+        h.run_steps(2);
+        assert!(h.get_by_label(&copy).accesskit_node().is_disabled(), "unticked on leaving the list");
     }
 
     #[test]

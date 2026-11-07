@@ -1,5 +1,7 @@
 //! Category list views with status chips.
 
+use std::collections::HashSet;
+
 use chrono::NaiveDate;
 use egui::{Color32, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
@@ -62,17 +64,39 @@ pub struct ListState<'a> {
     pub search: &'a mut String,
     pub show_archived: &'a mut bool,
     pub selected: &'a mut Option<Uuid>,
+    /// Students ticked to copy their emails.
+    pub ticked: &'a mut HashSet<Uuid>,
     /// Privacy mode: names and numbers are dots.
     pub private: bool,
 }
 
 /// A button of the list's header.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ListAction {
     None,
     Add,
     /// Import students from a spreadsheet.
     Import,
+    /// Copy the emails of these students, ticked and shown, in list order.
+    CopyEmails(Vec<Uuid>),
+}
+
+/// The emails of `students` as one line to paste into the To field of
+/// Outlook or Gmail: separated by semicolons, which both take, and each
+/// once. Also the students without an email.
+pub fn email_list<'a>(students: &[&'a Student]) -> (String, Vec<&'a Student>) {
+    let mut seen = HashSet::new();
+    let mut emails = Vec::new();
+    let mut missing = Vec::new();
+    for s in students {
+        let email = s.email.trim();
+        if email.is_empty() {
+            missing.push(*s);
+        } else if seen.insert(email.to_lowercase()) {
+            emails.push(email);
+        }
+    }
+    (emails.join("; "), missing)
 }
 
 impl Category {
@@ -154,6 +178,9 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> Li
     if *cat == Category::Marking(MarkingKind::Project) {
         rows.sort_by_key(|s| s.marking.as_ref().and_then(MarkingRecord::poster_order).unwrap_or(u32::MAX));
     }
+    if let Some(copy) = copy_bar(ui, &rows, st.ticked) {
+        add = copy;
+    }
 
     if rows.is_empty() {
         theme::card(ui, "", |ui| {
@@ -208,8 +235,43 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> Li
 
     theme::card_frame(ui)
         .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 4 })
-        .show(ui, |ui| table(ui, db, cat, &rows, mixed, headers, st.selected, st.private, today));
+        .show(ui, |ui| table(ui, db, cat, &rows, mixed, headers, st.selected, st.ticked, st.private, today));
     add
+}
+
+/// Above the table: how many are ticked, and the button to copy their
+/// emails. Only students shown count, so a search narrows what is copied.
+fn copy_bar(ui: &mut Ui, rows: &[&Student], ticked: &mut HashSet<Uuid>) -> Option<ListAction> {
+    if rows.is_empty() {
+        return None;
+    }
+    let chosen: Vec<Uuid> = rows.iter().filter(|s| ticked.contains(&s.id)).map(|s| s.id).collect();
+    let mut action = None;
+    ui.horizontal(|ui| {
+        let n = chosen.len();
+        let button = egui::Button::new(format!("{}  Copy emails", icons::ENVELOPE_SIMPLE)).min_size(egui::vec2(0.0, 30.0));
+        let hover = if n == 0 {
+            "Tick students in the list first, or the box at the top of the list to tick everyone shown"
+        } else {
+            "Copy their emails, to paste into To in Outlook or Gmail"
+        };
+        if ui.add_enabled(n > 0, button).on_hover_text(hover).on_disabled_hover_text(hover).clicked() {
+            action = Some(ListAction::CopyEmails(chosen.clone()));
+        }
+        let text = match n {
+            0 => "Tick students to copy their emails".to_string(),
+            1 => "1 student ticked".to_string(),
+            n => format!("{n} students ticked"),
+        };
+        ui.label(RichText::new(text).color(theme::muted(ui)));
+        if n > 0 && ui.small_button("Untick all").clicked() {
+            for s in rows {
+                ticked.remove(&s.id);
+            }
+        }
+    });
+    ui.add_space(8.0);
+    action
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -221,6 +283,7 @@ fn table(
     mixed: bool,
     headers: &[&str],
     selected: &mut Option<Uuid>,
+    ticked: &mut HashSet<Uuid>,
     private: bool,
     today: NaiveDate,
 ) {
@@ -229,6 +292,7 @@ fn table(
         .striped(false)
         .sense(Sense::click())
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::exact(24.0))
         .column(Column::initial(210.0).at_least(140.0).resizable(true).clip(true))
         .column(Column::initial(110.0).resizable(true));
     for _ in 2..headers.len() - 1 {
@@ -237,6 +301,25 @@ fn table(
     table
         .column(Column::remainder().at_least(140.0))
         .header(32.0, |mut header| {
+            header.col(|ui| {
+                let n = rows.iter().filter(|s| ticked.contains(&s.id)).count();
+                let mut all = n == rows.len();
+                let hover = if all { "Untick everyone shown" } else { "Tick everyone shown" };
+                let check = egui::Checkbox::without_text(&mut all).indeterminate(n > 0 && n < rows.len());
+                let resp = ui.add(check).on_hover_text(hover);
+                resp.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::Role::CheckBox, true, all, "Tick everyone shown")
+                });
+                if resp.changed() {
+                    for s in rows {
+                        if all {
+                            ticked.insert(s.id);
+                        } else {
+                            ticked.remove(&s.id);
+                        }
+                    }
+                }
+            });
             for h in headers {
                 header.col(|ui| {
                     ui.label(
@@ -252,6 +335,21 @@ fn table(
             body.rows(46.0, rows.len(), |mut row| {
                 let s = rows[row.index()];
                 row.set_selected(*selected == Some(s.id));
+                row.col(|ui| {
+                    let mut on = ticked.contains(&s.id);
+                    let resp = ui.add(egui::Checkbox::without_text(&mut on)).on_hover_text("Tick to copy the email");
+                    resp.widget_info(|| {
+                        let who = if private { "student".to_string() } else { s.name.clone() };
+                        egui::WidgetInfo::selected(egui::Role::CheckBox, true, on, format!("Tick {who}"))
+                    });
+                    if resp.changed() {
+                        if on {
+                            ticked.insert(s.id);
+                        } else {
+                            ticked.remove(&s.id);
+                        }
+                    }
+                });
                 row.col(|ui| {
                     theme::avatar(ui, if private { "" } else { &s.name }, 30.0);
                     let text = if private {
@@ -562,5 +660,25 @@ pub fn semester_status(
         (Some(_), ReplyStatus::Replied) => ("replied".into(), theme::ACCENT),
         (Some(_), ReplyStatus::Awaiting) => ("awaiting reply".into(), theme::AMBER),
         (Some(_), ReplyStatus::NoReply) => ("no reply".into(), theme::RED),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emails_are_joined_by_semicolons_once_each() {
+        let student = |name: &str, email: &str| Student { name: name.into(), email: email.into(), ..Default::default() };
+        let all = [
+            student("Ana", "ana@ulster.ac.uk"),
+            student("No Email", "  "),
+            student("Ana Again", "ANA@ulster.ac.uk"),
+            student("Bob", " bob@ulster.ac.uk"),
+        ];
+        let refs: Vec<&Student> = all.iter().collect();
+        let (text, missing) = email_list(&refs);
+        assert_eq!(text, "ana@ulster.ac.uk; bob@ulster.ac.uk");
+        assert_eq!(missing.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["No Email"]);
     }
 }

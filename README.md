@@ -7,7 +7,7 @@ Supervisor is a desktop application for the administration of student supervisio
 ## Features
 
 - **Dashboard:** upcoming events and items that require attention, such as unanswered contact, overdue coursework, research deadlines and the end of visas or grants.
-- **Student lists:** one list for each group of students, with the details of the selected student in a side panel.
+- **Student lists:** one list for each group of students, with the details of the selected student in a side panel. Students can be ticked to copy their emails, ready to paste into the *To* field of Outlook or Gmail.
 - **Project supervision:** second markers, coursework deadlines derived from the teaching weeks, and marks from each marker with a suggested agreed mark. Each coursework records who marks it (the supervisor, the second marker, or both) and its weight, from which the module mark is calculated. The poster number is recorded next to the poster. Separate fields apply to SUST students.
 - **Research students:** four lists (PhD, PhD External, MSc and MSc External) with assessments, annual reports, submission, viva and reminders. External students have their own list of deadlines.
 - **Brazilian programmes:** academic and professional levels, funding bodies, standard stages, the defence committee and suggested deadlines.
