@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::model::Database;
 use crate::storage::{self, KeyFile, Vault};
+use crate::ui::file_dialog::{Dialog, Pending};
 use crate::ui::{icons, theme, widgets};
 
 /// What the lock screen hands over once the data is open.
@@ -48,6 +49,14 @@ pub struct LockScreen {
     key: KeyState,
     weak_password: bool,
     pending: Option<Receiver<Result<(Vault, Database)>>>,
+    /// A file dialog while it is open, and what its answer is for.
+    choosing: Option<(Pending, Choosing)>,
+}
+
+enum Choosing {
+    Key([u8; 32]),
+    Open,
+    New,
 }
 
 impl LockScreen {
@@ -60,6 +69,28 @@ impl LockScreen {
             error: None,
             weak_password: false,
             pending: None,
+            choosing: None,
+        }
+    }
+
+    /// Act on the file dialog's answer once it has closed.
+    fn file_chosen(&mut self) {
+        let Some(answer) = self.choosing.as_ref().and_then(|(d, _)| d.poll()) else { return };
+        let Some((_, what)) = self.choosing.take() else { return };
+        let Some(path) = answer else { return };
+        match what {
+            Choosing::Key(id) => match storage::import_key_file(&path, id) {
+                Ok(key) => {
+                    self.key = KeyState::Ready(key);
+                    self.error = None;
+                }
+                Err(e) => self.error = Some(format!("{e:#}")),
+            },
+            Choosing::Open => *self = Self::new(path),
+            Choosing::New if path.exists() => {
+                self.error = Some("That file already exists – use “Open another file…”.".into());
+            }
+            Choosing::New => *self = Self::new(path),
         }
     }
 
@@ -111,6 +142,7 @@ impl LockScreen {
 
     /// Draws the screen; returns the unlocked data once ready.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Unlocked> {
+        self.file_chosen();
         if let Some(rx) = &self.pending
             && let Ok(result) = rx.try_recv()
         {
@@ -129,7 +161,7 @@ impl LockScreen {
         }
 
         let first_run = self.first_run();
-        let busy = self.pending.is_some();
+        let busy = self.pending.is_some() || self.choosing.is_some();
         let needs_key = matches!(self.key, KeyState::Missing(_) | KeyState::Wrong(_));
         let width = ui.available_width();
         if width > 900.0 {
@@ -209,17 +241,9 @@ impl LockScreen {
                                 if ui
                                     .add_enabled(!busy, egui::Button::new(format!("{}  Import key file…", icons::KEY)))
                                     .clicked()
-                                    && let Some(src) = rfd::FileDialog::new()
-                                        .set_title("Choose your Supervisor key file")
-                                        .pick_file()
                                 {
-                                    match storage::import_key_file(&src, id) {
-                                        Ok(key) => {
-                                            self.key = KeyState::Ready(key);
-                                            self.error = None;
-                                        }
-                                        Err(e) => self.error = Some(format!("{e:#}")),
-                                    }
+                                    let dialog = Dialog::new().set_title("Choose your Supervisor key file").pick_file();
+                                    self.choosing = Some((Pending::open(ui.ctx(), dialog), Choosing::Key(id)));
                                 }
                             }
                             ui.add_space(10.0);
@@ -291,24 +315,16 @@ impl LockScreen {
                 }
                 ui.horizontal(|ui| {
                     ui.add_space((ui.available_width() - 330.0).max(0.0) / 2.0);
-                    if ui.add_enabled(!busy, egui::Button::new("Open another file…").small()).clicked()
-                        && let Some(p) = rfd::FileDialog::new()
-                            .add_filter("Supervisor data", &["svt"])
-                            .pick_file()
-                    {
-                        *self = Self::new(p);
+                    if ui.add_enabled(!busy, egui::Button::new("Open another file…").small()).clicked() {
+                        let dialog = Dialog::new().add_filter("Supervisor data", &["svt"]).pick_file();
+                        self.choosing = Some((Pending::open(ui.ctx(), dialog), Choosing::Open));
                     }
-                    if ui.add_enabled(!busy, egui::Button::new("Create new file at…").small()).clicked()
-                        && let Some(p) = rfd::FileDialog::new()
+                    if ui.add_enabled(!busy, egui::Button::new("Create new file at…").small()).clicked() {
+                        let dialog = Dialog::new()
                             .add_filter("Supervisor data", &["svt"])
                             .set_file_name("data.svt")
-                            .save_file()
-                    {
-                        if p.exists() {
-                            self.error = Some("That file already exists – use “Open another file…”.".into());
-                        } else {
-                            *self = Self::new(p);
-                        }
+                            .save_file();
+                        self.choosing = Some((Pending::open(ui.ctx(), dialog), Choosing::New));
                     }
                 });
             });

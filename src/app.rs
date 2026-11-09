@@ -25,6 +25,7 @@ use crate::ui::student_form::{self, FormAction, Role, Shown};
 use crate::ui::student_import::{self, StudentImport};
 use crate::ui::student_list::{self, Category, ListAction, ListState};
 use crate::ui::timetable::{self, TimetableDialog};
+use crate::ui::file_dialog::{self, Dialog};
 use crate::ui::{icons, theme, widgets};
 
 const AUTOSAVE_DELAY: f64 = 1.0;
@@ -132,7 +133,18 @@ struct KeyFileSetup {
     path: PathBuf,
     password: Zeroizing<String>,
     backup: Option<PathBuf>,
+    /// The dialog asking where to save the backup copy, while it is open.
+    choosing: Option<file_dialog::Pending>,
     error: Option<String>,
+}
+
+/// What to do with the path from the open file dialog.
+enum OnPick {
+    /// Write this calendar there, then say `done`.
+    SaveIcs { text: String, done: String },
+    ImportIcs,
+    ImportSheet(crate::sheet_import::SheetKind, Category),
+    BackupFolder,
 }
 
 enum Confirm {
@@ -292,6 +304,8 @@ struct Session {
     new_student: Option<NewStudent>,
     /// Students from a spreadsheet, while they are being chosen.
     student_import: Option<(StudentImport, crate::sheet_import::SheetKind)>,
+    /// A file dialog while it is open, and what to do with its answer.
+    file_dialog: Option<(file_dialog::Pending, OnPick)>,
     /// The student whose hidden registration number is shown.
     revealed: Option<Uuid>,
     reveal_prompt: Option<RevealPrompt>,
@@ -361,6 +375,7 @@ impl Session {
             status: SaveStatus::Saved,
             new_student: None,
             student_import: None,
+            file_dialog: None,
             revealed: None,
             reveal_prompt: None,
             rar_notes: None,
@@ -637,6 +652,7 @@ impl Session {
         self.shortcuts(ui);
         self.timetable_dialog(ui);
         self.student_import_dialog(ui);
+        self.file_dialog(ui);
         self.dialogs(ui);
         let ctx = ui.ctx();
         // Anything floating over the app takes it (a date picker, a menu, a
@@ -1150,11 +1166,11 @@ impl Session {
                     SettingsAction::ChangePassword => self.change_password(ui),
                     SettingsAction::AddKeyFile => self.start_key_file(),
                     SettingsAction::RemoveKeyFile => self.remove_key_file(ui),
-                    SettingsAction::ChooseBackupFolder => {
-                        if let Some(folder) = rfd::FileDialog::new().set_title("Choose a folder for the backup copy").pick_folder() {
-                            self.set_backup_folder(ui, &folder);
-                        }
-                    }
+                    SettingsAction::ChooseBackupFolder => self.open_file_dialog(
+                        ui,
+                        Dialog::new().set_title("Choose a folder for the backup copy").pick_folder(),
+                        OnPick::BackupFolder,
+                    ),
                     SettingsAction::BackupNow => self.backup_now(ui),
                     SettingsAction::StopBackup => self.stop_backup(ui),
                 }
@@ -1162,27 +1178,44 @@ impl Session {
         }
     }
 
-    /// Ask where to save, then write an .ics of `items`.
-    fn write_ics(&mut self, ui: &Ui, items: &[CalItem], invite: bool, file_name: &str) -> bool {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("iCalendar", &["ics"])
-            .set_file_name(file_name)
-            .save_file()
-        else {
-            return false;
-        };
+    /// Ask where to save an .ics of `items`; once saved, say `done`.
+    fn save_ics(&mut self, ui: &Ui, items: &[CalItem], invite: bool, file_name: &str, done: String) {
         let text = ics::calendar(
             items,
             &self.db.settings,
             invite,
             &jiff::tz::TimeZone::system(),
         );
-        match std::fs::write(&path, text) {
-            Ok(()) => true,
-            Err(e) => {
-                self.notify(ui, format!("Saving {} failed: {e}", path.display()));
-                false
-            }
+        let dialog = Dialog::new().add_filter("iCalendar", &["ics"]).set_file_name(file_name).save_file();
+        self.open_file_dialog(ui, dialog, OnPick::SaveIcs { text, done });
+    }
+
+    /// Open a file dialog without blocking the window; `file_dialog` acts
+    /// on its answer. Only one is open at a time.
+    fn open_file_dialog(
+        &mut self,
+        ui: &Ui,
+        dialog: impl Future<Output = Option<rfd::FileHandle>> + Send + 'static,
+        then: OnPick,
+    ) {
+        if self.file_dialog.is_none() {
+            self.file_dialog = Some((file_dialog::Pending::open(ui.ctx(), dialog), then));
+        }
+    }
+
+    /// Act on the file dialog's answer once it has closed.
+    fn file_dialog(&mut self, ui: &Ui) {
+        let Some(answer) = self.file_dialog.as_ref().and_then(|(d, _)| d.poll()) else { return };
+        let Some((_, then)) = self.file_dialog.take() else { return };
+        let Some(path) = answer else { return };
+        match then {
+            OnPick::SaveIcs { text, done } => match std::fs::write(&path, text) {
+                Ok(()) => self.notify(ui, done),
+                Err(e) => self.notify(ui, format!("Saving {} failed: {e}", path.display())),
+            },
+            OnPick::ImportIcs => self.import_ics(ui, &path),
+            OnPick::ImportSheet(kind, cat) => self.import_sheet(ui, &path, kind, &cat),
+            OnPick::BackupFolder => self.set_backup_folder(ui, &path),
         }
     }
 
@@ -1198,9 +1231,8 @@ impl Session {
 
     fn export_ics(&mut self, ui: &Ui) {
         let items = self.db.cal_items(|_| true, true);
-        if self.write_ics(ui, &items, false, "supervisor.ics") {
-            self.notify(ui, format!("Exported {} items", items.len()));
-        }
+        let done = format!("Exported {} items", items.len());
+        self.save_ics(ui, &items, false, "supervisor.ics", done);
     }
 
     fn export_selected(&mut self, ui: &Ui, uids: &std::collections::HashSet<String>) {
@@ -1216,7 +1248,7 @@ impl Session {
         } else {
             "supervisor-selection.ics"
         };
-        if self.write_ics(ui, &items, invite, name) {
+        {
             let mut msg = format!("Exported {} items", items.len());
             if invite {
                 // Deadlines and reminders never have guests; anything else without one lacks an email.
@@ -1233,7 +1265,7 @@ impl Session {
                     msg.push_str(" – upload it in Outlook, then open each event and Send");
                 }
             }
-            self.notify(ui, msg);
+            self.save_ics(ui, &items, invite, name, msg);
         }
     }
 
@@ -1277,9 +1309,7 @@ impl Session {
         } else {
             "upload it in Outlook, open the event and Send"
         };
-        if self.write_ics(ui, &[invite], true, &format!("{name}.ics")) {
-            self.notify(ui, format!("{series}Invite saved – {hint}"));
-        }
+        self.save_ics(ui, &[invite], true, &format!("{name}.ics"), format!("{series}Invite saved – {hint}"));
     }
 
     /// Open Google Calendar's "new event" page filled in with the meeting,
@@ -1299,10 +1329,13 @@ impl Session {
 
     /// Ask for an .ics file and show its events for importing.
     fn pick_import(&mut self, ui: &Ui) {
-        let Some(path) = rfd::FileDialog::new().add_filter("iCalendar", &["ics"]).pick_file() else {
-            return;
-        };
-        let text = match std::fs::read(&path) {
+        let dialog = Dialog::new().add_filter("iCalendar", &["ics"]).pick_file();
+        self.open_file_dialog(ui, dialog, OnPick::ImportIcs);
+    }
+
+    /// Show the events of the .ics file at `path` for importing.
+    fn import_ics(&mut self, ui: &Ui, path: &std::path::Path) {
+        let text = match std::fs::read(path) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => {
                 self.notify(ui, format!("Reading {} failed: {e}", path.display()));
@@ -1320,14 +1353,16 @@ impl Session {
 
     /// Ask for a spreadsheet and show its students for importing into `cat`.
     fn pick_sheet(&mut self, ui: &Ui, kind: crate::sheet_import::SheetKind, cat: &Category) {
-        let Some(path) = rfd::FileDialog::new()
+        let dialog = Dialog::new()
             .set_title("Import students from a spreadsheet")
             .add_filter("Spreadsheet", &["xlsx", "xlsm", "xls", "xlsb", "ods"])
-            .pick_file()
-        else {
-            return;
-        };
-        let sheet = crate::sheet_import::read_workbook(&path).and_then(|sheets| crate::sheet_import::import(&sheets));
+            .pick_file();
+        self.open_file_dialog(ui, dialog, OnPick::ImportSheet(kind, cat.clone()));
+    }
+
+    /// Show the students in the spreadsheet at `path` for importing into `cat`.
+    fn import_sheet(&mut self, ui: &Ui, path: &std::path::Path, kind: crate::sheet_import::SheetKind, cat: &Category) {
+        let sheet = crate::sheet_import::read_workbook(path).and_then(|sheets| crate::sheet_import::import(&sheets));
         let sheet = match sheet {
             Ok(sheet) if sheet.students.is_empty() => {
                 self.notify(ui, "No students found in the first sheet of that file");
@@ -1473,6 +1508,7 @@ impl Session {
                 path,
                 password: form.password,
                 backup: None,
+                choosing: None,
                 error: None,
             })
         })();
@@ -1642,12 +1678,21 @@ impl Session {
                     "Without the key file your data can't be opened, even with the right password.",
                 );
                 ui.add_space(10.0);
-                if ui.button(format!("{} Save backup copy…", icons::EXPORT)).clicked()
-                    && let Some(dest) = rfd::FileDialog::new()
+                if ui
+                    .add_enabled(setup.choosing.is_none(), egui::Button::new(format!("{} Save backup copy…", icons::EXPORT)))
+                    .clicked()
+                {
+                    let dialog = Dialog::new()
                         .set_title("Save a backup copy of your key file")
                         .set_file_name("supervisor-key.bin")
-                        .save_file()
-                {
+                        .save_file();
+                    setup.choosing = Some(file_dialog::Pending::open(ui.ctx(), dialog));
+                }
+                let chosen = setup.choosing.as_ref().and_then(|d| d.poll());
+                if chosen.is_some() {
+                    setup.choosing = None;
+                }
+                if let Some(dest) = chosen.flatten() {
                     let beside_copy = self.vault.backup_copy().is_some_and(|c| storage::same_folder(&dest, &c.file));
                     let saved = if beside_copy {
                         Err(anyhow::anyhow!("Choose another place: a key file next to the backup copy of your data would protect nothing."))

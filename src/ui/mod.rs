@@ -2,6 +2,7 @@ pub mod advisee;
 pub mod brazil;
 pub mod calendar;
 pub mod dashboard;
+pub mod file_dialog;
 pub mod fyp;
 pub mod icons;
 pub mod lock;
