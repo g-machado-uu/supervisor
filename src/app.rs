@@ -45,9 +45,14 @@ impl SupervisorApp {
         theme::install(&cc.egui_ctx);
         // The saved preference is encrypted; follow the OS until unlocked.
         cc.egui_ctx.set_theme(egui::ThemePreference::System);
-        Self {
-            screen: Screen::Locked(LockScreen::new(data_file.unwrap_or_else(storage::last_used_path))),
-        }
+        // A file named on the command line may be a new one; the one opened
+        // last should still be there.
+        let lock = match (data_file, storage::last_used_path()) {
+            (Some(path), _) => LockScreen::new(path, false),
+            (None, Some(path)) => LockScreen::new(path, true),
+            (None, None) => LockScreen::new(storage::default_path(), false),
+        };
+        Self { screen: Screen::Locked(lock) }
     }
 }
 
@@ -57,7 +62,7 @@ impl SupervisorApp {
     fn lock(&mut self, ctx: &egui::Context) {
         let Screen::Unlocked(s) = &self.screen else { return };
         let path = s.vault.path().to_path_buf();
-        self.screen = Screen::Locked(LockScreen::new(path));
+        self.screen = Screen::Locked(LockScreen::new(path, true));
         ctx.data_mut(|d| d.clear());
         ctx.forget_all_images();
     }
@@ -133,8 +138,6 @@ struct KeyFileSetup {
     path: PathBuf,
     password: Zeroizing<String>,
     backup: Option<PathBuf>,
-    /// The dialog asking where to save the backup copy, while it is open.
-    choosing: Option<file_dialog::Pending>,
     error: Option<String>,
 }
 
@@ -145,6 +148,38 @@ enum OnPick {
     ImportIcs,
     ImportSheet(crate::sheet_import::SheetKind, Category),
     BackupFolder,
+    /// Save the backup copy of the key file being added.
+    KeyBackup,
+}
+
+/// Slow password work on another thread: key derivation is slow on
+/// purpose (about a second), and would freeze the window.
+enum PasswordJob {
+    /// Checking the password typed to reveal a number or the RAR notes.
+    Reveal(Receiver<anyhow::Result<bool>>),
+    /// Checking the password before adding a key file at `path`.
+    AddKeyFile { rx: Receiver<anyhow::Result<bool>>, password: Zeroizing<String>, path: PathBuf },
+    /// Deriving the key for a new password or key file.
+    Rekey(Receiver<anyhow::Result<storage::NewSeal>>, Rekey),
+}
+
+/// What a re-key is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rekey {
+    Password,
+    KeyFileOn,
+    KeyFileOff,
+}
+
+/// Runs `job` on another thread, and repaints when it is done.
+fn spawn<T: Send + 'static>(ctx: &egui::Context, job: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
+    let (tx, rx) = channel();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(job());
+        ctx.request_repaint();
+    });
+    rx
 }
 
 enum Confirm {
@@ -309,6 +344,8 @@ struct Session {
     /// The student whose hidden registration number is shown.
     revealed: Option<Uuid>,
     reveal_prompt: Option<RevealPrompt>,
+    /// Slow password work running on another thread.
+    password_job: Option<PasswordJob>,
     rar_notes: Option<RarDialog>,
     /// Privacy mode, switched on the dashboard: names and numbers are
     /// hidden there, in the lists, the calendar and every student's details.
@@ -378,6 +415,7 @@ impl Session {
             file_dialog: None,
             revealed: None,
             reveal_prompt: None,
+            password_job: None,
             rar_notes: None,
             private: false,
             peek: None,
@@ -531,15 +569,19 @@ impl Session {
     }
 
     fn ready_to_leave(&self) -> Option<Leave> {
-        self.leaving
-            .filter(|_| (self.dirty_since.is_none() || self.discard) && self.saving.is_none())
+        // A new password or key file being worked out is saved first.
+        self.leaving.filter(|_| {
+            (self.dirty_since.is_none() || self.discard) && self.saving.is_none() && self.password_job.is_none()
+        })
     }
 
     /// Lock after the chosen time without input. Uses the wall clock, as
     /// egui's time stands still while the window is hidden.
     fn check_idle(&mut self, ctx: &egui::Context) {
         let minutes = self.db.settings.auto_lock_minutes;
-        if minutes == 0 || self.leaving.is_some() {
+        // Locking would lose the answer of an open file dialog, so it waits
+        // for it to close; choosing there counts as being active.
+        if minutes == 0 || self.leaving.is_some() || self.file_dialog.is_some() {
             return;
         }
         let limit = Duration::from_secs(u64::from(minutes) * 60);
@@ -613,14 +655,17 @@ impl Session {
             self.notify(ui, msg);
         }
         self.announce_backup_problem(ui);
+        self.poll_password_job(ui);
 
-        if ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::L))) {
+        // Not behind an open file dialog: locking would lose its answer.
+        let choosing = self.file_dialog.is_some();
+        if !choosing && ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::L))) {
             lock = true;
         }
         if ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S))) {
             save_now = true;
         }
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+        if !choosing && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
             self.shortcuts = !self.shortcuts;
         }
 
@@ -652,8 +697,8 @@ impl Session {
         self.shortcuts(ui);
         self.timetable_dialog(ui);
         self.student_import_dialog(ui);
-        self.file_dialog(ui);
         self.dialogs(ui);
+        self.file_dialog(ui);
         let ctx = ui.ctx();
         // Anything floating over the app takes it (a date picker, a menu, a
         // dialog), except a message that is only passing by.
@@ -1134,12 +1179,10 @@ impl Session {
                     self.pick_sheet(ui, kind, &cat);
                 }
                 if action == ListAction::Add
-                    || ui.input_mut(|i| {
-                        i.consume_shortcut(&egui::KeyboardShortcut::new(
-                            egui::Modifiers::COMMAND,
-                            egui::Key::N,
-                        ))
-                    })
+                    || (self.file_dialog.is_none()
+                        && ui.input_mut(|i| {
+                            i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N))
+                        }))
                 {
                     self.new_student =
                         Some(NewStudent::for_category(Some(&cat), &self.db.settings));
@@ -1147,9 +1190,13 @@ impl Session {
             }
             View::Settings => {
                 let path = self.vault.path().display().to_string();
+                // Students on each course: project students, and the projects marked as second marker.
                 let mut in_use = std::collections::HashMap::new();
-                for f in self.db.students.iter().filter_map(|s| s.fyp.as_ref()) {
-                    *in_use.entry(f.programme.clone()).or_insert(0) += 1;
+                for s in &self.db.students {
+                    let marked = s.marking.as_ref().filter(|m| m.kind == MarkingKind::Project).map(|m| &m.programme);
+                    for programme in s.fyp.as_ref().map(|f| &f.programme).into_iter().chain(marked) {
+                        *in_use.entry(programme.clone()).or_insert(0) += 1;
+                    }
                 }
                 let security = settings::Security {
                     data_path: &path,
@@ -1159,12 +1206,19 @@ impl Session {
                     key_file: &mut self.key_form,
                     backup_copy: self.vault.backup_copy(),
                     backup_message: &self.backup_message,
+                    working: match &self.password_job {
+                        Some(PasswordJob::Rekey(_, Rekey::Password)) => Some(settings::Working::Password),
+                        Some(PasswordJob::AddKeyFile { .. }) => Some(settings::Working::KeyFile("Checking your password…")),
+                        Some(PasswordJob::Rekey(_, Rekey::KeyFileOn)) => Some(settings::Working::KeyFile("Turning on the key file…")),
+                        Some(PasswordJob::Rekey(_, Rekey::KeyFileOff)) => Some(settings::Working::KeyFile("Removing the key file…")),
+                        Some(PasswordJob::Reveal(_)) | None => None,
+                    },
                 };
                 match settings::show(ui, &mut self.db.settings, &in_use, security) {
                     SettingsAction::None => {}
                     SettingsAction::ExportIcs => self.export_ics(ui),
                     SettingsAction::ChangePassword => self.change_password(ui),
-                    SettingsAction::AddKeyFile => self.start_key_file(),
+                    SettingsAction::AddKeyFile => self.start_key_file(ui),
                     SettingsAction::RemoveKeyFile => self.remove_key_file(ui),
                     SettingsAction::ChooseBackupFolder => self.open_file_dialog(
                         ui,
@@ -1203,10 +1257,17 @@ impl Session {
         }
     }
 
-    /// Act on the file dialog's answer once it has closed.
+    /// While a file dialog is open, covers the app; acts on its answer
+    /// once it has closed.
     fn file_dialog(&mut self, ui: &Ui) {
-        let Some(answer) = self.file_dialog.as_ref().and_then(|(d, _)| d.poll()) else { return };
+        let Some((dialog, _)) = &self.file_dialog else { return };
+        let Some(answer) = dialog.poll() else {
+            file_dialog::waiting(ui);
+            return;
+        };
         let Some((_, then)) = self.file_dialog.take() else { return };
+        // Choosing in the dialog was using the app: the idle time starts now.
+        self.last_active = Instant::now();
         let Some(path) = answer else { return };
         match then {
             OnPick::SaveIcs { text, done } => match std::fs::write(&path, text) {
@@ -1216,6 +1277,26 @@ impl Session {
             OnPick::ImportIcs => self.import_ics(ui, &path),
             OnPick::ImportSheet(kind, cat) => self.import_sheet(ui, &path, kind, &cat),
             OnPick::BackupFolder => self.set_backup_folder(ui, &path),
+            OnPick::KeyBackup => self.save_key_backup(&path),
+        }
+    }
+
+    /// Save the backup copy of the key file being added at `dest`.
+    fn save_key_backup(&mut self, dest: &std::path::Path) {
+        let beside_copy = self.vault.backup_copy().is_some_and(|c| storage::same_folder(dest, &c.file));
+        let data_file = self.vault.path().to_path_buf();
+        let Some(setup) = &mut self.key_setup else { return };
+        let saved = if beside_copy {
+            Err(anyhow::anyhow!("Choose another place: a key file next to the backup copy of your data would protect nothing."))
+        } else {
+            storage::save_key_backup(&setup.key, dest, &data_file)
+        };
+        match saved {
+            Ok(()) => {
+                setup.backup = Some(dest.to_path_buf());
+                setup.error = None;
+            }
+            Err(e) => setup.error = Some(format!("{e:#}")),
         }
     }
 
@@ -1248,25 +1329,23 @@ impl Session {
         } else {
             "supervisor-selection.ics"
         };
-        {
-            let mut msg = format!("Exported {} items", items.len());
-            if invite {
-                // Deadlines and reminders never have guests; anything else without one lacks an email.
-                let missing = items
-                    .iter()
-                    .filter(|i| {
-                        !matches!(i.event.kind, crate::model::EventKind::Deadline | crate::model::EventKind::Reminder)
-                            && i.attendees.is_empty()
-                    })
-                    .count();
-                if missing > 0 {
-                    msg.push_str(&format!(" – {missing} without a student email, add it to invite them"));
-                } else {
-                    msg.push_str(" – upload it in Outlook, then open each event and Send");
-                }
+        let mut msg = format!("Exported {} items", items.len());
+        if invite {
+            // Deadlines and reminders never have guests; anything else without one lacks an email.
+            let missing = items
+                .iter()
+                .filter(|i| {
+                    !matches!(i.event.kind, crate::model::EventKind::Deadline | crate::model::EventKind::Reminder)
+                        && i.attendees.is_empty()
+                })
+                .count();
+            if missing > 0 {
+                msg.push_str(&format!(" – {missing} without a student email, add it to invite them"));
+            } else {
+                msg.push_str(" – upload it in Outlook, then open each event and Send");
             }
-            self.save_ics(ui, &items, invite, name, msg);
         }
+        self.save_ics(ui, &items, invite, name, msg);
     }
 
     fn save_invite(&mut self, ui: &Ui, student_id: Uuid, uid: &str) {
@@ -1412,23 +1491,109 @@ impl Session {
     }
 
     fn change_password(&mut self, ui: &Ui) {
-        self.wait_for_save(ui);
-        let pw = std::mem::take(&mut self.password_form);
-        let result = if let Some(problem) = storage::password_problem(&pw.new) {
-            Err(problem)
-        } else if *pw.new != *pw.confirm {
-            Err("The new passwords do not match.".to_string())
-        } else {
-            let result = self.vault.change_password(&pw.current, &pw.new, &self.db);
-            self.resealed(result, "Could not change password")
-        };
-        if result.is_ok() {
-            self.weak_password = false;
+        if self.password_job.is_some() {
+            return;
         }
-        self.password_form.message = Some(match result {
-            Ok(()) => (true, "Password changed.".into()),
-            Err(e) => (false, e),
+        let pw = std::mem::take(&mut self.password_form);
+        let problem = storage::password_problem(&pw.new)
+            .or_else(|| (*pw.new != *pw.confirm).then(|| "The new passwords do not match.".to_string()));
+        if let Some(problem) = problem {
+            self.password_form.message = Some((false, problem));
+            return;
+        }
+        let job = self.vault.change_password_job(pw.current, pw.new);
+        self.password_job = Some(PasswordJob::Rekey(spawn(ui.ctx(), job), Rekey::Password));
+    }
+
+    /// Takes the result of slow password work once it has finished.
+    fn poll_password_job(&mut self, ui: &Ui) {
+        /// The result, once there is one.
+        fn finished<T>(rx: &Receiver<anyhow::Result<T>>) -> Option<anyhow::Result<T>> {
+            match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!("checking the password stopped unexpectedly"))),
+            }
+        }
+        match &self.password_job {
+            None => {}
+            Some(PasswordJob::Reveal(rx)) => {
+                if let Some(result) = finished(rx) {
+                    self.password_job = None;
+                    self.reveal_checked(result);
+                }
+            }
+            Some(PasswordJob::AddKeyFile { rx, .. }) => {
+                if let Some(result) = finished(rx)
+                    && let Some(PasswordJob::AddKeyFile { password, path, .. }) = self.password_job.take()
+                {
+                    self.key_file_password_checked(result, password, path);
+                }
+            }
+            Some(PasswordJob::Rekey(rx, _)) => {
+                if let Some(result) = finished(rx)
+                    && let Some(PasswordJob::Rekey(_, rekey)) = self.password_job.take()
+                {
+                    self.rekeyed(ui, result, rekey);
+                }
+            }
+        }
+    }
+
+    /// The password typed to reveal something has been checked.
+    fn reveal_checked(&mut self, result: anyhow::Result<bool>) {
+        let Some(prompt) = &mut self.reveal_prompt else { return };
+        match result {
+            Ok(true) => {
+                match prompt.what {
+                    Reveal::Number => self.revealed = Some(prompt.student),
+                    Reveal::RarNotes => self.rar_notes = Some(RarDialog { student: prompt.student, focused: false }),
+                }
+                self.reveal_prompt = None;
+            }
+            Ok(false) => prompt.error = Some("Wrong password.".into()),
+            Err(e) => prompt.error = Some(format!("{e:#}")),
+        }
+    }
+
+    /// A new password or key file is ready: save with it, and say how it went.
+    fn rekeyed(&mut self, ui: &Ui, result: anyhow::Result<storage::NewSeal>, rekey: Rekey) {
+        let result = result.and_then(|seal| {
+            self.wait_for_save(ui);
+            self.vault.rekey(seal, &self.db)
         });
+        match rekey {
+            Rekey::Password => {
+                let result = self.resealed(result, "Could not change password");
+                if result.is_ok() {
+                    self.weak_password = false;
+                }
+                self.password_form.message = Some(match result {
+                    Ok(()) => (true, "Password changed.".into()),
+                    Err(e) => (false, e),
+                });
+            }
+            Rekey::KeyFileOn => {
+                self.key_form.message = Some(match self.resealed(result, "Could not turn on the key file") {
+                    Ok(()) => (
+                        true,
+                        "Key file turned on. On another computer, Supervisor will ask for your backup copy the first time.".into(),
+                    ),
+                    Err(e) => (false, e),
+                });
+            }
+            Rekey::KeyFileOff => {
+                self.key_form.message = Some(match self.resealed(result, "Could not remove the key file") {
+                    Ok(()) => (
+                        true,
+                        "Key file removed – your password alone opens this data file again. \
+                         The key file stays on this computer in case another data file uses it."
+                            .into(),
+                    ),
+                    Err(e) => (false, e),
+                });
+            }
+        }
     }
 
     /// Re-keying saves the data too. Failures are put in plain words.
@@ -1475,22 +1640,39 @@ impl Session {
         });
     }
 
-    /// Adding a key file, step 1: check the password and put the key file in
-    /// place on this computer. The data file is re-keyed only after a backup
-    /// copy has been saved (see `dialogs`).
-    fn start_key_file(&mut self) {
+    /// Adding a key file, step 1: check where it would go, and the password
+    /// (on another thread: see `key_file_password_checked`).
+    fn start_key_file(&mut self, ui: &Ui) {
+        if self.password_job.is_some() {
+            return;
+        }
         let form = std::mem::take(&mut self.key_form);
+        let Some(path) = storage::key_file_path() else {
+            self.key_form.message = Some((false, "This computer has no folder for settings.".into()));
+            return;
+        };
+        if storage::same_folder(self.vault.path(), &path) {
+            let message = format!(
+                "Your data file is in the folder where the key file would go ({}). Move the data file first.",
+                path.parent().unwrap_or(&path).display()
+            );
+            self.key_form.message = Some((false, message));
+            return;
+        }
+        let check = self.vault.password_check();
+        let password = form.password.clone();
+        let rx = spawn(ui.ctx(), move || check.matches(&password));
+        self.password_job = Some(PasswordJob::AddKeyFile { rx, password: form.password, path });
+    }
+
+    /// Adding a key file, step 2: with the password right, put the key file
+    /// in place on this computer. The data file is re-keyed only after a
+    /// backup copy has been saved (see `dialogs`).
+    fn key_file_password_checked(&mut self, checked: anyhow::Result<bool>, password: Zeroizing<String>, path: PathBuf) {
         let result = (|| {
-            let path = storage::key_file_path().ok_or("This computer has no folder for settings.")?;
-            if storage::same_folder(self.vault.path(), &path) {
-                return Err(format!(
-                    "Your data file is in the folder where the key file would go ({}). Move the data file first.",
-                    path.parent().unwrap_or(&path).display()
-                ));
-            }
-            match self.vault.check_password(&form.password) {
+            match checked {
                 Ok(true) => {}
-                Ok(false) => return Err("The current password is incorrect.".into()),
+                Ok(false) => return Err("The current password is incorrect.".to_string()),
                 Err(e) => return Err(format!("{e:#}")),
             }
             // One key file per computer: reuse it if there already is one.
@@ -1503,14 +1685,7 @@ impl Session {
                 }
                 Err(e) => return Err(format!("{e:#}")),
             };
-            Ok(KeyFileSetup {
-                key,
-                path,
-                password: form.password,
-                backup: None,
-                choosing: None,
-                error: None,
-            })
+            Ok(KeyFileSetup { key, path, password, backup: None, error: None })
         })();
         match result {
             Ok(setup) => self.key_setup = Some(setup),
@@ -1519,31 +1694,21 @@ impl Session {
     }
 
     fn finish_key_file(&mut self, ui: &Ui) {
-        self.wait_for_save(ui);
+        if self.password_job.is_some() {
+            return;
+        }
         let Some(setup) = self.key_setup.take() else { return };
-        let result = self.vault.set_key_file(&setup.password, Some(setup.key), &self.db);
-        self.key_form.message = Some(match self.resealed(result, "Could not turn on the key file") {
-            Ok(()) => (
-                true,
-                "Key file turned on. On another computer, Supervisor will ask for your backup copy the first time.".into(),
-            ),
-            Err(e) => (false, e),
-        });
+        let job = self.vault.set_key_file_job(setup.password, Some(setup.key));
+        self.password_job = Some(PasswordJob::Rekey(spawn(ui.ctx(), job), Rekey::KeyFileOn));
     }
 
     fn remove_key_file(&mut self, ui: &Ui) {
-        self.wait_for_save(ui);
+        if self.password_job.is_some() {
+            return;
+        }
         let form = std::mem::take(&mut self.key_form);
-        let result = self.vault.set_key_file(&form.password, None, &self.db);
-        self.key_form.message = Some(match self.resealed(result, "Could not remove the key file") {
-            Ok(()) => (
-                true,
-                "Key file removed – your password alone opens this data file again. \
-                 The key file stays on this computer in case another data file uses it."
-                    .into(),
-            ),
-            Err(e) => (false, e),
-        });
+        let job = self.vault.set_key_file_job(form.password, None);
+        self.password_job = Some(PasswordJob::Rekey(spawn(ui.ctx(), job), Rekey::KeyFileOff));
     }
 
     /// The open student's timetable, if any.
@@ -1656,7 +1821,7 @@ impl Session {
         if let Some(setup) = &mut self.key_setup {
             let mut turn_on = false;
             let mut cancel = false;
-            let data_file = self.vault.path().to_path_buf();
+            let mut choose_backup = false;
             let resp = egui::Modal::new(Id::unique("key-file-setup")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
                 ui.set_width(500.0);
                 ui.horizontal(|ui| {
@@ -1678,34 +1843,8 @@ impl Session {
                     "Without the key file your data can't be opened, even with the right password.",
                 );
                 ui.add_space(10.0);
-                if ui
-                    .add_enabled(setup.choosing.is_none(), egui::Button::new(format!("{} Save backup copy…", icons::EXPORT)))
-                    .clicked()
-                {
-                    let dialog = Dialog::new()
-                        .set_title("Save a backup copy of your key file")
-                        .set_file_name("supervisor-key.bin")
-                        .save_file();
-                    setup.choosing = Some(file_dialog::Pending::open(ui.ctx(), dialog));
-                }
-                let chosen = setup.choosing.as_ref().and_then(|d| d.poll());
-                if chosen.is_some() {
-                    setup.choosing = None;
-                }
-                if let Some(dest) = chosen.flatten() {
-                    let beside_copy = self.vault.backup_copy().is_some_and(|c| storage::same_folder(&dest, &c.file));
-                    let saved = if beside_copy {
-                        Err(anyhow::anyhow!("Choose another place: a key file next to the backup copy of your data would protect nothing."))
-                    } else {
-                        storage::save_key_backup(&setup.key, &dest, &data_file)
-                    };
-                    match saved {
-                        Ok(()) => {
-                            setup.backup = Some(dest);
-                            setup.error = None;
-                        }
-                        Err(e) => setup.error = Some(format!("{e:#}")),
-                    }
+                if ui.button(format!("{} Save backup copy…", icons::EXPORT)).clicked() {
+                    choose_backup = true;
                 }
                 if let Some(dest) = &setup.backup {
                     ui.colored_label(
@@ -1730,7 +1869,13 @@ impl Session {
                     }
                 });
             });
-            if turn_on {
+            if choose_backup {
+                let dialog = Dialog::new()
+                    .set_title("Save a backup copy of your key file")
+                    .set_file_name("supervisor-key.bin")
+                    .save_file();
+                self.open_file_dialog(ui, dialog, OnPick::KeyBackup);
+            } else if turn_on {
                 self.finish_key_file(ui);
             } else if cancel || resp.should_close() {
                 self.key_setup = None;
@@ -1852,6 +1997,7 @@ impl Session {
             };
             let mut submit = false;
             let mut cancel = false;
+            let checking = matches!(self.password_job, Some(PasswordJob::Reveal(_)));
             let resp = egui::Modal::new(Id::unique("reveal")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
                 ui.set_width(420.0);
                 ui.horizontal(|ui| {
@@ -1864,13 +2010,18 @@ impl Session {
                         .wrap_mode(egui::TextWrapMode::Wrap),
                 );
                 ui.add_space(6.0);
-                let field = crate::ui::widgets::password_field(
-                    ui,
-                    egui::TextEdit::singleline(&mut *prompt.password)
-                        .hint_text("Password")
-                        .desired_width(f32::INFINITY),
-                );
-                if !field.has_focus() && prompt.password.is_empty() && prompt.error.is_none() {
+                let field = ui
+                    .add_enabled_ui(!checking, |ui| {
+                        crate::ui::widgets::password_field(
+                            ui,
+                            egui::TextEdit::singleline(&mut *prompt.password)
+                                .hint_text("Password")
+                                .desired_width(f32::INFINITY),
+                        )
+                    })
+                    .inner;
+                // Also after a wrong password, ready to type it again.
+                if !checking && !field.has_focus() && prompt.password.is_empty() {
                     field.request_focus();
                 }
                 if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -1881,33 +2032,28 @@ impl Session {
                 }
                 ui.add_space(12.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(theme::primary_button(button)).clicked() {
+                    if ui.add_enabled(!checking, theme::primary_button(button)).clicked() {
                         submit = true;
                     }
                     if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 34.0))).clicked() {
                         cancel = true;
                     }
+                    if checking {
+                        ui.spinner();
+                    }
                 });
             });
-            if submit && !prompt.password.is_empty() {
-                match self.vault.check_password(&prompt.password) {
-                    Ok(true) => {
-                        match prompt.what {
-                            Reveal::Number => self.revealed = Some(prompt.student),
-                            Reveal::RarNotes => {
-                                self.rar_notes = Some(RarDialog { student: prompt.student, focused: false });
-                            }
-                        }
-                        self.reveal_prompt = None;
-                    }
-                    Ok(false) => {
-                        prompt.error = Some("Wrong password.".into());
-                        prompt.password = Zeroizing::new(String::new());
-                    }
-                    Err(e) => prompt.error = Some(format!("{e:#}")),
-                }
+            if submit && !checking && !prompt.password.is_empty() && self.password_job.is_none() {
+                // Checked on another thread: key derivation is slow on purpose.
+                let password = std::mem::take(&mut prompt.password);
+                let check = self.vault.password_check();
+                prompt.error = None;
+                self.password_job = Some(PasswordJob::Reveal(spawn(&ctx, move || check.matches(&password))));
             } else if cancel || resp.should_close() {
                 self.reveal_prompt = None;
+                if checking {
+                    self.password_job = None;
+                }
             }
         }
 
@@ -2067,6 +2213,11 @@ mod ui_tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("timed out waiting for: {what}");
+    }
+
+    /// Waits for a password typed in the app to be checked.
+    fn wait_checked(h: &mut Harness<'_, SupervisorApp>) {
+        wait_until(h, "password checked", |app| matches!(&app.screen, Screen::Unlocked(s) if s.password_job.is_none()));
     }
 
     fn wait_unlocked(h: &mut Harness<'_, SupervisorApp>) {
@@ -2477,6 +2628,118 @@ mod ui_tests {
             h.run_steps(1);
             assert!(matches!(h.state().screen, Screen::Locked(_)), "auto-locked");
         }
+    }
+
+    #[test]
+    fn lock_screen_keeps_the_cursor_after_a_wrong_password_and_says_when_the_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        h.get_by_label(&format!("{}  Lock", icons::LOCK_SIMPLE)).click();
+        wait_until(&mut h, "locked", locked);
+        h.run_steps(2);
+
+        // A wrong password: the cursor is back in the field, to type it again.
+        let field = h.get_by_role(AkRole::PasswordInput);
+        field.focus();
+        field.type_text("wrong-password-000");
+        h.run_steps(1);
+        h.get_by_label("Unlock").click();
+        for _ in 0..600 {
+            h.run_steps(1);
+            if h.query_by_label_contains("Incorrect password").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        h.run_steps(2);
+        assert!(h.query_by_label_contains("Incorrect password").is_some());
+        h.event(egui::Event::Text(PASSWORD.into()));
+        h.run_steps(1);
+        h.key_press(egui::Key::Enter);
+        wait_unlocked(&mut h);
+        h.run_steps(2);
+
+        // The file is gone (a USB stick taken out): said so, with no offer
+        // of a new password, until it is back.
+        h.get_by_label(&format!("{}  Lock", icons::LOCK_SIMPLE)).click();
+        wait_until(&mut h, "locked", locked);
+        let away = dir.path().join("away.svt");
+        std::fs::rename(&path, &away).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("Data file not found").is_some());
+        assert!(h.query_by_label("Create a password").is_none());
+        assert!(h.query_by_role(AkRole::PasswordInput).is_none());
+        shot(&mut h, "02_data_file_not_found");
+        std::fs::rename(&away, &path).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("Data file not found").is_none());
+        assert!(h.query_by_label("Welcome back").is_some());
+        unlock(&mut h);
+    }
+
+    #[test]
+    fn password_is_changed_in_the_background() {
+        const NEW: &str = "a brand new passphrase";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        session(&mut h).view = View::Settings;
+        h.set_size(egui::vec2(1360.0, 3000.0));
+        h.run_steps(3);
+        let fields: Vec<_> = h.get_all_by_role(AkRole::PasswordInput).collect();
+        for (field, text) in fields.iter().zip([PASSWORD, NEW, NEW]) {
+            field.focus();
+            field.type_text(text);
+        }
+        h.run_steps(1);
+        h.get(By::new().label("Change password").role(AkRole::Button)).click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Changing the password…").is_some(), "the window keeps drawing meanwhile");
+        wait_checked(&mut h);
+        h.run_steps(2);
+        assert!(h.query_by_label("Password changed.").is_some());
+        assert!(storage::read_database(&path, NEW, None).is_ok());
+        assert!(storage::read_database(&path, PASSWORD, None).is_err());
+    }
+
+    /// A file dialog that answers when told to, as the user would.
+    fn fake_dialog() -> (
+        std::sync::mpsc::Sender<Option<std::path::PathBuf>>,
+        impl std::future::Future<Output = Option<rfd::FileHandle>> + Send + 'static,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+        (tx, async move { rx.recv().ok().flatten().map(rfd::FileHandle::from) })
+    }
+
+    #[test]
+    fn an_open_file_dialog_covers_the_app_and_its_answer_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let (answer, dialog) = fake_dialog();
+        let pending = file_dialog::Pending::open(&h.ctx, dialog);
+        let save = OnPick::SaveIcs { text: "BEGIN:VCALENDAR".into(), done: "Exported 0 items".into() };
+        session(&mut h).file_dialog = Some((pending, save));
+        h.run_steps(3);
+        assert!(h.query_by_label("Choose a file").is_some(), "the app is covered");
+
+        // Neither idling nor Ctrl+L locks while it is open: that would lose the answer.
+        if let Some(earlier) = Instant::now().checked_sub(Duration::from_secs(11 * 60)) {
+            session(&mut h).last_active = earlier;
+        }
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::L);
+        h.run_steps(3);
+        assert!(!locked(h.state()));
+
+        // The answer is acted on, and choosing it counts as being active.
+        let out = dir.path().join("out.ics");
+        answer.send(Some(out.clone())).unwrap();
+        wait_until(&mut h, "answered", |app| matches!(&app.screen, Screen::Unlocked(s) if s.file_dialog.is_none()));
+        h.run_steps(3);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "BEGIN:VCALENDAR");
+        assert!(h.query_by_label("Choose a file").is_none());
+        assert!(!locked(h.state()), "the idle time starts again from the answer");
     }
 
     #[test]
@@ -3240,6 +3503,7 @@ mod ui_tests {
         field.type_text("wrong-password-000");
         h.run_steps(1);
         h.get_by_label("Reveal").click();
+        wait_checked(&mut h);
         h.run_steps(2);
         assert!(h.query_by_label("Wrong password.").is_some());
         assert!(!all_text(&h).contains(CPF));
@@ -3248,6 +3512,7 @@ mod ui_tests {
         field.type_text(PASSWORD);
         h.run_steps(1);
         h.get_by_label("Reveal").click();
+        wait_checked(&mut h);
         h.run_steps(2);
         assert!(h.query_by_label("Reveal registration number").is_none(), "dialog closed");
         assert!(all_text(&h).contains(CPF));
@@ -3323,6 +3588,76 @@ mod ui_tests {
         let empty = h.get_by_label(&add).rect();
         assert_eq!(note.width(), empty.width(), "as wide as Add notes, however long the notes");
         shot(&mut h, "26b_week_notes_list");
+    }
+
+    #[test]
+    fn meetings_with_records_are_asked_about_before_they_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let first = chrono::NaiveDate::from_ymd_opt(2026, 10, 29).unwrap();
+        let mut weekly = Meeting {
+            date: Some(first),
+            repeat: Some(Repeat { until: Some(first + Days::weeks(3)), ..Default::default() }),
+            ..Default::default()
+        };
+        for (week, notes) in [(0, "First week"), (1, "Second week")] {
+            weekly.set_occurrence(Occurrence { planned: first + Days::weeks(week), notes: notes.into(), ..Default::default() });
+        }
+        let student = Student {
+            name: "Weekly Student".into(),
+            fyp: Some(FypRecord { programme: "BEng".into(), meetings: vec![weekly, Meeting::default()], ..Default::default() }),
+            ..Default::default()
+        };
+        let id = student.id;
+        {
+            let s = session(&mut h);
+            s.db.students.push(student);
+            s.view = View::List(Category::Projects("BEng".into()));
+            s.selected = Some(id);
+        }
+        h.set_size(egui::vec2(1360.0, 2000.0));
+        h.run_steps(3);
+        let meeting = |h: &mut Harness<'_, SupervisorApp>| session(h).db.student(id).unwrap().fyp.as_ref().unwrap().meetings.clone();
+
+        // A meeting with nothing in it goes straight away.
+        h.get_all_by_label(icons::TRASH).nth(1).unwrap().click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Remove this meeting?").is_none());
+        assert_eq!(meeting(&mut h).len(), 1);
+
+        // Unticking Repeats would lose the second week's notes: asked first.
+        h.get_by_label(&format!("{} Repeats", icons::REPEAT)).click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Stop repeating?").is_some());
+        assert!(all_text(&h).contains("Thu 05 Nov"), "names the week lost");
+        h.get_by_label("Keep").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Stop repeating?").is_none());
+        assert_eq!(meeting(&mut h)[0].repeat.as_ref().unwrap().exceptions.len(), 2, "nothing lost");
+
+        // Fortnightly would lose the second week: asked, then done.
+        h.get(By::new().role(AkRole::ComboBox).value("every week")).click();
+        h.run_steps(3);
+        h.get_by_label("every 2 weeks").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Change the meeting's weeks?").is_some());
+        assert_eq!(meeting(&mut h)[0].repeat.as_ref().unwrap().every_weeks, 1, "not until confirmed");
+        h.get_by_label("Change").click();
+        h.run_steps(3);
+        let m = &meeting(&mut h)[0];
+        assert_eq!(m.repeat.as_ref().unwrap().every_weeks, 2);
+        let notes: Vec<String> = m.repeat.as_ref().unwrap().exceptions.iter().map(|o| o.notes.clone()).collect();
+        assert_eq!(notes, ["First week"]);
+
+        // Removing it, with its notes, is asked too.
+        h.get_by_label(icons::TRASH).click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Remove this meeting?").is_some());
+        assert_eq!(meeting(&mut h).len(), 1);
+        h.get_by_label("Remove").click();
+        h.run_steps(3);
+        assert!(meeting(&mut h).is_empty());
     }
 
     #[test]
@@ -3471,7 +3806,13 @@ mod ui_tests {
         assert_eq!(session(&mut h).db.student(id).unwrap().timetable.s2.len(), 2);
         h.get_by_label(&format!("{} Clear", icons::TRASH)).click();
         h.run_steps(3);
+        // Asked first.
+        assert!(h.query_by_label("Clear the timetable?").is_some());
+        assert_eq!(session(&mut h).db.student(id).unwrap().timetable.s2.len(), 2);
+        h.get_by_label("Clear").click();
+        h.run_steps(3);
         assert!(session(&mut h).db.student(id).unwrap().timetable.s2.is_empty());
+        assert!(h.query_by_label("Done").is_some(), "the timetable is still open");
         assert_eq!(slots(&mut h, id).len(), 2, "semester 1 is untouched");
 
         h.get_by_label("Done").click();
@@ -3744,10 +4085,7 @@ mod ui_tests {
         let no_visit = panel_growth("37b_no_visit", |s| s.placement = Some(PlacementRecord::default()));
         assert!(visit <= no_visit + 1.0, "a visit widened the panel by {} more", visit - no_visit);
         let with_viva = panel_growth("37c_viva_row", |s| {
-            let mut phd = PhdRecord::default();
-            phd.viva = date;
-            phd.viva_time = time;
-            s.phd = Some(phd);
+            s.phd = Some(PhdRecord { viva: date, viva_time: time, ..Default::default() });
         });
         let without_viva = panel_growth("37d_no_viva", |s| s.phd = Some(PhdRecord::default()));
         assert!(with_viva <= without_viva + 1.0, "a viva widened the panel by {} more", with_viva - without_viva);
@@ -4244,6 +4582,7 @@ mod ui_tests {
             field.type_text(password);
             h.run_steps(1);
             h.get_by_label("Open").click();
+            wait_checked(h);
             h.run_steps(3);
         };
         h.get_by_label("RAR Notes").click();
@@ -4251,7 +4590,12 @@ mod ui_tests {
         assert!(h.query_by_role(AkRole::PasswordInput).is_some(), "asks even with the privacy option off");
         open(&mut h, "wrong-password-000");
         assert!(h.query_by_label("Wrong password.").is_some());
-        open(&mut h, PASSWORD);
+        // The cursor is back in the field, to type it again.
+        h.event(egui::Event::Text(PASSWORD.into()));
+        h.run_steps(1);
+        h.get_by_label("Open").click();
+        wait_checked(&mut h);
+        h.run_steps(3);
         assert!(h.query_by_role(AkRole::PasswordInput).is_none());
         // Ready to type straight away, like the meeting notes.
         h.event(egui::Event::Text(SECRET.into()));
@@ -4534,6 +4878,7 @@ mod ui_tests {
         h.run_steps(3);
         film(&mut h, "rar");
         h.get_by_label("Open").click();
+        wait_checked(&mut h);
         h.run_steps(4);
         film(&mut h, "rar");
         h.event(egui::Event::Text("Extra time in examinations. Slides shared in advance of lectures.".into()));

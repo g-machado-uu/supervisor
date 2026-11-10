@@ -35,6 +35,24 @@ pub struct Security<'a> {
     pub backup_copy: Option<&'a storage::BackupCopy>,
     /// How the last thing asked of the backup copy went.
     pub backup_message: &'a Option<(bool, String)>,
+    /// Password work running in the background, if any.
+    pub working: Option<Working>,
+}
+
+/// Slow password work running in the background, by the card it is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Working {
+    Password,
+    /// With what is being done.
+    KeyFile(&'static str),
+}
+
+/// A spinner and what it is waiting for.
+fn working_note(ui: &mut Ui, text: &str) {
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.label(RichText::new(text).color(theme::muted(ui)));
+    });
 }
 
 pub enum SettingsAction {
@@ -66,7 +84,9 @@ pub fn show(
     security: Security<'_>,
 ) -> SettingsAction {
     let mut action = SettingsAction::None;
-    let Security { data_path, key_file_on, weak_password, password: pw, key_file: kf, backup_copy, backup_message } = security;
+    let Security { data_path, key_file_on, weak_password, password: pw, key_file: kf, backup_copy, backup_message, working } =
+        security;
+    let idle = working.is_none();
     theme::page_header(ui, "Settings", "Academic calendar, courses, invitations, security and version", |_| {});
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.set_max_width(920.0);
@@ -312,10 +332,12 @@ pub fn show(
                 .small()
                 .color(theme::muted(ui)),
             );
-            if ui.button("Change password").clicked() {
+            if ui.add_enabled(idle, egui::Button::new("Change password")).clicked() {
                 action = SettingsAction::ChangePassword;
             }
-            if let Some((ok, msg)) = &pw.message {
+            if working == Some(Working::Password) {
+                working_note(ui, "Changing the password…");
+            } else if let Some((ok, msg)) = &pw.message {
                 ui.colored_label(theme::fg(ui, if *ok { theme::GREEN } else { theme::RED }), msg);
             }
         });
@@ -366,14 +388,16 @@ pub fn show(
                 ui.label("Your password");
                 widgets::password_field(ui, egui::TextEdit::singleline(&mut *kf.password).desired_width(200.0));
                 if key_file_on {
-                    if ui.button("Remove key file").clicked() {
+                    if ui.add_enabled(idle, egui::Button::new("Remove key file")).clicked() {
                         action = SettingsAction::RemoveKeyFile;
                     }
-                } else if ui.button(format!("{}  Add key file…", icons::KEY)).clicked() {
+                } else if ui.add_enabled(idle, egui::Button::new(format!("{}  Add key file…", icons::KEY))).clicked() {
                     action = SettingsAction::AddKeyFile;
                 }
             });
-            if let Some((ok, msg)) = &kf.message {
+            if let Some(Working::KeyFile(what)) = working {
+                working_note(ui, what);
+            } else if let Some((ok, msg)) = &kf.message {
                 ui.colored_label(theme::fg(ui, if *ok { theme::GREEN } else { theme::RED }), msg);
             }
         });

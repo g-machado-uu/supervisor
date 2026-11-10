@@ -613,6 +613,21 @@ pub fn ring(ui: &mut Ui, size: f32, segments: &[(f32, Color32)], centre: &str, c
     resp
 }
 
+/// The eye that shows or hides private details; like the Reveal and Hide
+/// buttons, its icon is what a click does. Returns true when clicked.
+/// `what` is what it shows, for the hover text.
+pub fn eye_button(ui: &mut Ui, shown: bool, what: &str) -> bool {
+    let (icon, hover) = if shown {
+        (icons::EYE_SLASH, format!("Hide {what}"))
+    } else {
+        (icons::EYE, format!("Reveal {what}"))
+    };
+    let resp = ui.add(egui::Button::new(RichText::new(icon).size(17.0).color(muted(ui))).frame(false));
+    // Named by what it does, for screen readers and tests.
+    resp.widget_info(|| WidgetInfo::labeled(egui::Role::Button, true, &hover));
+    resp.on_hover_text(hover).clicked()
+}
+
 #[cfg(test)]
 mod tests {
     /// Every non-ASCII character shown in the UI must exist in the bundled
@@ -688,19 +703,4 @@ mod tests {
         assert_eq!(super::initials("Li"), "L");
         assert_eq!(super::initials(""), "");
     }
-}
-
-/// The eye that shows or hides private details; like the Reveal and Hide
-/// buttons, its icon is what a click does. Returns true when clicked.
-/// `what` is what it shows, for the hover text.
-pub fn eye_button(ui: &mut Ui, shown: bool, what: &str) -> bool {
-    let (icon, hover) = if shown {
-        (icons::EYE_SLASH, format!("Hide {what}"))
-    } else {
-        (icons::EYE, format!("Reveal {what}"))
-    };
-    let resp = ui.add(egui::Button::new(RichText::new(icon).size(17.0).color(muted(ui))).frame(false));
-    // Named by what it does, for screen readers and tests.
-    resp.widget_info(|| WidgetInfo::labeled(egui::Role::Button, true, &hover));
-    resp.on_hover_text(hover).clicked()
 }

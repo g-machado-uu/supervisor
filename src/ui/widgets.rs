@@ -218,6 +218,123 @@ pub fn date_time_cell(
     });
 }
 
+/// What a confirmation asks before something is lost.
+#[derive(Clone)]
+pub struct Ask {
+    pub title: String,
+    pub body: String,
+    /// The button that goes ahead.
+    pub button: String,
+}
+
+/// "1 week", "3 weeks".
+pub fn plural(n: usize, what: &str) -> String {
+    if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") }
+}
+
+/// Asks before something is thrown away. `request` is `Some` on the frame
+/// it is asked for (a bin clicked); `ask` says what would be lost, or
+/// `None` when nothing would be, to go ahead at once. Returns the request
+/// once it should happen: straight away, or once confirmed. Call it on
+/// every frame the item is drawn, as the question stays open until answered.
+pub fn confirmed<T: Clone + Send + Sync + 'static>(
+    ui: &Ui,
+    id: egui::Id,
+    request: Option<T>,
+    ask: impl FnOnce(&T) -> Option<Ask>,
+) -> Option<T> {
+    if let Some(request) = request {
+        match ask(&request) {
+            None => return Some(request),
+            Some(question) => ui.data_mut(|d| {
+                d.insert_temp(id, (request, question));
+            }),
+        }
+    }
+    let (request, question) = ui.data(|d| d.get_temp::<(T, Ask)>(id))?;
+    let mut go = false;
+    let mut keep = false;
+    let resp = egui::Modal::new(id.with("confirm")).frame(theme::modal_frame(ui)).show(ui.ctx(), |ui| {
+        ui.set_width(440.0);
+        ui.horizontal(|ui| {
+            theme::icon_badge(ui, icons::TRASH, theme::RED, 40.0);
+            ui.label(theme::serif(question.title.as_str(), 22.0));
+        });
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(question.body.as_str()).wrap());
+        ui.add_space(12.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            go = ui.add(theme::danger_button(question.button.as_str())).clicked();
+            keep = ui.add(egui::Button::new("Keep").min_size(egui::vec2(0.0, 34.0))).clicked();
+        });
+    });
+    if go || keep || resp.should_close() {
+        ui.data_mut(|d| d.remove::<(T, Ask)>(id));
+    }
+    go.then_some(request)
+}
+
+/// "Mon 02 Nov, Mon 09 Nov and 3 more".
+fn dates_text(dates: &[NaiveDate]) -> String {
+    let shown: Vec<String> = dates.iter().take(3).map(|d| d.format("%a %d %b").to_string()).collect();
+    match dates.len() {
+        0..=3 => match shown.split_last() {
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+            None => String::new(),
+        },
+        n => format!("{} and {} more", shown.join(", "), n - 3),
+    }
+}
+
+/// Asks before a meeting with anything filled in is removed.
+fn remove_meeting_ask(m: &Meeting) -> Option<Ask> {
+    if m.is_blank() {
+        return None;
+    }
+    let what = match (m.date, &m.repeat) {
+        (Some(d), Some(_)) => format!("The meeting repeating from {}", d.format("%a %d %b %Y")),
+        (Some(d), None) => format!("The meeting on {}", d.format("%a %d %b %Y")),
+        (None, _) => "This meeting".to_string(),
+    };
+    let mut lost = Vec::new();
+    if !m.notes.trim().is_empty() {
+        lost.push("its notes".to_string());
+    }
+    let weeks = m.repeat.as_ref().map_or(0, |r| r.exceptions.len());
+    if weeks > 0 {
+        lost.push(format!("what was recorded for {}", plural(weeks, "week")));
+    }
+    let with = if lost.is_empty() { String::new() } else { format!(", with {}", lost.join(" and ")) };
+    Some(Ask {
+        title: "Remove this meeting?".into(),
+        body: format!("{what} is removed from the student's record{with}."),
+        button: "Remove".into(),
+    })
+}
+
+/// Asks before the weeks of a repeating meeting with something recorded go.
+fn weeks_lost_ask(lost: &[crate::model::Occurrence], title: &str, button: &str, why: &str) -> Option<Ask> {
+    if lost.is_empty() {
+        return None;
+    }
+    let dates: Vec<NaiveDate> = lost.iter().map(|o| o.planned).collect();
+    Some(Ask {
+        title: title.into(),
+        body: format!(
+            "{why} {} with something recorded (held, cancelled, moved or with notes) would be lost: {}.",
+            plural(lost.len(), "week"),
+            dates_text(&dates)
+        ),
+        button: button.into(),
+    })
+}
+
+/// When a repeating meeting happens: its first date, interval and end.
+fn plan_of(m: &Meeting) -> (Option<NaiveDate>, Option<(u8, Option<NaiveDate>)>) {
+    (m.date, m.repeat.as_ref().map(|r| (r.every_weeks, r.until)))
+}
+
 /// Two-column form grid with consistent spacing.
 pub fn form_grid(ui: &mut Ui, id: impl AsIdSalt, add: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id)
@@ -334,6 +451,8 @@ pub fn meetings_editor(
                 (None, n) => format!("Meeting {}", n + 1),
             };
             ui.push_id(m.id, |ui| {
+                // As it was, to ask before a change of plan loses weeks.
+                let before = m.repeat.is_some().then(|| m.clone());
                 inner_frame(ui).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
@@ -346,11 +465,12 @@ pub fn meetings_editor(
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui
+                                    let clicked = ui
                                         .small_button(icons::TRASH)
                                         .on_hover_text("Remove meeting")
-                                        .clicked()
-                                    {
+                                        .clicked();
+                                    let id = egui::Id::unique(("remove-meeting", m.id));
+                                    if confirmed(ui, id, clicked.then_some(()), |_| remove_meeting_ask(m)).is_some() {
                                         remove = Some(i);
                                     }
                                 },
@@ -402,6 +522,7 @@ pub fn meetings_editor(
                         repeat_editor(ui, m, settings, timetable);
                         notes(ui, &mut m.notes, "Meeting notes…");
                     });
+                replan(ui, m, before, settings);
             });
         }
         if let Some(i) = remove {
@@ -419,6 +540,42 @@ pub fn meetings_editor(
     invite
 }
 
+/// After the first date, interval or end of a repeating meeting changed
+/// (from `before`): the change is made at once, unless it would lose weeks
+/// with something recorded, which is asked first.
+fn replan(ui: &Ui, m: &mut Meeting, before: Option<Meeting>, settings: &Settings) {
+    let mut request = None;
+    if let Some(before) = before
+        && plan_of(&before) != plan_of(m)
+        && let Some(r) = &mut m.repeat
+    {
+        let (date, every, until) = (m.date, r.every_weeks, r.until);
+        // Put back as it was: `Meeting::replan` makes the change.
+        let (old_every, old_until) = before.repeat.as_ref().map_or((every, until), |r| (r.every_weeks, r.until));
+        r.every_weeks = old_every;
+        r.until = old_until;
+        m.date = before.date;
+        let mut changed = match date {
+            Some(d) if before.date != Some(d) => m.with_start(d),
+            _ => m.clone(),
+        };
+        changed.date = date;
+        if let Some(r) = &mut changed.repeat {
+            r.every_weeks = every;
+            r.until = until;
+        }
+        request = Some(changed);
+    }
+    let id = egui::Id::unique(("replan-meeting", m.id));
+    let ask = |changed: &Meeting| {
+        let lost = m.records_lost(changed, settings);
+        weeks_lost_ask(&lost, "Change the meeting's weeks?", "Change", "With this change,")
+    };
+    if let Some(changed) = confirmed(ui, id, request, ask) {
+        m.replan(changed, settings);
+    }
+}
+
 fn every_label(weeks: u8) -> String {
     match weeks {
         0 | 1 => format!("{} weekly", icons::REPEAT),
@@ -432,10 +589,15 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings, timetable: &
     let teaching_end = m
         .date
         .and_then(|d| settings.teaching_end(settings.semester_of(d)));
+    let mut stop = false;
     ui.horizontal(|ui| {
         let mut on = m.repeat.is_some();
         if ui.checkbox(&mut on, format!("{} Repeats", icons::REPEAT)).changed() {
-            m.repeat = on.then(Repeat::default);
+            if on {
+                m.repeat = Some(Repeat::default());
+            } else {
+                stop = true;
+            }
         }
         let Some(r) = &mut m.repeat else { return };
         egui::ComboBox::from_id_salt("every")
@@ -450,6 +612,14 @@ fn repeat_editor(ui: &mut Ui, m: &mut Meeting, settings: &Settings, timetable: &
                 }
             });
     });
+    let id = egui::Id::unique(("stop-repeating", m.id));
+    let ask = |_: &()| {
+        let lost = m.records_lost_without_repeat();
+        weeks_lost_ask(&lost, "Stop repeating?", "Stop repeating", "Only the first week stays, as a single meeting. The other")
+    };
+    if confirmed(ui, id, stop.then_some(()), ask).is_some() {
+        *m = m.without_repeat();
+    }
     let date = m.date;
     if let Some(r) = &mut m.repeat {
         ui.horizontal(|ui| {

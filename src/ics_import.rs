@@ -194,10 +194,8 @@ fn read_events(text: &str, local: &TimeZone) -> Vec<Raw> {
                     ),
                     "RECURRENCE-ID" => raw.recurrence_id = when(),
                     "STATUS" => raw.cancelled = value.eq_ignore_ascii_case("CANCELLED"),
-                    "ATTENDEE" => {
-                        if value.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("mailto:")) {
-                            raw.guests.push(value[7..].trim().to_string());
-                        }
+                    "ATTENDEE" if value.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("mailto:")) => {
+                        raw.guests.push(value[7..].trim().to_string());
                     }
                     _ => {}
                 }

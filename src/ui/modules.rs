@@ -93,7 +93,20 @@ fn semester(ui: &mut Ui, title: &str, m: &mut SemesterModules, ask_discussed: bo
                     ui.horizontal(|ui| {
                         ui.label(theme::semibold(format!("Module {}", i + 1)));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button(icons::TRASH).on_hover_text("Remove this module").clicked() {
+                            let clicked = ui.small_button(icons::TRASH).on_hover_text("Remove this module").clicked();
+                            let id = ui.make_persistent_id(("remove-module", i));
+                            let ask = |_: &()| {
+                                let name = [module.code.trim(), module.name.trim()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" ");
+                                (!module.is_blank()).then(|| widgets::Ask {
+                                    title: "Remove this module?".into(),
+                                    body: match name.as_str() {
+                                        "" => format!("Module {} is removed, with what was typed in for it.", i + 1),
+                                        name => format!("{name} is removed, with its marks and notes of what was failed."),
+                                    },
+                                    button: "Remove".into(),
+                                })
+                            };
+                            if widgets::confirmed(ui, id, clicked.then_some(()), ask).is_some() {
                                 remove = Some(i);
                             }
                         });

@@ -112,14 +112,23 @@ pub fn show(ui: &mut Ui, p: &mut PhdRecord, settings: &Settings, timetable: &Tim
                         let annual = step.key.strip_prefix("annual").and_then(|n| n.parse::<usize>().ok());
                         ui.horizontal(|ui| {
                             step_label(ui, step, today);
-                            if let Some(n) = annual
-                                && ui
+                            if let Some(n) = annual {
+                                let clicked = ui
                                     .push_id(&step.key, |ui| ui.small_button(icons::TRASH))
                                     .inner
                                     .on_hover_text("Remove this annual report")
-                                    .clicked()
-                            {
-                                remove_report = Some(n - 1);
+                                    .clicked();
+                                let id = egui::Id::unique(("remove-annual-report", &step.key));
+                                let ask = |_: &()| {
+                                    (step.milestone != Milestone::default()).then(|| widgets::Ask {
+                                        title: "Remove this annual report?".into(),
+                                        body: format!("{} is removed, with its deadline and whether it was completed.", step.label),
+                                        button: "Remove".into(),
+                                    })
+                                };
+                                if widgets::confirmed(ui, id, clicked.then_some(()), ask).is_some() {
+                                    remove_report = Some(n - 1);
+                                }
                             }
                         });
                         let mut edited = step.milestone.clone();
@@ -428,12 +437,23 @@ fn custom_steps(ui: &mut Ui, steps: &mut Vec<CustomStep>, today: NaiveDate) {
                                     .hint_text("e.g. Qualifying exam")
                                     .text_color(color),
                             );
-                            if ui
+                            let clicked = ui
                                 .push_id((c.id, "remove"), |ui| ui.small_button(icons::TRASH))
                                 .inner
                                 .on_hover_text("Remove this deadline")
-                                .clicked()
-                            {
+                                .clicked();
+                            let ask = |_: &()| {
+                                let blank = *c == CustomStep { id: c.id, ..Default::default() };
+                                (!blank).then(|| widgets::Ask {
+                                    title: "Remove this deadline?".into(),
+                                    body: match c.title.trim() {
+                                        "" => "The deadline is removed, with its date, reminder and whether it was completed.".into(),
+                                        title => format!("“{title}” is removed, with its date, reminder and whether it was completed."),
+                                    },
+                                    button: "Remove".into(),
+                                })
+                            };
+                            if widgets::confirmed(ui, egui::Id::unique(("remove-deadline", c.id)), clicked.then_some(()), ask).is_some() {
                                 remove = Some(i);
                             }
                         });

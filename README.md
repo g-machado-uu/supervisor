@@ -62,6 +62,7 @@ Supervisor holds personal data about students, so the protection of the data fil
 - **Save** (_Saved_ at the bottom of the sidebar, or `Ctrl+S`) saves immediately without locking. The backup then holds that version, which allows a return to it if later changes prove incorrect.
 - **Lock** (bottom of the sidebar, or `Ctrl+L`) saves all changes and closes the data. The password is required to open it again. The application also locks after **10 minutes** of inactivity. This period can be changed in Settings › Security.
 - If saving fails, for example because a network drive is disconnected, the application reports the failure. It does not lock or close until the changes are saved, unless the user chooses to discard them.
+- If the data file opened last isn't there when Supervisor starts, for example because a USB stick or network drive isn't connected, the unlock screen says so. It does not offer to create a new file in its place.
 - A data file can be open in only one Supervisor window at a time. If the file is changed elsewhere while open, for example on another computer sharing the file, the application asks before replacing that version and keeps it as the `.bak`.
 
 ### Sensitive records

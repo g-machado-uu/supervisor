@@ -60,8 +60,7 @@ fn year(y: i32, archived: bool) -> Vec<Student> {
         });
     }
     for i in 0..6 {
-        let mut phd = PhdRecord::default();
-        phd.meetings = vec![repeating(s1, 2, Some(d(y + 1, 8, 31)), held(3, 24))];
+        let phd = PhdRecord { meetings: vec![repeating(s1, 2, Some(d(y + 1, 8, 31)), held(3, 24))], ..Default::default() };
         out.push(Student { name: format!("PhD {y}-{i}"), archived, notes: notes(5), phd: Some(phd), ..Default::default() });
     }
     for i in 0..15 {

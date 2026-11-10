@@ -74,8 +74,20 @@ pub fn show(ui: &mut Ui, dlg: &mut TimetableDialog, s: &mut Student, settings: &
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             let slots = s.timetable.slots(dlg.semester).len();
-            if ui.add_enabled(slots > 0, egui::Button::new(format!("{} Clear", icons::TRASH))).clicked() {
-                s.timetable.slots_mut(dlg.semester).clear();
+            let clicked = ui.add_enabled(slots > 0, egui::Button::new(format!("{} Clear", icons::TRASH))).clicked();
+            let ask = |semester: &Semester| {
+                Some(widgets::Ask {
+                    title: "Clear the timetable?".into(),
+                    body: format!(
+                        "The {} the student is busy in {} are cleared. The other semester is left as it is.",
+                        widgets::plural(slots, "hour"),
+                        semester.label()
+                    ),
+                    button: "Clear".into(),
+                })
+            };
+            if let Some(semester) = widgets::confirmed(ui, egui::Id::unique(("clear-timetable", s.id)), clicked.then_some(dlg.semester), ask) {
+                s.timetable.slots_mut(semester).clear();
             }
             let (other, label) = match dlg.semester {
                 Semester::S2 => (Semester::S1, "Copy Semester 1"),

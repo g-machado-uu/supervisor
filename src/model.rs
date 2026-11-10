@@ -574,8 +574,6 @@ impl Settings {
             .map_or_else(|| id.to_string(), |p| p.short.clone())
     }
 
-    /// Whether a course is taught at SUST: the built-in SUST course, or any
-    /// course shown in the SUST list.
     /// Who a student with `pending` modules to carry needs to talk to.
     pub fn escalation(&self, pending: usize) -> Option<Escalation> {
         let pending = pending as u32;
@@ -590,6 +588,8 @@ impl Settings {
         }
     }
 
+    /// Whether a course is taught at SUST: the built-in SUST course, or any
+    /// course shown in the SUST list.
     pub fn is_sust(&self, id: &str) -> bool {
         id == "Sust"
             || self
@@ -971,6 +971,113 @@ impl Meeting {
                 repeat.exceptions.sort_by_key(|o| o.planned);
             }
         }
+    }
+
+    /// The meeting with its first date moved to `date`. A repeating
+    /// meeting's weeks keep what was recorded for them (held, cancelled,
+    /// moved, notes): on a new weekday they move with the meeting, by the
+    /// fewest days; moved by whole weeks, they stay on their dates.
+    pub fn with_start(&self, date: NaiveDate) -> Meeting {
+        let mut m = self.clone();
+        if let (Some(old), Some(r)) = (self.date, &mut m.repeat) {
+            let period = 7 * i64::from(r.every_weeks.max(1));
+            let delta = (date - old).num_days();
+            let shift = Duration::days(delta - (delta + period / 2 - 1).div_euclid(period) * period);
+            for o in &mut r.exceptions {
+                o.planned += shift;
+                if o.moved_to == Some(o.planned) {
+                    o.moved_to = None;
+                }
+            }
+        }
+        m.date = Some(date);
+        m
+    }
+
+    /// For each recorded week of a repeating meeting, whether it is one of
+    /// the meeting's weeks (and so shown).
+    fn records_shown(&self, settings: &Settings) -> Vec<bool> {
+        let Some(r) = &self.repeat else { return Vec::new() };
+        let weeks: HashSet<NaiveDate> = self.occurrences(settings).iter().map(|o| o.planned).collect();
+        r.exceptions.iter().map(|o| weeks.contains(&o.planned)).collect()
+    }
+
+    /// Which recorded weeks, shown now, `changed` would no longer have.
+    /// `changed` is this meeting planned differently (another first date
+    /// from [`Meeting::with_start`], interval or end), so its recorded weeks
+    /// are these, in the same order.
+    fn lost_in(&self, changed: &Meeting, settings: &Settings) -> Vec<bool> {
+        let after = changed.records_shown(settings);
+        self.records_shown(settings)
+            .into_iter()
+            .enumerate()
+            .map(|(i, shown)| shown && !after.get(i).copied().unwrap_or(false))
+            .collect()
+    }
+
+    /// The weeks with something recorded that planning the meeting as
+    /// `changed` would lose, as they are now.
+    pub fn records_lost(&self, changed: &Meeting, settings: &Settings) -> Vec<Occurrence> {
+        let Some(r) = &self.repeat else { return Vec::new() };
+        r.exceptions
+            .iter()
+            .zip(self.lost_in(changed, settings))
+            .filter(|(_, lost)| *lost)
+            .map(|(o, _)| o.clone())
+            .collect()
+    }
+
+    /// Plan the meeting as `changed`, deleting the records of the weeks it
+    /// no longer has (see [`Meeting::records_lost`]).
+    pub fn replan(&mut self, mut changed: Meeting, settings: &Settings) {
+        let lost = self.lost_in(&changed, settings);
+        if let Some(r) = &mut changed.repeat {
+            let mut i = 0;
+            r.exceptions.retain(|o| {
+                let keep = !lost.get(i).copied().unwrap_or(false) && !o.is_plain();
+                i += 1;
+                keep
+            });
+            r.exceptions.sort_by_key(|o| o.planned);
+        }
+        *self = changed;
+    }
+
+    /// The meeting as a single one: its first week, with what was recorded
+    /// for that week. The other weeks' records are lost.
+    pub fn without_repeat(&self) -> Meeting {
+        let mut m = self.clone();
+        m.repeat = None;
+        if let (Some(start), Some(_)) = (self.date, &self.repeat) {
+            let first = self.occurrence(start);
+            m.date = Some(first.date());
+            m.time = first.time.or(self.time);
+            m.held = first.held;
+            let notes = first.notes.trim();
+            if !notes.is_empty() {
+                m.notes = match m.notes.trim_end() {
+                    "" => notes.to_string(),
+                    own => format!("{own}\n\n{notes}"),
+                };
+            }
+        }
+        m
+    }
+
+    /// The weeks with something recorded, other than the first, which
+    /// [`Meeting::without_repeat`] loses.
+    pub fn records_lost_without_repeat(&self) -> Vec<Occurrence> {
+        self.repeat
+            .iter()
+            .flat_map(|r| &r.exceptions)
+            .filter(|o| Some(o.planned) != self.date)
+            .cloned()
+            .collect()
+    }
+
+    /// Nothing has been filled in since it was added.
+    pub fn is_blank(&self) -> bool {
+        *self == Meeting { id: self.id, ..Default::default() }
     }
 }
 
@@ -4324,6 +4431,93 @@ mod tests {
         settings.week_starts_sunday = true;
         assert_eq!(settings.week_start(d(2026, 10, 28)), d(2026, 10, 25));
         assert_eq!(settings.week_start(d(2026, 11, 1)), d(2026, 11, 1));
+    }
+
+    /// Weekly on Mondays from 2 Nov 2026: the first week held with notes,
+    /// the second with notes, the third moved to the Tuesday, the fourth cancelled.
+    fn weekly_from_2_nov_with_records() -> (Settings, Meeting) {
+        let settings = teaching();
+        let mut m = Meeting {
+            date: Some(d(2026, 11, 2)),
+            time: Some(t(14, 0)),
+            repeat: Some(Repeat::default()),
+            ..Default::default()
+        };
+        m.set_occurrence(Occurrence { planned: d(2026, 11, 2), held: true, notes: "First".into(), ..Default::default() });
+        m.set_occurrence(Occurrence { planned: d(2026, 11, 9), notes: "Second".into(), ..Default::default() });
+        m.set_occurrence(Occurrence { planned: d(2026, 11, 16), moved_to: Some(d(2026, 11, 17)), ..Default::default() });
+        m.set_occurrence(Occurrence { planned: d(2026, 11, 23), cancelled: true, ..Default::default() });
+        (settings, m)
+    }
+
+    fn records(m: &Meeting) -> Vec<(NaiveDate, Option<NaiveDate>)> {
+        m.repeat.as_ref().unwrap().exceptions.iter().map(|o| (o.planned, o.moved_to)).collect()
+    }
+
+    #[test]
+    fn a_new_weekday_moves_the_weeks_records_with_the_meeting() {
+        let (settings, m) = weekly_from_2_nov_with_records();
+        // Monday to Tuesday: every week's record moves a day, and the week
+        // moved to Tuesday is now on its planned day.
+        let tuesday = m.with_start(d(2026, 11, 3));
+        assert!(m.records_lost(&tuesday, &settings).is_empty());
+        assert_eq!(
+            records(&tuesday),
+            [(d(2026, 11, 3), None), (d(2026, 11, 10), None), (d(2026, 11, 17), None), (d(2026, 11, 24), None)]
+        );
+        let mut changed = m.clone();
+        changed.replan(tuesday, &settings);
+        let weeks = changed.occurrences(&settings);
+        assert!(weeks[0].held && weeks[0].notes == "First");
+        assert_eq!(weeks[1].notes, "Second");
+        assert!(weeks[3].cancelled);
+        // The week moved to the Tuesday is plain now, and forgotten.
+        assert_eq!(changed.repeat.as_ref().unwrap().exceptions.len(), 3);
+
+        // Back to Sunday: the fewest days, so the weeks stay the same weeks.
+        let sunday = m.with_start(d(2026, 11, 1));
+        assert_eq!(records(&sunday)[0].0, d(2026, 11, 1));
+    }
+
+    #[test]
+    fn whole_weeks_keep_the_records_on_their_dates_and_say_what_is_lost() {
+        let (settings, m) = weekly_from_2_nov_with_records();
+        // Starting two weeks later: the first two weeks are no longer weeks of it.
+        let later = m.with_start(d(2026, 11, 16));
+        let lost: Vec<NaiveDate> = m.records_lost(&later, &settings).iter().map(|o| o.planned).collect();
+        assert_eq!(lost, [d(2026, 11, 2), d(2026, 11, 9)]);
+        let mut changed = m.clone();
+        changed.replan(later, &settings);
+        assert_eq!(records(&changed), [(d(2026, 11, 16), Some(d(2026, 11, 17))), (d(2026, 11, 23), None)]);
+
+        // Fortnightly: the weeks in between go.
+        let mut fortnightly = m.clone();
+        fortnightly.repeat.as_mut().unwrap().every_weeks = 2;
+        let lost: Vec<NaiveDate> = m.records_lost(&fortnightly, &settings).iter().map(|o| o.planned).collect();
+        assert_eq!(lost, [d(2026, 11, 9), d(2026, 11, 23)]);
+
+        // A record that was already hidden isn't counted, nor deleted.
+        let mut ended = m.clone();
+        ended.repeat.as_mut().unwrap().until = Some(d(2026, 11, 10));
+        let mut both = m.clone();
+        both.replan(ended.clone(), &settings);
+        assert_eq!(both.repeat.as_ref().unwrap().exceptions.len(), 2);
+        let mut fortnightly_ended = ended.clone();
+        fortnightly_ended.repeat.as_mut().unwrap().every_weeks = 2;
+        assert_eq!(ended.records_lost(&fortnightly_ended, &settings).len(), 1, "only 9 Nov, still shown");
+    }
+
+    #[test]
+    fn stopping_a_repeat_keeps_the_first_week() {
+        let (_, m) = weekly_from_2_nov_with_records();
+        assert_eq!(m.records_lost_without_repeat().len(), 3);
+        let single = m.without_repeat();
+        assert!(single.repeat.is_none());
+        assert!(single.held);
+        assert_eq!(single.notes, "First");
+        assert_eq!(single.date, Some(d(2026, 11, 2)));
+        assert!(Meeting::default().is_blank());
+        assert!(!single.is_blank());
     }
 
     #[test]

@@ -568,29 +568,71 @@ impl Vault {
     }
 
     /// Whether `password` is the one the file is sealed with (no disk access).
+    #[cfg(test)]
     pub fn check_password(&self, password: &str) -> Result<bool> {
-        let key = derive_key(password, &self.seal.salt, self.seal.params, self.seal.key_file.as_ref())?;
-        Ok(key.iter().zip(self.seal.key.iter()).fold(0, |acc, (a, b)| acc | (a ^ b)) == 0)
+        self.password_check().matches(password)
+    }
+
+    /// What checking a password needs, to do it on another thread: key
+    /// derivation is slow on purpose, and would freeze the window.
+    pub fn password_check(&self) -> PasswordCheck {
+        PasswordCheck {
+            params: self.seal.params,
+            salt: self.seal.salt,
+            key: self.seal.key.clone(),
+            key_file: self.seal.key_file.clone(),
+        }
     }
 
     /// Re-key the file with a new password (fresh salt) and save immediately.
+    #[cfg(test)]
     pub fn change_password(&mut self, current: &str, new: &str, db: &Database) -> Result<()> {
-        let key_file = self.seal.key_file.clone();
-        self.reseal(current, new, key_file, db)
+        let job = self.change_password_job(Zeroizing::new(current.into()), Zeroizing::new(new.into()));
+        self.rekey(job()?, db)
     }
 
     /// Re-key the file to need `key_file` as well as the password, or (with
     /// `None`) the password alone.
+    #[cfg(test)]
     pub fn set_key_file(&mut self, password: &str, key_file: Option<KeyFile>, db: &Database) -> Result<()> {
-        self.reseal(password, password, key_file, db)
+        let job = self.set_key_file_job(Zeroizing::new(password.into()), key_file);
+        self.rekey(job()?, db)
     }
 
-    fn reseal(&mut self, current: &str, password: &str, key_file: Option<KeyFile>, db: &Database) -> Result<()> {
-        // A typo here would otherwise become the new password.
-        if !self.check_password(current)? {
-            return Err(VaultError::WrongPassword.into());
+    /// The slow part of [`Vault::change_password`], to run on any thread;
+    /// [`Vault::rekey`] then saves with its result.
+    pub fn change_password_job(&self, current: Zeroizing<String>, new: Zeroizing<String>) -> impl FnOnce() -> Result<NewSeal> + Send + 'static {
+        self.rekey_job(current, new, self.seal.key_file.clone())
+    }
+
+    /// The slow part of [`Vault::set_key_file`], to run on any thread;
+    /// [`Vault::rekey`] then saves with its result.
+    pub fn set_key_file_job(&self, password: Zeroizing<String>, key_file: Option<KeyFile>) -> impl FnOnce() -> Result<NewSeal> + Send + 'static {
+        self.rekey_job(password.clone(), password, key_file)
+    }
+
+    /// Checks `current` and derives the key for `password` and `key_file`.
+    fn rekey_job(
+        &self,
+        current: Zeroizing<String>,
+        password: Zeroizing<String>,
+        key_file: Option<KeyFile>,
+    ) -> impl FnOnce() -> Result<NewSeal> + Send + 'static {
+        let check = self.password_check();
+        let params = self.seal.params.at_least_default();
+        move || {
+            // A typo here would otherwise become the new password.
+            if !check.matches(&current)? {
+                return Err(VaultError::WrongPassword.into());
+            }
+            Ok(NewSeal(Seal::new(&password, key_file, params)?))
         }
-        let next = Seal::new(password, key_file, self.seal.params.at_least_default())?;
+    }
+
+    /// The quick part of a re-key: save `db` sealed the new way, then keep
+    /// that seal. A failed save leaves the old password and key file working.
+    pub fn rekey(&mut self, next: NewSeal, db: &Database) -> Result<()> {
+        let NewSeal(next) = next;
         let bytes = sealed(&next, db)?;
         // The copy is re-sealed here too, so the old password stops opening it.
         let written = self.writer().put(&bytes, true, false)?;
@@ -604,6 +646,27 @@ impl Vault {
         Ok(())
     }
 }
+
+/// What checking a password against an unlocked file needs; see
+/// [`Vault::password_check`].
+#[derive(Clone)]
+pub struct PasswordCheck {
+    params: KdfParams,
+    salt: [u8; SALT_LEN],
+    key: Zeroizing<[u8; 32]>,
+    key_file: Option<KeyFile>,
+}
+
+impl PasswordCheck {
+    /// Whether `password` is the one the file is sealed with.
+    pub fn matches(&self, password: &str) -> Result<bool> {
+        let key = derive_key(password, &self.salt, self.params, self.key_file.as_ref())?;
+        Ok(key.iter().zip(self.key.iter()).fold(0, |acc, (a, b)| acc | (a ^ b)) == 0)
+    }
+}
+
+/// A new password or key file, its key derived and ready for [`Vault::rekey`].
+pub struct NewSeal(Seal);
 
 /// Serialise and encrypt `db` into the bytes of a data file.
 fn sealed(seal: &Seal, db: &Database) -> Result<Vec<u8>> {
@@ -918,12 +981,12 @@ fn config_file() -> Option<PathBuf> {
     project_dirs().map(|d| d.config_dir().join("last_file.txt"))
 }
 
-pub fn last_used_path() -> PathBuf {
+/// The data file opened last on this computer, if one was.
+pub fn last_used_path() -> Option<PathBuf> {
     config_file()
         .and_then(|f| fs::read_to_string(f).ok())
         .map(|s| PathBuf::from(s.trim()))
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(default_path)
 }
 
 pub fn remember_path(path: &Path) {
