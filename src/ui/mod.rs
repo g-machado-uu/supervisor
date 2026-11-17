@@ -8,6 +8,7 @@ pub mod icons;
 pub mod lock;
 pub mod marking;
 pub mod modules;
+pub mod new_year;
 pub mod phd;
 pub mod placement;
 pub mod settings;

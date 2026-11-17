@@ -4,7 +4,6 @@ use egui::AsIdSalt;
 
 use chrono::{Datelike, Local, NaiveDate, NaiveTime, Timelike};
 use egui::{RichText, Ui};
-use egui_extras::DatePickerButton;
 
 use crate::model::{Meeting, Platform, Repeat, ReplyStatus, Settings, Timetable, TriState, contact_date_problem, reply_date_problem};
 use crate::ui::{icons, theme};
@@ -21,12 +20,100 @@ pub fn fmt_short(date: NaiveDate) -> String {
     date.format("%d %b").to_string()
 }
 
-fn to_jiff(d: NaiveDate) -> jiff::civil::Date {
-    jiff::civil::date(d.year() as i16, d.month() as i8, d.day() as i8)
+/// The first of the month `date` is in.
+fn first_of_month(date: NaiveDate) -> NaiveDate {
+    date.with_day(1).unwrap_or(date)
 }
 
-fn from_jiff(d: jiff::civil::Date) -> NaiveDate {
-    NaiveDate::from_ymd_opt(d.year().into(), d.month() as u32, d.day() as u32).unwrap_or_else(today)
+/// A date as a button that opens a month calendar. Clicking a day sets the
+/// date and closes the calendar; clicking elsewhere or Esc just closes it.
+/// Each day is labelled with its full date, for screen readers and tests.
+fn date_picker(ui: &mut Ui, date: &mut NaiveDate) -> egui::Response {
+    let mut button = ui.button(format!("{} {}", icons::CALENDAR_BLANK, date.format("%a %d %b %Y")));
+    let popup_id = button.id.with("calendar");
+    // The month on view: the date's own when the calendar opens.
+    let month_id = popup_id.with("month");
+    let opening = button.clicked() && !egui::Popup::is_id_open(ui.ctx(), popup_id);
+    let mut month = ui
+        .data(|d| d.get_temp::<NaiveDate>(month_id))
+        .filter(|_| !opening)
+        .unwrap_or_else(|| first_of_month(*date));
+    let mut picked = None;
+    egui::Popup::from_toggle_button_response(&button)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            let today = today();
+            let day_size = egui::vec2(30.0, 24.0);
+            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+            ui.horizontal(|ui| {
+                let step = |ui: &mut Ui, text: &str, hover: &str| {
+                    ui.add(egui::Button::new(text).frame_when_inactive(false).min_size(egui::vec2(24.0, 24.0)))
+                        .on_hover_text(hover)
+                        .clicked()
+                };
+                if step(ui, "«", "Previous year") {
+                    month = month.checked_sub_months(chrono::Months::new(12)).unwrap_or(month);
+                }
+                if step(ui, "‹", "Previous month") {
+                    month = month.checked_sub_months(chrono::Months::new(1)).unwrap_or(month);
+                }
+                // Centred between the arrows, across the width of the week.
+                let title = theme::semibold(month.format("%B %Y").to_string());
+                let width = 7.0 * day_size.x + 6.0 * 2.0 - 4.0 * (24.0 + 2.0);
+                ui.add_sized([width, 24.0], egui::Label::new(title));
+                if step(ui, "›", "Next month") {
+                    month = month.checked_add_months(chrono::Months::new(1)).unwrap_or(month);
+                }
+                if step(ui, "»", "Next year") {
+                    month = month.checked_add_months(chrono::Months::new(12)).unwrap_or(month);
+                }
+            });
+            let first = month - chrono::Duration::days(i64::from(month.weekday().num_days_from_monday()));
+            egui::Grid::new("days").spacing([2.0, 2.0]).show(ui, |ui| {
+                for name in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
+                    ui.add_sized(day_size, egui::Label::new(RichText::new(name).small().color(theme::muted(ui))));
+                }
+                ui.end_row();
+                for week in 0..6 {
+                    for weekday in 0..7 {
+                        let day = first + chrono::Duration::days(week * 7 + weekday);
+                        let mut text = RichText::new(day.day().to_string());
+                        if day.month() != month.month() {
+                            text = text.color(theme::muted(ui));
+                        }
+                        let resp = ui.add(egui::Button::new(text).selected(day == *date).frame_when_inactive(day == *date).min_size(day_size));
+                        if day == today {
+                            let stroke = egui::Stroke::new(1.5, theme::fg(ui, theme::ACCENT));
+                            ui.painter().rect_stroke(resp.rect.shrink(1.0), 6.0, stroke, egui::StrokeKind::Inside);
+                        }
+                        let label = day.format("%a %d %b %Y").to_string();
+                        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
+                        if resp.clicked() {
+                            picked = Some(day);
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button("Today").clicked() {
+                    picked = Some(today);
+                }
+                if first_of_month(*date) != month && ui.small_button("Back to the date").clicked() {
+                    month = first_of_month(*date);
+                }
+            });
+        });
+    ui.data_mut(|d| d.insert_temp(month_id, month));
+    if let Some(day) = picked {
+        egui::Popup::close_id(ui.ctx(), popup_id);
+        if day != *date {
+            *date = day;
+            button.mark_changed();
+        }
+    }
+    button
 }
 
 /// An optional date: a "Set date" button when empty, otherwise a picker plus clear button.
@@ -38,14 +125,7 @@ pub fn opt_date(ui: &mut Ui, salt: impl AsIdSalt, value: &mut Option<NaiveDate>)
 fn date_field(ui: &mut Ui, value: &mut Option<NaiveDate>, default: NaiveDate) {
     ui.horizontal(|ui| match value {
         Some(date) => {
-            let mut j = to_jiff(*date);
-            ui.add(
-                DatePickerButton::new(&mut j)
-                    .id_salt("date")
-                    .format("%a %d %b %Y")
-                    .calendar_week(false),
-            );
-            *date = from_jiff(j);
+            ui.push_id("date", |ui| date_picker(ui, date));
             if ui.small_button(icons::X).on_hover_text("Clear date").clicked() {
                 *value = None;
             }

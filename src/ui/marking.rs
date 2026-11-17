@@ -54,6 +54,19 @@ pub fn show(ui: &mut Ui, m: &mut MarkingRecord, settings: &Settings, shown: &mut
             ui.label("Poster number");
             ui.horizontal(|ui| fyp::poster_field(ui, &mut m.poster_number));
             ui.end_row();
+        } else {
+            ui.label("Marks due");
+            ui.horizontal(|ui| {
+                widgets::opt_date(ui, "mark-by", &mut m.mark_by);
+                if m.mark_by.is_none() {
+                    let text = match settings.report_mark_by(m.kind) {
+                        Some(by) => format!("{} (Settings)", widgets::fmt_date(Some(by))),
+                        None => "Set the date for all of them in Settings › Marking deadlines".into(),
+                    };
+                    ui.label(RichText::new(text).small().color(theme::muted(ui)));
+                }
+            });
+            ui.end_row();
         }
     });
 
@@ -61,13 +74,17 @@ pub fn show(ui: &mut Ui, m: &mut MarkingRecord, settings: &Settings, shown: &mut
     let marks_shown = shown.marks;
     let mut switch_marks = false;
     theme::section(ui, "Marks", |ui| {
-        // (title, module code, who marks it, its status)
-        let items: Vec<(String, String, Markers, Option<uuid::Uuid>)> = match m.kind.report() {
-            Some((title, markers)) => vec![(title.to_string(), String::new(), markers, None)],
+        // (title, module code, who marks it, its status, when my mark is due)
+        type Item = (String, String, Markers, Option<uuid::Uuid>, Option<chrono::NaiveDate>);
+        let items: Vec<Item> = match m.kind.report() {
+            Some((title, markers)) => vec![(title.to_string(), String::new(), markers, None, m.report_mark_by(settings))],
             None => settings
                 .second_marked(&m.programme)
                 .into_iter()
-                .map(|(module, cw)| (cw.title.clone(), module.code.clone(), cw.markers, Some(cw.id)))
+                .map(|(module, cw)| {
+                    let by = settings.marking_deadline(module, cw, m.coursework.get(&cw.id));
+                    (cw.title.clone(), module.code.clone(), cw.markers, Some(cw.id), by)
+                })
                 .collect(),
         };
         if items.is_empty() {
@@ -81,8 +98,8 @@ pub fn show(ui: &mut Ui, m: &mut MarkingRecord, settings: &Settings, shown: &mut
             return;
         }
         let cols = Cols {
-            first: items.iter().any(|(_, _, markers, _)| markers.supervisor()),
-            agreed: items.iter().any(|(_, _, markers, _)| *markers == Markers::Both),
+            first: items.iter().any(|(_, _, markers, _, _)| markers.supervisor()),
+            agreed: items.iter().any(|(_, _, markers, _, _)| *markers == Markers::Both),
             second_first: false,
         };
         egui::Grid::new("marking-marks")
@@ -104,12 +121,17 @@ pub fn show(ui: &mut Ui, m: &mut MarkingRecord, settings: &Settings, shown: &mut
                     ui.label(RichText::new(*h).small().color(theme::muted(ui)));
                 }
                 ui.end_row();
-                for (title, code, markers, id) in items {
+                for (title, code, markers, id, by) in items {
                     ui.horizontal(|ui| {
                         ui.label(title);
                         if !code.is_empty() {
                             ui.label(RichText::new(code).small().color(theme::muted(ui)));
                         }
+                        let status = match id {
+                            Some(id) => m.coursework.get(&id),
+                            None => Some(&m.report),
+                        };
+                        fyp::mark_by_note(ui, by, status.is_some_and(|st| st.has_mark(false)));
                     });
                     let edit = |status: &mut CwStatus| {
                         switch_marks |= fyp::marks_cells(ui, status, markers, marks_shown, "the supervisor's mark", cols);

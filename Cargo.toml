@@ -1,6 +1,6 @@
 [package]
 name = "supervisor"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 # Required by egui 0.37.
 rust-version = "1.95"
@@ -15,7 +15,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 eframe = "0.37"
 egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
-egui_extras = { version = "0.37", features = ["datepicker"] }
+egui_extras = "0.37"
 jiff = "0.2"
 rand = "0.8"
 regex = "1.13.1"

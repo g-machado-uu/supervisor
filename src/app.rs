@@ -20,6 +20,7 @@ use crate::storage::{self, KeyFile, Vault, VaultError, Written};
 use crate::ui::calendar::{self, CalAction, CalendarState};
 use crate::ui::dashboard::{self, DashAction};
 use crate::ui::lock::{LockScreen, Unlocked};
+use crate::ui::new_year::{self, NewYearAction, NewYearDialog};
 use crate::ui::settings::{self, KeyFileForm, PasswordForm, SettingsAction};
 use crate::ui::student_form::{self, FormAction, Role, Shown};
 use crate::ui::student_import::{self, StudentImport};
@@ -32,6 +33,11 @@ const AUTOSAVE_DELAY: f64 = 1.0;
 
 pub struct SupervisorApp {
     screen: Screen,
+    /// The size of the interface as last remembered on this computer.
+    ui_scale: f32,
+    /// The reminder to set up a placement module has had its chance this
+    /// launch; locking and unlocking again doesn't repeat it.
+    placement_reminded: bool,
 }
 
 enum Screen {
@@ -45,6 +51,9 @@ impl SupervisorApp {
         theme::install(&cc.egui_ctx);
         // The saved preference is encrypted; follow the OS until unlocked.
         cc.egui_ctx.set_theme(egui::ThemePreference::System);
+        // Chosen per computer: each screen may want its own size.
+        let ui_scale = storage::ui_scale().unwrap_or(1.0);
+        cc.egui_ctx.set_zoom_factor(ui_scale);
         // A file named on the command line may be a new one; the one opened
         // last should still be there.
         let lock = match (data_file, storage::last_used_path()) {
@@ -52,7 +61,7 @@ impl SupervisorApp {
             (None, Some(path)) => LockScreen::new(path, true),
             (None, None) => LockScreen::new(storage::default_path(), false),
         };
-        Self { screen: Screen::Locked(lock) }
+        Self { screen: Screen::Locked(lock), ui_scale, placement_reminded: false }
     }
 }
 
@@ -79,7 +88,12 @@ impl eframe::App for SupervisorApp {
                 s.leaving = Some(Leave::Quit);
             } else {
                 s.detect_changes(now);
-                s.leave(ctx, Leave::Quit);
+                if s.manual_save() && s.dirty_since.is_some() && !matches!(s.status, SaveStatus::Conflict) {
+                    // Changes not saved on purpose: ask whether to save them.
+                    s.unsaved_prompt = true;
+                } else {
+                    s.leave(ctx, Leave::Quit);
+                }
             }
             if s.ready_to_leave().is_none() {
                 // Not saved yet: stay open, and close once saved or say why not.
@@ -96,7 +110,11 @@ impl eframe::App for SupervisorApp {
         match &mut self.screen {
             Screen::Locked(lock) => {
                 if let Some(unlocked) = lock.ui(ui) {
-                    self.screen = Screen::Unlocked(Box::new(Session::new(unlocked)));
+                    let mut session = Session::new(unlocked);
+                    session.placement_reminder =
+                        !self.placement_reminded && session.db.settings.placement_modules().next().is_none();
+                    self.placement_reminded = true;
+                    self.screen = Screen::Unlocked(Box::new(session));
                 }
             }
             Screen::Unlocked(session) => match session.ui(ui) {
@@ -104,6 +122,19 @@ impl eframe::App for SupervisorApp {
                 Some(Leave::Quit) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
                 None => {}
             },
+        }
+        self.remember_ui_scale(ui.ctx());
+    }
+}
+
+impl SupervisorApp {
+    /// Keep the size of the interface for next time, once it has settled:
+    /// the slider in Settings, or Ctrl + and Ctrl −.
+    fn remember_ui_scale(&mut self, ctx: &egui::Context) {
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.ui_scale).abs() > f32::EPSILON && !ctx.input(|i| i.pointer.any_down()) {
+            self.ui_scale = zoom;
+            storage::remember_ui_scale(zoom);
         }
     }
 }
@@ -391,11 +422,26 @@ struct Session {
     weak_password: bool,
     /// Shown once the session is on screen.
     notice: Option<String>,
+    /// Quitting with saving set to manual: asking whether to save first.
+    unsaved_prompt: bool,
+    /// Asking to set up the placement module, as none is.
+    placement_reminder: bool,
+    /// Saving over an earlier version put back by a sync service has been mentioned.
+    restored_noted: bool,
+    /// In the conflict dialog: switch to saving manually along with "Save my version".
+    switch_to_manual: bool,
+    /// Whether saving was manual at the last change check, to notice it being switched.
+    manual_seen: bool,
+    /// Save once even though saving is manual: switching it on or off is saved straight away.
+    save_once: bool,
+    /// Starting a new academic year, while it is being set up.
+    new_year: Option<NewYearDialog>,
 }
 
 impl Session {
     fn new(unlocked: Unlocked) -> Self {
         let Unlocked { vault, db, weak_password } = unlocked;
+        let db_manual = db.settings.manual_save;
         Self {
             db_print: storage::fingerprint(&db),
             derived: None,
@@ -441,7 +487,19 @@ impl Session {
                 "Your password is easier to guess than Supervisor now allows – please change it in Settings › Security."
                     .to_string()
             }),
+            unsaved_prompt: false,
+            placement_reminder: false,
+            restored_noted: false,
+            switch_to_manual: false,
+            manual_seen: db_manual,
+            save_once: false,
+            new_year: None,
         }
+    }
+
+    /// Saving waits for Save, Ctrl+S, locking or quitting.
+    fn manual_save(&self) -> bool {
+        self.db.settings.manual_save
     }
 
     /// Start saving in the background, unless a save is already running.
@@ -451,6 +509,7 @@ impl Session {
         if self.saving.is_some() {
             return;
         }
+        self.save_once = false;
         let job = self.vault.seal(&self.db).map(|bytes| (self.vault.writer(), bytes));
         let (tx, rx) = channel();
         let ctx = ctx.clone();
@@ -479,6 +538,13 @@ impl Session {
         self.saving = None;
         match result {
             Ok(written) => {
+                if written.restored && !self.restored_noted {
+                    self.restored_noted = true;
+                    self.notice = Some(
+                        "The sync service of your data file's folder had put back an earlier save. Your latest version was saved over it."
+                            .into(),
+                    );
+                }
                 self.vault.saved(written);
                 // Edits made while it was saving stay pending for the next save.
                 if self.db_print == started_from {
@@ -533,6 +599,7 @@ impl Session {
             Ok(()) => {
                 self.status = SaveStatus::Saved;
                 self.dirty_since = None;
+                self.save_once = false;
             }
             // Written elsewhere: ask before replacing it.
             Err(e) if storage::vault_error(&e) == Some(VaultError::ChangedOnDisk) => {
@@ -550,6 +617,10 @@ impl Session {
         let print = storage::fingerprint(&self.db);
         if print != self.db_print {
             self.db_print = print;
+            if self.db.settings.manual_save != self.manual_seen {
+                self.manual_seen = self.db.settings.manual_save;
+                self.save_once = true;
+            }
             self.dirty_since = Some(now);
             if !matches!(self.status, SaveStatus::Conflict) {
                 self.status = SaveStatus::Pending;
@@ -728,9 +799,14 @@ impl Session {
         } else if save_now {
             self.save_now(ui.ctx(), now);
         }
+        // Saving manually: only when asked, or on locking.
+        let waiting_for_save = self.manual_save() && self.leaving.is_none() && !self.save_requested && !self.save_once;
         if let Some(since) = self.dirty_since
             && !matches!(self.status, SaveStatus::Conflict)
             && self.saving.is_none()
+            && !waiting_for_save
+            // Leaving without saving, as chosen.
+            && !self.discard
         {
             // Locking, quitting and the Save button don't wait for a pause in
             // typing, only for the back-off after a failed save.
@@ -963,6 +1039,13 @@ impl Session {
                                     format!("{} Saved", icons::FLOPPY_DISK),
                                     theme::fg(ui, theme::GREEN),
                                     "All changes are saved and encrypted.\nClick to save now and keep this version as the backup (Ctrl+S).".to_string(),
+                                ),
+                                SaveStatus::Pending
+                                    if self.db.settings.manual_save && self.saving.is_none() && !self.save_requested && !self.save_once =>
+                                (
+                                    format!("{} Save", icons::FLOPPY_DISK),
+                                    theme::fg(ui, theme::AMBER),
+                                    "You have unsaved changes. Click to save them (Ctrl+S).\nSaving is set to manual in Settings › Security.".to_string(),
                                 ),
                                 SaveStatus::Pending => ("Saving…".to_string(), theme::muted(ui), "Click to save now (Ctrl+S)".to_string()),
                                 SaveStatus::Error(e) => (
@@ -1227,6 +1310,7 @@ impl Session {
                     ),
                     SettingsAction::BackupNow => self.backup_now(ui),
                     SettingsAction::StopBackup => self.stop_backup(ui),
+                    SettingsAction::NewYear => self.new_year = Some(NewYearDialog::new(&self.db)),
                 }
             }
         }
@@ -1596,6 +1680,37 @@ impl Session {
         }
     }
 
+    /// Start a new academic year. The data as it was is saved first and
+    /// kept as the `.bak`, in case students were let go by mistake.
+    fn start_year(&mut self, ui: &Ui, plan: &crate::model::NewYear) {
+        let now = ui.input(|i| i.time);
+        self.wait_for_save(ui);
+        self.detect_changes(now);
+        if self.dirty_since.is_some() && !matches!(self.status, SaveStatus::Conflict) {
+            let result = self.vault.save(&self.db);
+            self.saved(result);
+        }
+        let kept = matches!(self.status, SaveStatus::Saved);
+        if kept {
+            self.vault.mark_restore_point();
+        }
+        let done = self.db.start_year(plan);
+        if self.selected.is_some_and(|id| self.db.student(id).is_none_or(|s| s.archived)) {
+            self.selected = None;
+        }
+        self.detect_changes(now);
+        let count = |n: usize| if n == 1 { "1 student".to_string() } else { format!("{n} students") };
+        let mut msg = format!("Started {}", self.db.settings.academic_year);
+        if done.archived > 0 {
+            msg.push_str(&format!(" – archived {}", count(done.archived)));
+        }
+        if done.deleted > 0 {
+            msg.push_str(&format!("{} deleted {}", if done.archived > 0 { ", " } else { " – " }, count(done.deleted)));
+        }
+        msg.push_str(if kept { ". The data as it was is kept as the .bak." } else { "." });
+        self.notify(ui, msg);
+    }
+
     /// Re-keying saves the data too. Failures are put in plain words.
     fn resealed(&mut self, result: anyhow::Result<()>, failed: &str) -> Result<(), String> {
         let Err(e) = result else {
@@ -1747,12 +1862,26 @@ impl Session {
                 ui.add_space(4.0);
                 ui.label(
                     "Since you unlocked it, your data file was changed by another copy of Supervisor – \
-                     probably on another computer that shares the file, or in a second window.",
+                     probably on another computer that shares the file, or in a second window – or by the \
+                     sync service of the folder it is in, such as OneDrive.",
                 );
                 ui.add_space(4.0);
                 ui.label(format!(
                     "Saving your version replaces that one. It is kept as {backup} in the same folder, so nothing is lost for good."
                 ));
+                if !self.db.settings.manual_save {
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut self.switch_to_manual, "Save only when I click Save (manual saving)");
+                    ui.label(
+                        RichText::new(
+                            "If this keeps happening in a synced folder, saving less often can help: Supervisor then \
+                             saves when you click Save or press Ctrl+S, and when it locks. You can change this in \
+                             Settings › Security.",
+                        )
+                        .small()
+                        .color(theme::muted(ui)),
+                    );
+                }
                 ui.add_space(12.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add(theme::primary_button("Save my version")).clicked() {
@@ -1768,12 +1897,98 @@ impl Session {
                 });
             });
             if keep_mine {
+                if std::mem::take(&mut self.switch_to_manual) {
+                    self.db.settings.manual_save = true;
+                    self.detect_changes(ui.input(|i| i.time));
+                }
                 self.wait_for_save(ui);
                 let result = self.vault.overwrite(&self.db);
                 self.saved(result);
             } else if discard {
                 self.discard = true;
                 self.leaving.get_or_insert(Leave::Lock);
+            }
+        }
+
+        if let Some(dialog) = &mut self.new_year {
+            match new_year::show(ui, dialog, &self.db) {
+                NewYearAction::None => {}
+                NewYearAction::Cancel => self.new_year = None,
+                NewYearAction::Start => {
+                    let plan = dialog.plan.clone();
+                    self.new_year = None;
+                    self.start_year(ui, &plan);
+                }
+            }
+        }
+
+        if self.unsaved_prompt {
+            let mut save = false;
+            let mut discard = false;
+            let mut cancel = false;
+            let resp = egui::Modal::new(Id::unique("unsaved")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
+                ui.set_width(460.0);
+                ui.horizontal(|ui| {
+                    theme::icon_badge(ui, icons::FLOPPY_DISK, theme::AMBER, 40.0);
+                    ui.label(theme::serif("Unsaved changes", 22.0));
+                });
+                ui.add_space(4.0);
+                ui.label("Saving is set to manual, and your latest changes aren't saved. Save them before closing?");
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(theme::primary_button("Save and quit")).clicked() {
+                        save = true;
+                    }
+                    if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, 34.0))).clicked() {
+                        cancel = true;
+                    }
+                    if ui.add(theme::danger_button("Quit without saving")).clicked() {
+                        discard = true;
+                    }
+                });
+            });
+            if save {
+                self.unsaved_prompt = false;
+                self.leave(&ctx, Leave::Quit);
+            } else if discard {
+                self.unsaved_prompt = false;
+                self.discard = true;
+                self.leaving = Some(Leave::Quit);
+            } else if cancel || resp.should_close() {
+                self.unsaved_prompt = false;
+            }
+        }
+
+        if self.placement_reminder && !matches!(self.status, SaveStatus::Conflict) {
+            let mut open_settings = false;
+            let mut later = false;
+            let resp = egui::Modal::new(Id::unique("placement-reminder")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
+                ui.set_width(480.0);
+                ui.horizontal(|ui| {
+                    theme::icon_badge(ui, icons::BUILDINGS, theme::AMBER, 40.0);
+                    ui.label(theme::serif("No placement module yet", 22.0));
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    "Supervisor checks that your placement students are enrolled on the placement module, but no \
+                     module is set up for placement. Add it in Settings › Modules & coursework, and tick Placement \
+                     under Applies to.",
+                );
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(theme::primary_button("Open Settings")).clicked() {
+                        open_settings = true;
+                    }
+                    if ui.add(egui::Button::new("Later").min_size(egui::vec2(0.0, 34.0))).clicked() {
+                        later = true;
+                    }
+                });
+            });
+            if open_settings {
+                self.placement_reminder = false;
+                self.view = View::Settings;
+            } else if later || resp.should_close() {
+                self.placement_reminder = false;
             }
         }
 
@@ -2424,7 +2639,235 @@ mod ui_tests {
         wait_unlocked(&mut h);
         h.run_steps(2);
         assert!(path.exists());
+        // A new data file has no placement module: put off setting it up.
+        assert!(h.query_by_label("No placement module yet").is_some());
+        h.get_by_label("Later").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("No placement module yet").is_none());
         h
+    }
+
+    /// The window's close button.
+    fn request_close(h: &mut Harness<'_, SupervisorApp>) {
+        h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+        h.run_steps(2);
+    }
+
+    #[test]
+    fn the_placement_module_reminder_comes_once_per_launch_and_opens_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::L);
+        wait_until(&mut h, "locked", locked);
+        h.run_steps(2);
+        unlock(&mut h);
+        assert!(h.query_by_label("No placement module yet").is_none(), "not again after locking");
+
+        // On the next launch it comes back, and goes to Settings.
+        h.state_mut().placement_reminded = false;
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::L);
+        wait_until(&mut h, "locked", locked);
+        h.run_steps(2);
+        unlock(&mut h);
+        h.get_by_label("Open Settings").click();
+        h.run_steps(2);
+        assert!(session(&mut h).view == View::Settings);
+        assert!(h.query_by_label("No placement module yet").is_none());
+
+        // Once there is one, there is nothing to remind.
+        let s = session(&mut h);
+        s.db.settings.modules.push(Module { applies_to: vec![PLACEMENT_MODULE.into()], ..Default::default() });
+        h.key_press(egui::Key::F20);
+        h.run_steps(1);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::L);
+        wait_until(&mut h, "locked", locked);
+        h.state_mut().placement_reminded = false;
+        h.run_steps(2);
+        unlock(&mut h);
+        assert!(h.query_by_label("No placement module yet").is_none());
+    }
+
+    #[test]
+    fn manual_saving_waits_for_save_and_asks_before_quitting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        session(&mut h).db.settings.manual_save = true;
+        h.key_press(egui::Key::F20);
+        wait_until(&mut h, "the setting saved", all_saved);
+
+        // An edit isn't saved by itself, however long it waits.
+        session(&mut h).db.settings.my_name = "Unsaved".into();
+        h.key_press(egui::Key::F20);
+        for _ in 0..90 {
+            h.run_steps(1);
+        }
+        std::thread::sleep(Duration::from_millis(1200));
+        h.run_steps(3);
+        assert!(session(&mut h).dirty_since.is_some());
+        assert!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name.is_empty());
+
+        // Ctrl+S saves it.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+        wait_until(&mut h, "saved", all_saved);
+        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Unsaved");
+
+        // Closing with changes asks first; Cancel stays.
+        session(&mut h).db.settings.my_name = "Second".into();
+        request_close(&mut h);
+        assert!(h.query_by_label("Unsaved changes").is_some());
+        h.get_by_label("Cancel").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Unsaved changes").is_none());
+        assert!(session(&mut h).leaving.is_none());
+
+        // Quit without saving leaves the file as it was.
+        request_close(&mut h);
+        h.get_by_label("Quit without saving").click();
+        h.run_steps(2);
+        assert!(session(&mut h).ready_to_leave() == Some(Leave::Quit));
+        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Unsaved");
+    }
+
+    #[test]
+    fn placement_students_record_enrolment_and_marks_show_when_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let today = widgets::today();
+        let s = session(&mut h);
+        s.db.settings.modules.push(Module {
+            code: "EEE501".into(),
+            name: "Placement".into(),
+            applies_to: vec![PLACEMENT_MODULE.into()],
+            ..Default::default()
+        });
+        s.db.settings.msc_mark_by = Some(today + Days::days(2));
+        let pat = Student { name: "Pat Placement".into(), placement: Some(PlacementRecord::default()), ..Default::default() };
+        let mo = Student {
+            name: "Mo Msc".into(),
+            marking: Some(MarkingRecord { kind: MarkingKind::Msc, ..Default::default() }),
+            ..Default::default()
+        };
+        let (pat_id, mo_id) = (pat.id, mo.id);
+        s.db.students.extend([pat, mo]);
+        s.selected = Some(pat_id);
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("check they are enrolled on EEE501").is_some(), "on the dashboard");
+        assert!(h.query_by_label_contains("MSc dissertation to mark by").is_some(), "on the dashboard");
+        shot(&mut h, "30_placement_module_and_marking_reminders");
+
+        assert!(h.query_by_label("EEE501 – Placement").is_some());
+        h.get_all_by_label("Yes").next().unwrap().click(); // The first: enrolment, above the visits.
+        h.run_steps(3);
+        let placement = session(&mut h).db.student(pat_id).unwrap().placement.clone().unwrap();
+        assert_eq!(placement.enrolled, crate::model::TriState::Yes);
+        assert!(h.query_by_label_contains("check they are enrolled").is_none());
+
+        session(&mut h).selected = Some(mo_id);
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("(Settings)").is_some(), "the date from Settings");
+        shot(&mut h, "31_marking_due_in_the_panel");
+        session(&mut h).view = View::Settings;
+        h.set_size(egui::vec2(1360.0, 3600.0));
+        h.run_steps(3);
+        h.get_by_label("MEC526 – Research Methods and Management (Semester 1)").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Weeks after the deadline").is_some());
+        shot(&mut h, "32_settings");
+    }
+
+    #[test]
+    fn the_size_of_the_interface_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        assert_eq!(h.state().ui_scale, 1.0);
+        h.ctx.set_zoom_factor(0.85);
+        h.run_steps(3);
+        assert_eq!(h.state().ui_scale, 0.85);
+        assert_eq!(h.ctx.zoom_factor(), 0.85);
+    }
+
+    #[test]
+    fn a_new_academic_year_archives_last_years_students_and_moves_the_dates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let s = session(&mut h);
+        s.db.settings.sem1_start = Some(start);
+        let advisee = Student { name: "Last Year".into(), advisee: Some(AdviseeRecord::default()), ..Default::default() };
+        let phd = Student { name: "Carries On".into(), phd: Some(ResearchGroup::Phd.new_record()), ..Default::default() };
+        let (advisee_id, phd_id) = (advisee.id, phd.id);
+        s.db.students.extend([advisee, phd]);
+        s.selected = Some(advisee_id);
+        s.view = View::Settings;
+        h.key_press(egui::Key::F20);
+        wait_until(&mut h, "saved", all_saved);
+
+        h.get_by_label("Start new academic year…").click();
+        // The dialog takes a few frames to grow to its height.
+        h.run_steps(8);
+        assert!(h.query_by_label("Start a new academic year").is_some());
+        assert!(h.query_by_label("Studies advisees (1)").is_some());
+        shot(&mut h, "34_new_academic_year");
+        h.get_by_label("Start 2027/28").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Start a new academic year").is_none());
+        assert!(h.query_by_label_contains("Started 2027/28 – archived 1 student").is_some());
+
+        let s = session(&mut h);
+        assert_eq!(s.db.settings.academic_year, "2027/28");
+        assert_eq!(s.db.settings.sem1_start, Some(start + Days::weeks(52)));
+        assert!(s.db.student(advisee_id).unwrap().archived);
+        assert!(!s.db.student(phd_id).unwrap().archived, "research students carry on");
+        assert!(s.selected.is_none(), "the archived student's details close");
+        wait_until(&mut h, "saved", all_saved);
+        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.academic_year, "2027/28");
+        let bak = dir.path().join("data.svt.bak");
+        assert_eq!(storage::read_database(&bak, PASSWORD, None).unwrap().settings.academic_year, "2026/27", "the year before is the .bak");
+    }
+
+    #[test]
+    fn deleting_last_years_students_needs_confirming() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let s = session(&mut h);
+        s.db.students.push(Student { name: "Gone".into(), placement: Some(PlacementRecord::default()), ..Default::default() });
+        s.view = View::Settings;
+        h.run_steps(2);
+        h.get_by_label("Start new academic year…").click();
+        h.run_steps(8);
+        h.get_by_label("Delete them").click();
+        h.run_steps(4);
+        let delete = h.get_by_label("Delete 1 student and start 2027/28");
+        assert!(delete.accesskit_node().is_disabled(), "not before confirming");
+        h.get_by_label("I understand that deleted students can't be brought back").click();
+        h.run_steps(4);
+        h.get_by_label("Delete 1 student and start 2027/28").click();
+        h.run_steps(3);
+        assert!(session(&mut h).db.students.is_empty());
+    }
+
+    #[test]
+    fn save_and_quit_saves_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        session(&mut h).db.settings.manual_save = true;
+        h.key_press(egui::Key::F20);
+        wait_until(&mut h, "the setting saved", all_saved);
+        session(&mut h).db.settings.my_name = "Keep".into();
+        request_close(&mut h);
+        h.get_by_label("Save and quit").click();
+        wait_until(&mut h, "ready to quit", |app| {
+            matches!(&app.screen, Screen::Unlocked(s) if s.ready_to_leave() == Some(Leave::Quit))
+        });
+        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Keep");
     }
 
     #[test]
@@ -2685,7 +3128,7 @@ mod ui_tests {
         let path = dir.path().join("data.svt");
         let mut h = create_and_unlock(&path, false);
         session(&mut h).view = View::Settings;
-        h.set_size(egui::vec2(1360.0, 3000.0));
+        h.set_size(egui::vec2(1360.0, 3600.0));
         h.run_steps(3);
         let fields: Vec<_> = h.get_all_by_role(AkRole::PasswordInput).collect();
         for (field, text) in fields.iter().zip([PASSWORD, NEW, NEW]) {
@@ -2761,10 +3204,36 @@ mod ui_tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"someone else's version", "not overwritten");
         assert!(h.query_by_label("Changed somewhere else").is_some());
 
+        // Offered: save manually from now on.
+        h.get_by_label("Save only when I click Save (manual saving)").click();
+        h.run_steps(1);
         h.get_by_label("Save my version").click();
         h.run_steps(2);
-        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Mine");
+        let saved = storage::read_database(&path, PASSWORD, None).unwrap();
+        assert_eq!(saved.settings.my_name, "Mine");
+        assert!(saved.settings.manual_save, "switched, and saved with it");
+        assert!(session(&mut h).dirty_since.is_none());
         assert_eq!(std::fs::read(dir.path().join("data.svt.bak")).unwrap(), b"someone else's version");
+    }
+
+    #[test]
+    fn an_earlier_save_put_back_by_a_sync_service_is_saved_over_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let first = std::fs::read(&path).unwrap();
+        session(&mut h).db.settings.my_name = "Second".into();
+        h.key_press(egui::Key::F20);
+        wait_until(&mut h, "saved", all_saved);
+
+        std::fs::write(&path, &first).unwrap();
+        session(&mut h).db.settings.my_name = "Third".into();
+        h.key_press(egui::Key::F20);
+        wait_until(&mut h, "saved again", all_saved);
+        h.run_steps(2);
+        assert_eq!(storage::read_database(&path, PASSWORD, None).unwrap().settings.my_name, "Third");
+        assert!(h.query_by_label("Changed somewhere else").is_none());
+        assert!(h.query_by_label_contains("had put back an earlier save").is_some());
     }
 
     #[test]
@@ -2948,10 +3417,9 @@ mod ui_tests {
         h.get_by_label_contains(&suggested.format("%a %d %b %Y").to_string()).click();
         h.run_steps(2);
         shot(&mut h, "14_postpone_dialog");
-        h.get_by_label(">").click();
-        h.run_steps(1);
-        h.get_by_label("Save").click();
-        h.run_steps(1);
+        // A click on the day sets it and closes the calendar.
+        h.get_by_label(&(suggested + Days::days(1)).format("%a %d %b %Y").to_string()).click();
+        h.run_steps(2);
         h.get_by_label("Postpone").click();
         h.run_steps(2);
         let late = meeting(&mut h, "Late Student");
@@ -4671,9 +5139,9 @@ mod ui_tests {
         let date = crate::ui::widgets::today().format("%a %d %b %Y").to_string();
         h.get_all_by_label_contains(&date).next().unwrap().click();
         h.run_steps(3);
-        assert!(h.query_by_label("Save").is_some(), "picker open");
+        assert!(h.query_by_label(&date).is_some(), "picker open: its days are labelled with the date");
         press(&mut h);
-        assert!(h.query_by_label("Save").is_none(), "picker closed");
+        assert!(h.query_by_label(&date).is_none(), "picker closed");
         assert!(open(&mut h), "the student stays open");
 
         // A dialog: Esc closes it first.
@@ -4702,14 +5170,62 @@ mod ui_tests {
         assert!(!open(&mut h));
     }
 
-    /// Opens the date picker showing `date`, moves it a day on, and saves.
+    /// Opens the date picker showing `date` and clicks the next day.
     fn pick_next_day(h: &mut Harness<'_, SupervisorApp>, date: chrono::NaiveDate) {
         h.get_all_by_label_contains(&date.format("%a %d %b %Y").to_string()).next().unwrap().click();
         h.run_steps(3);
-        h.get_by_label(">").click();
+        h.get_by_label(&(date + Days::days(1)).format("%a %d %b %Y").to_string()).click();
         h.run_steps(3);
-        h.get_by_label("Save").click();
+    }
+
+    #[test]
+    fn a_day_clicked_in_the_date_picker_is_set_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let start = chrono::NaiveDate::from_ymd_opt(2027, 1, 30).unwrap();
+        session(&mut h).db.settings.sem1_start = Some(start);
+        session(&mut h).view = View::Settings;
         h.run_steps(3);
+        let label = |d: chrono::NaiveDate| d.format("%a %d %b %Y").to_string();
+        let field = format!("{} {}", icons::CALENDAR_BLANK, label(start));
+        h.get_by_label(&field).click();
+        h.run_steps(3);
+        shot(&mut h, "33_date_picker");
+
+        // Moving through the months keeps it open and changes nothing.
+        h.get_by_label("›").click();
+        h.run_steps(2);
+        let in_february = chrono::NaiveDate::from_ymd_opt(2027, 2, 15).unwrap();
+        assert!(h.query_by_label(&label(in_february)).is_some());
+        assert_eq!(session(&mut h).db.settings.sem1_start, Some(start));
+
+        // One click on a day sets it and closes the calendar.
+        h.get_by_label(&label(in_february)).click();
+        h.run_steps(3);
+        assert_eq!(session(&mut h).db.settings.sem1_start, Some(in_february));
+        assert!(h.query_by_label(&label(in_february)).is_none(), "closed");
+
+        // Clicking elsewhere just closes it.
+        let field = format!("{} {}", icons::CALENDAR_BLANK, label(in_february));
+        h.get_by_label(&field).click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Today").is_some());
+        h.get_by_label("Academic year").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Today").is_none());
+        assert_eq!(session(&mut h).db.settings.sem1_start, Some(in_february));
+
+        // Opening it again shows the date's month, not the one last looked at.
+        h.get_by_label(&field).click();
+        h.run_steps(3);
+        h.get_by_label("›").click();
+        h.run_steps(2);
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        h.get_by_label(&field).click();
+        h.run_steps(3);
+        assert!(h.query_by_label("February 2027").is_some());
     }
 
     #[test]

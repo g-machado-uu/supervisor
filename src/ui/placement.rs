@@ -1,12 +1,48 @@
 //! Placement section: company details and the two visits.
 
-use egui::Ui;
+use egui::{RichText, Ui};
 
 use uuid::Uuid;
 
 use crate::model::{PlacementRecord, ReplyStatus, Settings, Timetable, VisitMode, visit_uid};
 use crate::ui::student_form::Shown;
 use crate::ui::{fyp, icons, theme, widgets};
+
+/// The placement module, and whether they are enrolled on it.
+fn placement_module(ui: &mut Ui, p: &mut PlacementRecord, settings: &Settings) {
+    let modules: Vec<_> = settings.placement_modules().collect();
+    ui.label("Placement module");
+    let label = |m: &crate::model::Module| format!("{} – {}", m.code, m.name);
+    match modules.as_slice() {
+        [] => {
+            ui.label(
+                RichText::new("None set up – add it in Settings › Modules & coursework, ticking Placement")
+                    .italics()
+                    .color(theme::muted(ui)),
+            );
+        }
+        [only] => {
+            ui.label(label(only));
+        }
+        _ => {
+            let current = p.placement_module(settings).map_or_else(|| "Choose…".to_string(), label);
+            egui::ComboBox::from_id_salt("placement-module")
+                .selected_text(current)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for m in &modules {
+                        ui.selectable_value(&mut p.module, Some(m.id), label(m));
+                    }
+                });
+        }
+    }
+    ui.end_row();
+    if !modules.is_empty() {
+        ui.label("Enrolled on it");
+        widgets::tri_state(ui, &mut p.enrolled);
+        ui.end_row();
+    }
+}
 
 /// Returns the visit to send, if asked.
 pub fn show(
@@ -32,6 +68,7 @@ pub fn show(
         ui.label("Line manager email");
         widgets::text_field(ui, &mut p.line_manager_email, "manager@company.com");
         ui.end_row();
+        placement_module(ui, p, settings);
         // Placements have no second marker; kept only for what older versions stored.
         if !p.second_marker_name.trim().is_empty() || !p.second_marker_email.trim().is_empty() {
             ui.label("Second marker");

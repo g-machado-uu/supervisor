@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use egui::{RichText, Ui};
 use zeroize::Zeroizing;
 
-use crate::model::{BrLevel, BrRule, CourseworkTemplate, Markers, Module, Programme, Semester, Settings, default_br_rules};
+use crate::model::{
+    BrLevel, BrRule, CourseworkTemplate, Markers, Module, PLACEMENT_MODULE, Programme, Semester, Settings, default_br_rules,
+};
 use crate::storage;
 use crate::ui::{icons, theme, widgets};
 
@@ -64,6 +66,8 @@ pub enum SettingsAction {
     ChooseBackupFolder,
     BackupNow,
     StopBackup,
+    /// Start a new academic year, which asks about last year's students and dates.
+    NewYear,
 }
 
 /// Choices for locking after a while without use (minutes; 0 = never).
@@ -94,7 +98,16 @@ pub fn show(
         theme::card(ui, "Academic year", |ui| {
             widgets::form_grid(ui, "year-grid", |ui| {
                 ui.label("Academic year");
-                ui.add(egui::TextEdit::singleline(&mut settings.academic_year).desired_width(120.0));
+                ui.horizontal(|ui| {
+                    ui.label(theme::semibold(&settings.academic_year));
+                    if ui
+                        .button("Start new academic year…")
+                        .on_hover_text("Archive last year's students and set this year's dates")
+                        .clicked()
+                    {
+                        action = SettingsAction::NewYear;
+                    }
+                });
                 ui.end_row();
                 for (sem, label) in [(Semester::S1, "Semester 1"), (Semester::S2, "Semester 2")] {
                     let (start, end) = match sem {
@@ -128,6 +141,9 @@ pub fn show(
                     ui.selectable_value(&mut settings.dark_mode, false, format!("{} Light", icons::SUN));
                     ui.selectable_value(&mut settings.dark_mode, true, format!("{} Dark", icons::MOON));
                 });
+                ui.end_row();
+                ui.label("Size");
+                ui_scale_slider(ui);
                 ui.end_row();
             });
             ui.label(
@@ -174,6 +190,37 @@ pub fn show(
             if ui.button("➕ Add module").clicked() {
                 settings.modules.push(Module::default());
             }
+        });
+
+        ui.add_space(8.0);
+        theme::card(ui, "Marking deadlines", |ui| {
+            widgets::form_grid(ui, "marking-deadlines-grid", |ui| {
+                ui.label("Remind me");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut settings.marking_reminder_days).range(0..=30));
+                    ui.label(if settings.marking_reminder_days == 1 { "day before marks are due" } else { "days before marks are due" });
+                });
+                ui.end_row();
+                ui.label("MSc dissertations due");
+                widgets::opt_date(ui, "msc-mark-by", &mut settings.msc_mark_by);
+                ui.end_row();
+                ui.label("Placement reports due");
+                widgets::opt_date(ui, "placement-report-mark-by", &mut settings.placement_report_mark_by);
+                ui.end_row();
+            });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "The dashboard reminds you of work you haven't marked yet: your project students' once it is \
+                         submitted, and that of the students you mark without supervising them. When the marks of each \
+                         coursework are due is set with the module, under Modules & coursework. The dates above are for \
+                         MSc dissertations and placement reports; a student's own date can be set in their Marking section.",
+                    )
+                    .small()
+                    .color(theme::muted(ui)),
+                )
+                .wrap_mode(egui::TextWrapMode::Wrap),
+            );
         });
 
         ui.add_space(8.0);
@@ -299,11 +346,29 @@ pub fn show(
                         }
                     });
                 ui.end_row();
+                ui.label("Save changes");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut settings.manual_save, false, "Automatically");
+                    ui.selectable_value(&mut settings.manual_save, true, "Only when I click Save");
+                });
+                ui.end_row();
             });
             ui.label(
                 RichText::new("Locking saves your changes and closes the data; your password opens it again.")
                     .small()
                     .color(theme::muted(ui)),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Manual saving suits a data file in a synced folder (OneDrive, Dropbox) whose sync service keeps \
+                         it from saving, with “Changed somewhere else”. Save with Ctrl+S or the Save button at the bottom \
+                         of the sidebar. Locking still saves, and closing the window asks before leaving changes unsaved.",
+                    )
+                    .small()
+                    .color(theme::muted(ui)),
+                )
+                .wrap_mode(egui::TextWrapMode::Wrap),
             );
             ui.add_space(6.0);
             ui.label(RichText::new("Change password").strong());
@@ -480,6 +545,34 @@ fn backup_card(ui: &mut Ui, copy: Option<&storage::BackupCopy>, message: &Option
     action
 }
 
+/// The size of everything on screen, kept on this computer only. Applied
+/// when the slider is let go, so the slider doesn't move under the pointer.
+fn ui_scale_slider(ui: &mut Ui) {
+    let ctx = ui.ctx().clone();
+    let id = egui::Id::unique("ui-scale-dragging");
+    let current = ctx.zoom_factor() * 100.0;
+    let mut percent = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(current);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().slider_width = 220.0;
+        let (min, max) = storage::UI_SCALE;
+        let slider = egui::Slider::new(&mut percent, min * 100.0..=max * 100.0).step_by(5.0).show_value(false);
+        let resp = ui.add(slider).on_hover_text("Ctrl + and Ctrl − change it too");
+        if resp.dragged() {
+            ui.data_mut(|d| d.insert_temp(id, percent));
+        } else {
+            ui.data_mut(|d| d.remove::<f32>(id));
+            if resp.drag_stopped() || resp.changed() {
+                ctx.set_zoom_factor(percent / 100.0);
+            }
+        }
+        ui.label(format!("{percent:.0}%"));
+        if (current - 100.0).abs() > 0.5 && ui.small_button("Reset").clicked() {
+            ctx.set_zoom_factor(1.0);
+        }
+        ui.label(RichText::new("on this computer").small().color(theme::muted(ui)));
+    });
+}
+
 /// Returns true if the module should be removed.
 fn module_editor(
     ui: &mut Ui,
@@ -518,9 +611,29 @@ fn module_editor(
                     }
                 }
             }
+            ui.separator();
+            let mut placement = module.applies_to.iter().any(|id| id == PLACEMENT_MODULE);
+            if ui
+                .checkbox(&mut placement, "Placement")
+                .on_hover_text("The placement module: placement students are checked for being enrolled on it")
+                .changed()
+            {
+                if placement {
+                    module.applies_to.push(PLACEMENT_MODULE.into());
+                } else {
+                    module.applies_to.retain(|id| id != PLACEMENT_MODULE);
+                }
+            }
         });
         ui.end_row();
     });
+    if module.applies_to.iter().any(|id| id == PLACEMENT_MODULE) {
+        ui.label(
+            RichText::new("Each placement student has “Enrolled on the placement module” to tick, and the dashboard reminds you until it is.")
+                .small()
+                .color(theme::muted(ui)),
+        );
+    }
 
     ui.label(RichText::new("Courseworks").strong());
     if module.courseworks.is_empty() {
@@ -583,6 +696,49 @@ fn module_editor(
         });
     if let Some(i) = remove_cw {
         module.courseworks.remove(i);
+    }
+    if !module.courseworks.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new("Marks due").strong());
+        egui::Grid::new("cw-marking-grid")
+            .num_columns(4)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                for h in ["Coursework", "Weeks after the deadline", "Or on a date", "Resolves to"] {
+                    ui.label(RichText::new(h).small().color(theme::muted(ui)));
+                }
+                ui.end_row();
+                for cw in &mut module.courseworks {
+                    ui.label(&cw.title);
+                    ui.push_id((cw.id, "mark-weeks"), |ui| {
+                        ui.horizontal(|ui| {
+                            let mut has_weeks = cw.mark_weeks.is_some();
+                            if ui.checkbox(&mut has_weeks, "").changed() {
+                                cw.mark_weeks = has_weeks.then_some(3);
+                            }
+                            if let Some(w) = &mut cw.mark_weeks {
+                                ui.add(egui::DragValue::new(w).range(0..=20).suffix(" weeks"));
+                            }
+                        });
+                    });
+                    widgets::opt_date(ui, (cw.id, "mark-by"), &mut cw.mark_by);
+                    let due = cw.resolve_deadline(semester_start);
+                    match (cw.mark_by, cw.mark_weeks, due) {
+                        (Some(by), _, _) => ui.label(widgets::fmt_date(Some(by))),
+                        (None, Some(weeks), Some(due)) => {
+                            ui.label(widgets::fmt_date(Some(due + chrono::Duration::weeks(i64::from(weeks)))))
+                        }
+                        (None, Some(_), None) => ui.label(RichText::new("once the deadline is set").color(theme::muted(ui))),
+                        (None, None, _) => ui.label(RichText::new("not set").color(theme::muted(ui))),
+                    };
+                    ui.end_row();
+                }
+            });
+        ui.label(
+            RichText::new("A student's extension moves their marking deadline on by as many days.")
+                .small()
+                .color(theme::muted(ui)),
+        );
     }
     if let Some(sum) = module.weights_off() {
         ui.colored_label(

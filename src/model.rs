@@ -179,6 +179,11 @@ pub struct CourseworkTemplate {
     pub markers: Markers,
     /// Share of the module mark, in percent, when known.
     pub weight: Option<u8>,
+    /// Marks are due this many weeks after the student's deadline.
+    pub mark_weeks: Option<u8>,
+    /// Marks are due on this date; takes precedence over `mark_weeks`. A
+    /// student's extension moves it on by as many days.
+    pub mark_by: Option<NaiveDate>,
 }
 
 impl Default for CourseworkTemplate {
@@ -190,6 +195,8 @@ impl Default for CourseworkTemplate {
             deadline: None,
             markers: Markers::Both,
             weight: None,
+            mark_weeks: None,
+            mark_by: None,
         }
     }
 }
@@ -335,6 +342,13 @@ pub fn default_programmes() -> Vec<Programme> {
 /// Teaching weeks per semester when no end of teaching is set.
 pub const TEACHING_WEEKS: i64 = 12;
 
+/// What a module's "Applies to" holds for the placement module, beside the
+/// ids of courses. Courses added in Settings get a UUID, so they can't clash.
+pub const PLACEMENT_MODULE: &str = "Placement";
+
+/// Days before marks are due that the dashboard starts to remind.
+pub const MARKING_REMINDER_DAYS: u32 = 3;
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -369,6 +383,17 @@ pub struct Settings {
     pub course_director_from: u32,
     /// From this many pending modules, the student talks to the Head of School.
     pub head_of_school_from: u32,
+    /// Remind me this many days before my marks are due.
+    pub marking_reminder_days: u32,
+    /// When marks for MSc dissertations I second-mark are due, unless a
+    /// student has their own date.
+    pub msc_mark_by: Option<NaiveDate>,
+    /// When marks for placement reports are due, unless a student has their own date.
+    pub placement_report_mark_by: Option<NaiveDate>,
+    /// Save only when asked (Save, Ctrl+S, locking), not after each change:
+    /// for a data file in a synced folder whose sync service trips over
+    /// frequent saves.
+    pub manual_save: bool,
 }
 
 impl Default for Settings {
@@ -394,6 +419,10 @@ impl Default for Settings {
             week_starts_sunday: false,
             course_director_from: 2,
             head_of_school_from: 3,
+            marking_reminder_days: MARKING_REMINDER_DAYS,
+            msc_mark_by: None,
+            placement_report_mark_by: None,
+            manual_save: false,
         }
     }
 }
@@ -548,6 +577,54 @@ impl Settings {
         status
             .and_then(|s| s.deadline_override)
             .or_else(|| self.template_deadline(module, cw))
+    }
+
+    /// When marks for one student's coursework are due: the date set, moved
+    /// on by the student's extension, or so many weeks after their deadline.
+    pub fn marking_deadline(
+        &self,
+        module: &Module,
+        cw: &CourseworkTemplate,
+        status: Option<&CwStatus>,
+    ) -> Option<NaiveDate> {
+        let due = self.effective_deadline(module, cw, status);
+        match (cw.mark_by, cw.mark_weeks) {
+            (Some(date), _) => {
+                let extension = due
+                    .zip(self.template_deadline(module, cw))
+                    .map_or(Duration::zero(), |(due, planned)| (due - planned).max(Duration::zero()));
+                Some(date + extension)
+            }
+            (None, Some(weeks)) => Some(due? + Duration::weeks(i64::from(weeks))),
+            (None, None) => None,
+        }
+    }
+
+    /// The modules placement students should be enrolled on.
+    pub fn placement_modules(&self) -> impl Iterator<Item = &Module> {
+        self.modules_for(PLACEMENT_MODULE)
+    }
+
+    /// When marks for an MSc dissertation or a placement report are due,
+    /// unless the student has their own date.
+    pub fn report_mark_by(&self, kind: MarkingKind) -> Option<NaiveDate> {
+        match kind {
+            MarkingKind::Project => None,
+            MarkingKind::Msc => self.msc_mark_by,
+            MarkingKind::Placement => self.placement_report_mark_by,
+        }
+    }
+
+    /// Whether marks due `by` need a reminder `today`: overdue once the day
+    /// has passed, pending from `marking_reminder_days` before.
+    pub fn marking_alert(&self, by: NaiveDate, today: NaiveDate) -> Option<Severity> {
+        if by < today {
+            Some(Severity::Overdue)
+        } else if by <= today + Duration::days(i64::from(self.marking_reminder_days)) {
+            Some(Severity::Pending)
+        } else {
+            None
+        }
     }
 
     /// The courseworks of a course a second marker marks (with the module
@@ -1135,6 +1212,13 @@ impl CwStatus {
         self.final_mark(markers).is_some() && !(markers == Markers::Both && self.agreed_unconfirmed)
     }
 
+    /// Whether a marker has put down their mark: marker 1 (the supervisor)
+    /// or marker 2. Anything typed counts, such as "absent".
+    pub fn has_mark(&self, first: bool) -> bool {
+        let mark = if first { &self.mark_1 } else { &self.mark_2 };
+        !mark.trim().is_empty()
+    }
+
     /// Both markers' marks, when both are numbers.
     pub fn marks(&self) -> Option<(f64, f64)> {
         Some((parse_mark(&self.mark_1)?, parse_mark(&self.mark_2)?))
@@ -1241,6 +1325,21 @@ pub struct PlacementRecord {
     pub visits: [Visit; 2],
     pub second_marker_name: String,
     pub second_marker_email: String,
+    /// Whether they are enrolled on the placement module.
+    pub enrolled: TriState,
+    /// Which placement module (`Module::id`), when there is more than one.
+    pub module: Option<Uuid>,
+}
+
+impl PlacementRecord {
+    /// The placement module they should be on: the one chosen, or the only one there is.
+    pub fn placement_module<'a>(&self, settings: &'a Settings) -> Option<&'a Module> {
+        let mut modules = settings.placement_modules();
+        match self.module.and_then(|id| settings.placement_modules().find(|m| m.id == id)) {
+            Some(module) => Some(module),
+            None => modules.next().filter(|_| modules.next().is_none()),
+        }
+    }
 }
 
 impl Default for PlacementRecord {
@@ -1259,6 +1358,8 @@ impl Default for PlacementRecord {
             ],
             second_marker_name: String::new(),
             second_marker_email: String::new(),
+            enrolled: TriState::Unknown,
+            module: None,
         }
     }
 }
@@ -1342,9 +1443,17 @@ pub struct MarkingRecord {
     pub coursework: HashMap<Uuid, CwStatus>,
     /// MSc dissertation or placement report.
     pub report: CwStatus,
+    /// When marks for the MSc dissertation or placement report are due,
+    /// when it differs from the date in Settings.
+    pub mark_by: Option<NaiveDate>,
 }
 
 impl MarkingRecord {
+    /// When marks for the MSc dissertation or placement report are due.
+    pub fn report_mark_by(&self, settings: &Settings) -> Option<NaiveDate> {
+        self.mark_by.or_else(|| settings.report_mark_by(self.kind))
+    }
+
     /// What there is to mark, and whether it is done: (done, all).
     pub fn progress(&self, settings: &Settings) -> (usize, usize) {
         if let Some((_, markers)) = self.kind.report() {
@@ -2756,6 +2865,224 @@ impl Student {
 }
 
 // ---------------------------------------------------------------------------
+// A new academic year
+// ---------------------------------------------------------------------------
+
+/// The academic year after `year`: "2026/27" gives "2027/28", "2026/2027"
+/// gives "2027/2028" and "2026-27" gives "2027-28".
+pub fn next_academic_year(year: &str) -> Option<String> {
+    let year = year.trim();
+    let split = year.find(|c: char| !c.is_ascii_digit())?;
+    let (first, rest) = year.split_at(split);
+    let sep = rest.chars().next()?;
+    let second = &rest[sep.len_utf8()..];
+    if first.len() != 4 || second.is_empty() || !second.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let start: u32 = first.parse().ok()?;
+    let end: u32 = second.parse().ok()?;
+    let width = second.len();
+    let modulo = 10u32.checked_pow(width as u32)?;
+    Some(format!("{}{sep}{:0width$}", start + 1, (end + 1) % modulo))
+}
+
+/// A kind of student whose year ends with the academic year.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum YearGroup {
+    Projects,
+    Placement,
+    Advisees,
+    Marking,
+    Research,
+}
+
+impl YearGroup {
+    pub const ALL: [YearGroup; 5] =
+        [YearGroup::Projects, YearGroup::Placement, YearGroup::Advisees, YearGroup::Marking, YearGroup::Research];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            YearGroup::Projects => "Project students",
+            YearGroup::Placement => "Placement students",
+            YearGroup::Advisees => "Studies advisees",
+            YearGroup::Marking => "Students I mark",
+            YearGroup::Research => "Research students (PhD and MSc)",
+        }
+    }
+
+    /// Whether `s` has this role.
+    pub fn has(self, s: &Student) -> bool {
+        match self {
+            YearGroup::Projects => s.fyp.is_some(),
+            YearGroup::Placement => s.placement.is_some(),
+            YearGroup::Advisees => s.advisee.is_some(),
+            YearGroup::Marking => s.marking.is_some(),
+            YearGroup::Research => s.phd.is_some(),
+        }
+    }
+
+    /// Their year ends with the academic year; research students carry on.
+    pub fn ends_with_the_year(self) -> bool {
+        self != YearGroup::Research
+    }
+}
+
+/// What to do with the fixed dates in Settings when a new year starts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FixedDates {
+    /// On by 52 weeks, so each keeps its weekday.
+    MoveOn,
+    Clear,
+    Keep,
+}
+
+/// How far dates move on into the next year: 52 weeks, keeping the weekday.
+pub const YEAR_ON: Duration = Duration::weeks(52);
+
+/// Starting a new academic year: its name and dates, and what becomes of
+/// last year's students and dates.
+#[derive(Clone, Debug)]
+pub struct NewYear {
+    pub year: String,
+    pub sem1_start: Option<NaiveDate>,
+    pub sem2_start: Option<NaiveDate>,
+    pub sem1_teaching_end: Option<NaiveDate>,
+    pub sem2_teaching_end: Option<NaiveDate>,
+    /// Students whose roles are all in these groups leave.
+    pub leaving: HashSet<YearGroup>,
+    /// They are deleted rather than archived.
+    pub delete: bool,
+    /// Students archived before are deleted too.
+    pub delete_archived: bool,
+    pub fixed_dates: FixedDates,
+}
+
+/// A fixed date in Settings, for review when a new year starts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FixedDate {
+    pub label: String,
+    pub date: NaiveDate,
+}
+
+/// What starting a new year did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YearStarted {
+    pub archived: usize,
+    pub deleted: usize,
+}
+
+impl Database {
+    /// The next year, with its dates suggested 52 weeks on from this
+    /// year's, and last year's students (but not research students) leaving.
+    pub fn new_year_plan(&self) -> NewYear {
+        let s = &self.settings;
+        let on = |d: Option<NaiveDate>| d.map(|d| d + YEAR_ON);
+        NewYear {
+            year: next_academic_year(&s.academic_year).unwrap_or_else(|| s.academic_year.clone()),
+            sem1_start: on(s.sem1_start),
+            sem2_start: on(s.sem2_start),
+            sem1_teaching_end: on(s.sem1_teaching_end),
+            sem2_teaching_end: on(s.sem2_teaching_end),
+            leaving: YearGroup::ALL.into_iter().filter(|g| g.ends_with_the_year()).collect(),
+            delete: false,
+            delete_archived: false,
+            fixed_dates: FixedDates::MoveOn,
+        }
+    }
+
+    /// The students (not yet archived) who leave with `groups`: every role
+    /// they have is in them. Also how many have one of those roles but stay
+    /// for another.
+    pub fn leaving_students(&self, groups: &HashSet<YearGroup>) -> (Vec<Uuid>, usize) {
+        let mut leaving = Vec::new();
+        let mut staying = 0;
+        for st in self.students.iter().filter(|st| !st.archived) {
+            let roles: Vec<YearGroup> = YearGroup::ALL.into_iter().filter(|g| g.has(st)).collect();
+            if roles.is_empty() || !roles.iter().any(|g| groups.contains(g)) {
+                continue;
+            }
+            if roles.iter().all(|g| groups.contains(g)) {
+                leaving.push(st.id);
+            } else {
+                staying += 1;
+            }
+        }
+        (leaving, staying)
+    }
+
+    /// Active students with a role in `group`.
+    pub fn count_in(&self, group: YearGroup) -> usize {
+        self.students.iter().filter(|st| !st.archived && group.has(st)).count()
+    }
+
+    /// The dates in Settings that don't follow the semester dates: fixed
+    /// coursework deadlines, the dates marks are due, and those of MSc
+    /// dissertations and placement reports.
+    pub fn fixed_dates(&self) -> Vec<FixedDate> {
+        let s = &self.settings;
+        let mut out = Vec::new();
+        for m in &s.modules {
+            for cw in &m.courseworks {
+                let name = format!("{} {}", m.code, cw.title);
+                if let Some(date) = cw.deadline {
+                    out.push(FixedDate { label: format!("{name}: deadline"), date });
+                }
+                if let Some(date) = cw.mark_by {
+                    out.push(FixedDate { label: format!("{name}: marks due"), date });
+                }
+            }
+        }
+        if let Some(date) = s.msc_mark_by {
+            out.push(FixedDate { label: "MSc dissertations: marks due".into(), date });
+        }
+        if let Some(date) = s.placement_report_mark_by {
+            out.push(FixedDate { label: "Placement reports: marks due".into(), date });
+        }
+        out
+    }
+
+    /// Start the year `plan` describes.
+    pub fn start_year(&mut self, plan: &NewYear) -> YearStarted {
+        let mut done = YearStarted::default();
+        let (leaving, _) = self.leaving_students(&plan.leaving);
+        let leaving: HashSet<Uuid> = leaving.into_iter().collect();
+        let before = self.students.len();
+        self.students.retain(|st| {
+            let goes = leaving.contains(&st.id) && plan.delete;
+            let old = st.archived && plan.delete_archived;
+            !(goes || old)
+        });
+        done.deleted = before - self.students.len();
+        if !plan.delete {
+            for st in self.students.iter_mut().filter(|st| leaving.contains(&st.id)) {
+                st.archived = true;
+                done.archived += 1;
+            }
+        }
+
+        let s = &mut self.settings;
+        s.academic_year = plan.year.trim().to_string();
+        s.sem1_start = plan.sem1_start;
+        s.sem2_start = plan.sem2_start;
+        s.sem1_teaching_end = plan.sem1_teaching_end;
+        s.sem2_teaching_end = plan.sem2_teaching_end;
+        let fixed = plan.fixed_dates;
+        let change = |date: &mut Option<NaiveDate>| match fixed {
+            FixedDates::MoveOn => *date = date.map(|d| d + YEAR_ON),
+            FixedDates::Clear => *date = None,
+            FixedDates::Keep => {}
+        };
+        for cw in s.modules.iter_mut().flat_map(|m| &mut m.courseworks) {
+            change(&mut cw.deadline);
+            change(&mut cw.mark_by);
+        }
+        change(&mut s.msc_mark_by);
+        change(&mut s.placement_report_mark_by);
+        done
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Database and derived views
 // ---------------------------------------------------------------------------
 
@@ -3081,6 +3408,14 @@ fn reschedule(m: &mut Meeting, planned: Option<NaiveDate>, date: NaiveDate, time
             week.time = time.filter(|t| Some(*t) != usual);
             m.set_occurrence(week);
         }
+    }
+}
+
+/// The attention message for my mark of `what`, due `by`.
+fn marking_message(what: &str, severity: Severity, by: NaiveDate) -> String {
+    match severity {
+        Severity::Overdue => format!("{what} not marked (due {by})"),
+        Severity::Pending => format!("{what} to mark by {by}"),
     }
 }
 
@@ -3861,10 +4196,53 @@ impl Database {
                                 format!("{} {} not submitted (due {due})", module.code, cw.title),
                             );
                         }
+                        // My mark, once there is work to mark.
+                        if submitted
+                            && cw.markers.supervisor()
+                            && !status.is_some_and(|st| st.has_mark(true))
+                            && let Some(by) = self.settings.marking_deadline(module, cw, status)
+                            && let Some(severity) = self.settings.marking_alert(by, today)
+                        {
+                            push(s, severity, marking_message(&format!("{} {}", module.code, cw.title), severity, by));
+                        }
+                    }
+                }
+            }
+            if let Some(m) = &s.marking {
+                // My mark is marker 2's.
+                let mut due: Vec<(String, NaiveDate)> = Vec::new();
+                if m.kind.report().is_some() {
+                    if !m.report.has_mark(false)
+                        && let Some(by) = m.report_mark_by(&self.settings)
+                    {
+                        let what = if m.kind == MarkingKind::Msc { "MSc dissertation" } else { "Placement report" };
+                        due.push((what.to_string(), by));
+                    }
+                } else {
+                    for (module, cw) in self.settings.second_marked(&m.programme) {
+                        let status = m.coursework.get(&cw.id);
+                        if !status.is_some_and(|st| st.has_mark(false))
+                            && let Some(by) = self.settings.marking_deadline(module, cw, status)
+                        {
+                            due.push((format!("{} {}", module.code, cw.title), by));
+                        }
+                    }
+                }
+                for (what, by) in due {
+                    if let Some(severity) = self.settings.marking_alert(by, today) {
+                        push(s, severity, marking_message(&what, severity, by));
                     }
                 }
             }
             if let Some(p) = &s.placement {
+                if self.settings.placement_modules().next().is_some() {
+                    let code = p.placement_module(&self.settings).map_or("the placement module".to_string(), |m| m.code.clone());
+                    match p.enrolled {
+                        TriState::Unknown => push(s, Severity::Pending, format!("check they are enrolled on {code}")),
+                        TriState::No => push(s, Severity::Overdue, format!("not enrolled on {code}")),
+                        TriState::Yes => {}
+                    }
+                }
                 for (i, v) in p.visits.iter().enumerate() {
                     if v.completed {
                         continue;
@@ -4153,6 +4531,214 @@ mod tests {
                 .repeat
                 .is_none()
         );
+        // Settings added since then take their defaults.
+        assert_eq!(db.settings.marking_reminder_days, MARKING_REMINDER_DAYS);
+        assert!(!db.settings.manual_save);
+    }
+
+    #[test]
+    fn the_next_academic_year_follows_the_way_it_is_written() {
+        assert_eq!(next_academic_year("2026/27").as_deref(), Some("2027/28"));
+        assert_eq!(next_academic_year("2026/2027").as_deref(), Some("2027/2028"));
+        assert_eq!(next_academic_year(" 2026-27 ").as_deref(), Some("2027-28"));
+        assert_eq!(next_academic_year("2099/00").as_deref(), Some("2100/01"));
+        assert_eq!(next_academic_year("2099/2100").as_deref(), Some("2100/2101"));
+        assert_eq!(next_academic_year("Year 1"), None);
+        assert_eq!(next_academic_year(""), None);
+    }
+
+    #[test]
+    fn a_new_year_lets_last_years_students_go_and_moves_the_dates_on() {
+        let mut db = Database { settings: teaching(), ..Default::default() };
+        db.settings.modules[0].courseworks[0].mark_by = Some(d(2026, 12, 1));
+        db.settings.msc_mark_by = Some(d(2027, 9, 10));
+        let student = |name: &str| Student { name: name.into(), ..Default::default() };
+        let advisee = Student { advisee: Some(AdviseeRecord::default()), ..student("Advisee") };
+        let phd = Student { phd: Some(ResearchGroup::Phd.new_record()), ..student("PhD") };
+        let both = Student { advisee: Some(AdviseeRecord::default()), phd: Some(ResearchGroup::Phd.new_record()), ..student("Both") };
+        let old = Student { archived: true, fyp: Some(FypRecord::default()), ..student("Old") };
+        let no_role = student("No role");
+        db.students.extend([advisee, phd, both, old, no_role]);
+        let id = |db: &Database, name: &str| db.students.iter().find(|s| s.name == name).map(|s| s.id);
+
+        let mut plan = db.new_year_plan();
+        assert_eq!(plan.year, "2027/28");
+        assert_eq!(plan.sem1_start, Some(d(2027, 9, 20)), "52 weeks on: a Monday again");
+        assert!(!plan.leaving.contains(&YearGroup::Research));
+        let (leaving, staying) = db.leaving_students(&plan.leaving);
+        assert_eq!(leaving, vec![id(&db, "Advisee").unwrap()]);
+        assert_eq!(staying, 1, "Both stays for their research");
+        assert_eq!(db.fixed_dates().len(), 2);
+
+        let mut archived = db.clone();
+        let done = archived.start_year(&plan);
+        assert_eq!(done, YearStarted { archived: 1, deleted: 0 });
+        let s = &archived.settings;
+        assert_eq!((s.academic_year.as_str(), s.sem2_start), ("2027/28", Some(d(2028, 1, 24))));
+        assert_eq!(s.modules[0].courseworks[0].mark_by, Some(d(2027, 11, 30)));
+        assert_eq!(s.msc_mark_by, Some(d(2028, 9, 8)));
+        let archived_names: Vec<_> = archived.students.iter().filter(|s| s.archived).map(|s| s.name.as_str()).collect();
+        assert_eq!(archived_names, ["Advisee", "Old"]);
+
+        plan.delete = true;
+        plan.delete_archived = true;
+        plan.fixed_dates = FixedDates::Clear;
+        let done = db.start_year(&plan);
+        assert_eq!(done, YearStarted { archived: 0, deleted: 2 });
+        let names: Vec<_> = db.students.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["PhD", "Both", "No role"]);
+        assert!(db.fixed_dates().is_empty());
+    }
+
+    #[test]
+    fn marks_are_due_weeks_after_the_deadline_or_on_a_date_moved_by_an_extension() {
+        let settings = teaching();
+        let module = settings.modules[0].clone();
+        let mut cw = module.courseworks[0].clone(); // Week 8: 9 Nov
+        assert_eq!(settings.marking_deadline(&module, &cw, None), None, "not set");
+
+        cw.mark_weeks = Some(3);
+        assert_eq!(settings.marking_deadline(&module, &cw, None), Some(d(2026, 11, 30)));
+        let extension = CwStatus {
+            deadline_override: Some(d(2026, 11, 16)),
+            ..Default::default()
+        };
+        assert_eq!(settings.marking_deadline(&module, &cw, Some(&extension)), Some(d(2026, 12, 7)));
+
+        // A date wins, and moves on with the extension.
+        cw.mark_by = Some(d(2026, 12, 1));
+        assert_eq!(settings.marking_deadline(&module, &cw, None), Some(d(2026, 12, 1)));
+        assert_eq!(settings.marking_deadline(&module, &cw, Some(&extension)), Some(d(2026, 12, 8)));
+        // With no deadline to measure an extension from, the date stands.
+        let no_semester = Settings::default();
+        assert_eq!(no_semester.marking_deadline(&module, &cw, Some(&extension)), Some(d(2026, 12, 1)));
+    }
+
+    /// The attention items about marking, as (severity, detail).
+    fn marking_items(db: &Database, today: NaiveDate) -> Vec<(Severity, String)> {
+        db.attention(today)
+            .into_iter()
+            .filter(|a| a.detail.contains("mark"))
+            .map(|a| (a.severity, a.detail))
+            .collect()
+    }
+
+    #[test]
+    fn work_i_have_not_marked_is_flagged_as_marks_fall_due() {
+        let mut db = Database { settings: teaching(), ..Default::default() };
+        db.settings.modules[0].courseworks[0].mark_weeks = Some(3); // MEC526 CW1: marks due 30 Nov
+        let cw = db.settings.modules[0].courseworks[0].id;
+        let submitted = CwStatus {
+            submitted: true,
+            ..Default::default()
+        };
+        db.students.push(Student {
+            name: "Ann".into(),
+            fyp: Some(FypRecord {
+                programme: "BEng".into(),
+                initial_contact: true,
+                coursework: HashMap::from([(cw, submitted)]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert!(marking_items(&db, d(2026, 11, 26)).is_empty(), "4 days before");
+        assert_eq!(
+            marking_items(&db, d(2026, 11, 27)),
+            vec![(Severity::Pending, "MEC526 Coursework 1 to mark by 2026-11-30".into())]
+        );
+        assert_eq!(
+            marking_items(&db, d(2026, 12, 1)),
+            vec![(Severity::Overdue, "MEC526 Coursework 1 not marked (due 2026-11-30)".into())]
+        );
+        db.settings.marking_reminder_days = 10;
+        assert_eq!(marking_items(&db, d(2026, 11, 20)).len(), 1, "reminded earlier");
+
+        // Marked, or nothing handed in to mark: nothing to say about marking.
+        let status = db.students[0].fyp.as_mut().unwrap().coursework.get_mut(&cw).unwrap();
+        status.mark_1 = "65".into();
+        assert!(marking_items(&db, d(2026, 12, 1)).is_empty());
+        let status = db.students[0].fyp.as_mut().unwrap().coursework.get_mut(&cw).unwrap();
+        status.mark_1.clear();
+        status.submitted = false;
+        assert!(marking_items(&db, d(2026, 12, 1)).is_empty());
+    }
+
+    #[test]
+    fn work_i_mark_for_other_supervisors_is_flagged_too() {
+        let mut db = Database { settings: teaching(), ..Default::default() };
+        db.settings.msc_mark_by = Some(d(2026, 12, 10));
+        let msc = Student {
+            name: "Mo".into(),
+            marking: Some(MarkingRecord { kind: MarkingKind::Msc, ..Default::default() }),
+            ..Default::default()
+        };
+        db.students.push(msc);
+        assert_eq!(marking_items(&db, d(2026, 12, 8)), vec![(Severity::Pending, "MSc dissertation to mark by 2026-12-10".into())]);
+        // Their own date wins over the one in Settings.
+        db.students[0].marking.as_mut().unwrap().mark_by = Some(d(2027, 1, 15));
+        assert!(marking_items(&db, d(2026, 12, 11)).is_empty());
+        // My mark is marker 2's.
+        db.students[0].marking.as_mut().unwrap().report.mark_2 = "70".into();
+        assert!(marking_items(&db, d(2027, 1, 16)).is_empty());
+
+        // A project: the courseworks the second marker marks.
+        let dissertation = db.settings.modules[1].courseworks[1].id; // MEC528 Dissertation
+        db.settings.modules[1].courseworks[1].mark_by = Some(d(2027, 5, 14));
+        db.students[0].marking = Some(MarkingRecord {
+            kind: MarkingKind::Project,
+            programme: "BEng".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            marking_items(&db, d(2027, 5, 12)),
+            vec![(Severity::Pending, "MEC528 Dissertation to mark by 2027-05-14".into())]
+        );
+        let marked = CwStatus { mark_2: "58".into(), ..Default::default() };
+        db.students[0].marking.as_mut().unwrap().coursework.insert(dissertation, marked);
+        assert!(marking_items(&db, d(2027, 5, 15)).is_empty());
+    }
+
+    #[test]
+    fn placement_students_are_checked_against_the_placement_module() {
+        let mut db = Database::default();
+        db.students.push(Student {
+            name: "Pat".into(),
+            placement: Some(PlacementRecord::default()),
+            ..Default::default()
+        });
+        let enrolment = |db: &Database| -> Vec<(Severity, String)> {
+            db.attention(d(2026, 10, 1))
+                .into_iter()
+                .filter(|a| a.detail.contains("enrolled"))
+                .map(|a| (a.severity, a.detail))
+                .collect()
+        };
+        assert!(enrolment(&db).is_empty(), "no placement module to check against");
+
+        let placement = |code: &str| Module {
+            code: code.into(),
+            name: "Placement".into(),
+            applies_to: vec![PLACEMENT_MODULE.into()],
+            ..Default::default()
+        };
+        db.settings.modules.push(placement("EEE501"));
+        assert_eq!(enrolment(&db), vec![(Severity::Pending, "check they are enrolled on EEE501".into())]);
+        assert_eq!(db.settings.modules_for("BEng").filter(|m| m.code == "EEE501").count(), 0, "not a course's module");
+        let p = || PlacementRecord { enrolled: TriState::No, ..Default::default() };
+        db.students[0].placement = Some(p());
+        assert_eq!(enrolment(&db), vec![(Severity::Overdue, "not enrolled on EEE501".into())]);
+        db.students[0].placement.as_mut().unwrap().enrolled = TriState::Yes;
+        assert!(enrolment(&db).is_empty());
+
+        // With two, the student's own is the one chosen.
+        db.settings.modules.push(placement("EEE502"));
+        let second = db.settings.modules.last().unwrap().id;
+        db.students[0].placement = Some(p());
+        assert_eq!(enrolment(&db), vec![(Severity::Overdue, "not enrolled on the placement module".into())]);
+        db.students[0].placement.as_mut().unwrap().module = Some(second);
+        assert_eq!(enrolment(&db), vec![(Severity::Overdue, "not enrolled on EEE502".into())]);
     }
 
     #[test]

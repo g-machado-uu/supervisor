@@ -35,6 +35,8 @@ const ID_LEN: usize = 32;
 const V1_HEADER_LEN: usize = 4 + 1 + 12 + SALT_LEN;
 const V2_HEADER_LEN: usize = V1_HEADER_LEN + 1 + ID_LEN;
 const FLAG_KEY_FILE: u8 = 1;
+/// How many versions of the file a session remembers having had.
+const SEEN_VERSIONS: usize = 256;
 const KEY_FILE_LEN: usize = 32;
 const KEY_ID_LABEL: &[u8] = b"Supervisor key file id v1";
 
@@ -157,6 +159,9 @@ pub struct Vault {
     seal: Seal,
     /// The file as last read or written, to notice other writers.
     on_disk: Option<OnDisk>,
+    /// Every version of the file read or written this session (hashes),
+    /// newest last. A sync service may put one of them back; see [`Written::restored`].
+    seen: Vec<[u8; 32]>,
     /// The `.bak` was written this session, so it holds the file as it was
     /// when unlocked; later saves leave it alone.
     backed_up: bool,
@@ -434,6 +439,7 @@ impl Vault {
             path: path.to_path_buf(),
             seal: Seal::new(password, None, params)?,
             on_disk: None,
+            seen: Vec::new(),
             backed_up: false,
             copy: None,
         };
@@ -453,6 +459,7 @@ impl Vault {
             path: path.to_path_buf(),
             seal,
             on_disk: Some(OnDisk::of(&bytes, &meta)),
+            seen: vec![hash(&bytes)],
             backed_up: false,
             copy: BackupCopy::remembered(path),
             _lock: lock,
@@ -498,6 +505,7 @@ impl Vault {
         Writer {
             path: self.path.clone(),
             on_disk: self.on_disk,
+            seen: self.seen.clone(),
             backup: !self.backed_up,
             copy: self.copy.as_ref().map(|c| c.file.clone()),
         }
@@ -556,9 +564,18 @@ impl Vault {
 
     /// Record a save finished by a [`Writer`].
     pub fn saved(&mut self, written: Written) {
-        self.on_disk = Some(written.on_disk);
+        self.note_written(written.on_disk);
         self.backed_up |= written.backed_up;
         self.note_copy(written.copied);
+    }
+
+    fn note_written(&mut self, on_disk: OnDisk) {
+        self.on_disk = Some(on_disk);
+        self.seen.retain(|h| *h != on_disk.hash);
+        self.seen.push(on_disk.hash);
+        if self.seen.len() > SEEN_VERSIONS {
+            self.seen.remove(0);
+        }
     }
 
     fn note_copy(&mut self, written: Option<Result<SystemTime, String>>) {
@@ -636,7 +653,7 @@ impl Vault {
         let bytes = sealed(&next, db)?;
         // The copy is re-sealed here too, so the old password stops opening it.
         let written = self.writer().put(&bytes, true, false)?;
-        self.on_disk = Some(written.on_disk);
+        self.note_written(written.on_disk);
         self.note_copy(written.copied);
         self.seal = next;
         // The backup is still sealed the old way; don't leave it behind. The
@@ -696,6 +713,9 @@ fn sealed(seal: &Seal, db: &Database) -> Result<Vec<u8>> {
 pub struct Writer {
     path: PathBuf,
     on_disk: Option<OnDisk>,
+    /// Versions of the file this session already has: finding one of them
+    /// on disk is no one else's work.
+    seen: Vec<[u8; 32]>,
     /// Keep the file as it is now as the `.bak` first.
     backup: bool,
     /// Also write the same bytes here, once the data file is safely written.
@@ -706,6 +726,9 @@ pub struct Writer {
 pub struct Written {
     on_disk: OnDisk,
     backed_up: bool,
+    /// The file on disk had gone back to an earlier version from this
+    /// session (a sync service restoring it), and was saved over.
+    pub restored: bool,
     /// How writing the copy went, if there is one.
     copied: Option<Result<SystemTime, String>>,
 }
@@ -725,14 +748,22 @@ impl Writer {
         }
         let reading = || format!("reading {}", self.path.display());
         let mut backed_up = false;
+        let mut restored = false;
         match fs::metadata(&self.path) {
             Ok(meta) => {
                 // Same size and time as last written: unchanged, no need to read it.
                 let unchanged = self.on_disk.is_some_and(|d| d.same_size_and_time(&meta));
                 if backup || (check && !unchanged) {
                     let old = fs::read(&self.path).with_context(reading)?;
-                    if check && Some(hash(&old)) != self.on_disk.map(|d| d.hash) {
-                        return Err(VaultError::ChangedOnDisk.into());
+                    let old_hash = hash(&old);
+                    if check && Some(old_hash) != self.on_disk.map(|d| d.hash) {
+                        // One of this session's own earlier versions, put back by a
+                        // sync service (OneDrive, Dropbox…): everything in it is
+                        // in this save too, so writing over it loses nothing.
+                        if !self.seen.contains(&old_hash) {
+                            return Err(VaultError::ChangedOnDisk.into());
+                        }
+                        restored = true;
                     }
                     if backup {
                         write_atomic(&sibling(&self.path, "bak"), &old).context("writing backup")?;
@@ -748,6 +779,7 @@ impl Writer {
         Ok(Written {
             on_disk: OnDisk::of(bytes, &meta),
             backed_up,
+            restored,
             copied: self.copy.as_deref().map(|file| write_copy(file, bytes)),
         })
     }
@@ -1001,6 +1033,40 @@ pub fn remember_path(path: &Path) {
     }
 }
 
+/// The smallest and largest size of the interface, as a zoom factor.
+pub const UI_SCALE: (f32, f32) = (0.6, 2.0);
+
+/// Non-secret preference file with the size of the interface on this
+/// computer: each screen may want its own, so it isn't in the data file.
+fn ui_scale_file() -> Option<PathBuf> {
+    project_dirs().map(|d| d.config_dir().join("ui_scale.txt"))
+}
+
+fn read_ui_scale(file: &Path) -> Option<f32> {
+    let scale: f32 = fs::read_to_string(file).ok()?.trim().parse().ok()?;
+    scale.is_finite().then(|| scale.clamp(UI_SCALE.0, UI_SCALE.1))
+}
+
+/// The size of the interface chosen on this computer, if one was.
+pub fn ui_scale() -> Option<f32> {
+    if cfg!(test) {
+        return None;
+    }
+    read_ui_scale(&ui_scale_file()?)
+}
+
+pub fn remember_ui_scale(scale: f32) {
+    // Tests change the zoom; don't change the real app's.
+    if cfg!(test) {
+        return;
+    }
+    if let Some(f) = ui_scale_file()
+        && f.parent().is_none_or(|dir| create_private_dir(dir).is_ok())
+    {
+        let _ = write_atomic(&f, format!("{scale:.2}").as_bytes());
+    }
+}
+
 fn sibling(path: &Path, ext: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".");
@@ -1231,6 +1297,7 @@ mod tests {
             path: path.clone(),
             seal: Seal::new("pw", None, FAST).unwrap(),
             on_disk: Some(OnDisk::of(&fs::read(&path).unwrap(), &meta)),
+            seen: Vec::new(),
             backed_up: true,
             copy: None,
             _lock: None,
@@ -1248,6 +1315,44 @@ mod tests {
         vault.save(&db).unwrap();
         drop(vault);
         assert!(Vault::open(&path, "pw", None).is_ok(), "lock released");
+    }
+
+    #[test]
+    fn an_earlier_version_put_back_by_a_sync_service_is_saved_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut db = sample();
+        let mut vault = Vault::create_with_params(&path, "pw", &db, FAST).unwrap();
+        let first = fs::read(&path).unwrap();
+        db.students[0].name = "Second".into();
+        vault.save(&db).unwrap();
+
+        // The sync service puts back the version it last uploaded.
+        fs::write(&path, &first).unwrap();
+        db.students[0].name = "Third".into();
+        let bytes = vault.seal(&db).unwrap();
+        let written = vault.writer().write(&bytes).unwrap();
+        assert!(written.restored);
+        vault.saved(written);
+        assert_eq!(read_database(&path, "pw", None).unwrap().students[0].name, "Third");
+
+        // Its own versions only: anything else is still someone else's work.
+        fs::write(&path, b"another computer's version").unwrap();
+        assert_eq!(error_of(vault.save(&db)), Some(VaultError::ChangedOnDisk));
+        assert_eq!(fs::read(&path).unwrap(), b"another computer's version");
+    }
+
+    #[test]
+    fn ui_scale_is_read_back_and_kept_in_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ui_scale.txt");
+        assert_eq!(read_ui_scale(&file), None);
+        fs::write(&file, "0.85\n").unwrap();
+        assert_eq!(read_ui_scale(&file), Some(0.85));
+        fs::write(&file, "9").unwrap();
+        assert_eq!(read_ui_scale(&file), Some(UI_SCALE.1));
+        fs::write(&file, "nonsense").unwrap();
+        assert_eq!(read_ui_scale(&file), None);
     }
 
     #[test]

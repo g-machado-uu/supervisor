@@ -11,8 +11,9 @@ Supervisor is a desktop application for the administration of student supervisio
 - **Project supervision:** second markers, coursework deadlines derived from the teaching weeks, and marks from each marker with a suggested agreed mark. Each coursework records who marks it (the supervisor, the second marker, or both) and its weight, from which the module mark is calculated. The poster number is recorded next to the poster. Separate fields apply to SUST students.
 - **Research students:** four lists (PhD, PhD External, MSc and MSc External) with assessments, annual reports, submission, viva and reminders. External students have their own list of deadlines.
 - **Brazilian programmes:** academic and professional levels, funding bodies, standard stages, the defence committee and suggested deadlines.
-- **Placement visits:** requests, replies, the attendance of the line manager and the mark of each visit.
+- **Placement visits:** requests, replies, the attendance of the line manager and the mark of each visit. Whether each student is enrolled on the placement module is recorded too, and the dashboard reminds you until it is confirmed. The placement module is added in Settings › Modules & coursework with **Placement** ticked under *Applies to*; until there is one, Supervisor reminds you when it opens.
 - **Marking:** three lists for students whose work is marked but who are not supervised: final-year projects (BEng and MEng, as second marker: poster and dissertation, sorted by poster number), MSc dissertations (as second marker) and placement reports (single marker). Each list shows the progress of the marking and the marks still to be agreed.
+- **Marking deadlines:** each coursework can have a date when marks are due, or a number of weeks after its deadline; a student's extension moves their date on by as many days. MSc dissertations and placement reports have their own dates in Settings › Marking deadlines, and a student can have their own. The dashboard reminds you of work you haven't marked from **3 days** before marks are due (adjustable in Settings), and flags it as overdue afterwards: for your own project students once the work is submitted, and for the students you mark without supervising them.
 - **Importing students:** project, placement, advisee and marking students can be added from an Excel spreadsheet, such as the list of project allocations, the poster list, the list of placement visits or of advisees. The rows with the user's email or name as supervisor, academic visitor, mentor or second marker are selected, and another can be chosen with **Filter by**.
 - **Studies advisees:** contact, replies and meetings for each semester, together with the year of study (1st, 2nd or 4th).
 - **Modules:** a card, collapsed by default, for local advisees and project students. For each semester it records whether modules are pending from the previous semester. For each pending module it records the code, the name, the failed component (CW, EX or CW+EX) and the marks. In Semester 2 it also records whether the module was discussed with an advisee. The number of pending modules determines whether the student needs to talk to their advisor, the course director or the Head of School. These thresholds are set in Settings.
@@ -64,6 +65,8 @@ Supervisor holds personal data about students, so the protection of the data fil
 - If saving fails, for example because a network drive is disconnected, the application reports the failure. It does not lock or close until the changes are saved, unless the user chooses to discard them.
 - If the data file opened last isn't there when Supervisor starts, for example because a USB stick or network drive isn't connected, the unlock screen says so. It does not offer to create a new file in its place.
 - A data file can be open in only one Supervisor window at a time. If the file is changed elsewhere while open, for example on another computer sharing the file, the application asks before replacing that version and keeps it as the `.bak`.
+- Sync services (OneDrive, Dropbox) sometimes put back a version of the file that Supervisor saved a moment earlier. Supervisor recognises its own earlier saves and saves over them without asking, as nothing in them is lost.
+- **Manual saving:** if the file in a synced folder still keeps reporting that it was changed somewhere else, saving can be set to **Only when I click Save** (Settings › Security, or from the warning itself). Changes are then saved with **Save** at the bottom of the sidebar or `Ctrl+S`, and when the application locks. Closing the window with unsaved changes asks whether to save them first.
 
 ### Sensitive records
 
@@ -113,6 +116,16 @@ As an alternative to **Import key file…**, the backup can be copied into that 
 4. Add students with **Add student** (`Ctrl+N`), or with **Import…** (see below), and complete the remaining fields in the details panel.
 
 The keyboard button next to **Settings** (or `F1`) lists the keyboard shortcuts.
+
+### A new academic year
+
+Students change each year, so **Start new academic year…** (Settings › Academic year) sets up the next one in one step:
+
+- **Last year's students:** tick the groups whose year is over. Project, placement, advisee and marking students are ticked; research students, who carry on, are not. They are archived (hidden, and brought back with **Show archived**) or, if chosen, deleted. A student who also has a role you keep stays as they are. Students archived in earlier years can be deleted at the same time.
+- **Dates:** the semester dates are suggested 52 weeks on, so each keeps its weekday. Coursework set by teaching week follows them. Fixed dates (coursework deadlines, marking deadlines, MSc and placement report dates) are listed, and can be moved on 52 weeks, cleared or kept.
+- **Undo:** the data as it was is saved first and kept as the `.bak`, until **Save** is next clicked or the file is next unlocked.
+
+If text and controls look too large or too small on a screen, change **Size** in Settings › Academic year, or press `Ctrl +` and `Ctrl −`. The size is kept on each computer separately, so a laptop and a large monitor can each have their own.
 
 ### Importing from a spreadsheet
 

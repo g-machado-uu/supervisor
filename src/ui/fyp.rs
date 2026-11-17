@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use chrono::NaiveDate;
 use egui::{RichText, Ui};
 use uuid::Uuid;
 
@@ -157,6 +158,11 @@ pub fn show(ui: &mut Ui, fyp: &mut FypRecord, settings: &Settings, timetable: &T
                             if cw.is_poster() && !sust {
                                 poster_field(ui, &mut fyp.poster_number);
                             }
+                            if cw.markers.supervisor() {
+                                let status = fyp.coursework.get(&cw.id);
+                                let done = status.is_some_and(|st| st.has_mark(true));
+                                mark_by_note(ui, settings.marking_deadline(module, cw, status), done);
+                            }
                         });
                         edit_status(&mut fyp.coursework, cw.id, |status| {
                             if sust {
@@ -223,6 +229,15 @@ pub(crate) fn item_label(ui: &mut Ui, cw: &CourseworkTemplate) {
         ui.label(RichText::new(format!("{w}%")).small().color(theme::muted(ui)))
             .on_hover_text("Weight in the module mark");
     }
+}
+
+/// When my mark is due, beside a coursework; red once late and still to do.
+pub(crate) fn mark_by_note(ui: &mut Ui, by: Option<NaiveDate>, done: bool) {
+    let Some(by) = by else { return };
+    let late = !done && by < widgets::today();
+    let color = if late { theme::fg(ui, theme::RED) } else { theme::muted(ui) };
+    ui.label(RichText::new(format!("mark by {}", widgets::fmt_short(by))).small().color(color))
+        .on_hover_text(format!("Your mark is due {}", widgets::fmt_date(Some(by))));
 }
 
 /// The poster number, to find the poster at the session.
