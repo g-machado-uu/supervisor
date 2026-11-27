@@ -176,6 +176,8 @@ struct KeyFileSetup {
 enum OnPick {
     /// Write this calendar there, then say `done`.
     SaveIcs { text: String, done: String },
+    /// Write this file there, then say `done`.
+    SaveFile { bytes: Vec<u8>, done: String },
     ImportIcs,
     ImportSheet(crate::sheet_import::SheetKind, Category),
     BackupFolder,
@@ -442,6 +444,7 @@ impl Session {
     fn new(unlocked: Unlocked) -> Self {
         let Unlocked { vault, db, weak_password } = unlocked;
         let db_manual = db.settings.manual_save;
+        let private = db.settings.start_private;
         Self {
             db_print: storage::fingerprint(&db),
             derived: None,
@@ -463,7 +466,7 @@ impl Session {
             reveal_prompt: None,
             password_job: None,
             rar_notes: None,
-            private: false,
+            private,
             peek: None,
             hidden: HashSet::new(),
             marks_shown: None,
@@ -1168,6 +1171,11 @@ impl Session {
                         self.revealed = None;
                     }
                     DashAction::Open(id) => self.selected = Some(id),
+                    DashAction::Later(id, key, until) => {
+                        if self.db.remind_later(id, &key, until) {
+                            self.notify(ui, format!("You'll be reminded again on {}", until.format("%a %d %b")));
+                        }
+                    }
                     DashAction::Goto(cat) => self.view = View::List(cat),
                     DashAction::ExportIcs => self.export_ics(ui),
                     DashAction::Month(month) => {
@@ -1255,6 +1263,12 @@ impl Session {
                 );
                 if let ListAction::CopyEmails(ids) = &action {
                     self.copy_emails(ui, ids);
+                }
+                if action == ListAction::PosterPdf {
+                    let bytes = crate::pdf::table(&self.db.poster_table(widgets::today()));
+                    let dialog = Dialog::new().add_filter("PDF", &["pdf"]).set_file_name("posters-to-mark.pdf").save_file();
+                    let done = "Poster list saved (the PDF is not encrypted)".to_string();
+                    self.open_file_dialog(ui, dialog, OnPick::SaveFile { bytes, done });
                 }
                 if action == ListAction::Import
                     && let Some(kind) = cat.import_kind()
@@ -1355,6 +1369,10 @@ impl Session {
         let Some(path) = answer else { return };
         match then {
             OnPick::SaveIcs { text, done } => match std::fs::write(&path, text) {
+                Ok(()) => self.notify(ui, done),
+                Err(e) => self.notify(ui, format!("Saving {} failed: {e}", path.display())),
+            },
+            OnPick::SaveFile { bytes, done } => match std::fs::write(&path, bytes) {
                 Ok(()) => self.notify(ui, done),
                 Err(e) => self.notify(ui, format!("Saving {} failed: {e}", path.display())),
             },
@@ -2731,6 +2749,161 @@ mod ui_tests {
     }
 
     #[test]
+    fn a_reminder_on_the_dashboard_can_be_put_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        let today = widgets::today();
+        let due = today + Days::days(60);
+        let s = session(&mut h);
+        let mut p = ResearchGroup::PhdExternal.new_record();
+        p.set_brazilian(true);
+        p.brazil.qualification.deadline = Some(due);
+        let ana = Student { name: "Ana Souza".into(), phd: Some(p), ..Default::default() };
+        let id = ana.id;
+        s.db.students.push(ana);
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("Ana Souza – Qualifying exam due").is_some());
+
+        // The Later button opens its menu rather than the student.
+        h.set_size(egui::vec2(1360.0, 1300.0));
+        h.run_steps(2);
+        h.get_by_label(&format!("{} Later", icons::CLOCK)).click();
+        h.run_steps(3);
+        shot(&mut h, "40_remind_me_later");
+        let until = due - Days::weeks(2);
+        h.get_by_label_contains("2 weeks before the deadline").click();
+        h.run_steps(3);
+        let m = session(&mut h).db.student(id).unwrap().phd.as_ref().unwrap().brazil.qualification.clone();
+        assert_eq!(m.remind_from, Some(until));
+        assert!(h.query_by_label_contains("Qualifying exam due").is_none(), "gone until then");
+        assert!(session(&mut h).selected.is_none(), "the row wasn't opened");
+
+        // The student's details say so, and can go back to the usual reminder.
+        session(&mut h).selected = Some(id);
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("(put off)").is_some());
+        h.get_by_label(&format!("{} Usual reminder", icons::BELL)).scroll_to_me();
+        h.run_steps(6);
+        shot(&mut h, "41_reminder_put_off_in_details");
+        h.get_by_label(&format!("{} Usual reminder", icons::BELL)).click();
+        h.run_steps(3);
+        let m = session(&mut h).db.student(id).unwrap().phd.as_ref().unwrap().brazil.qualification.clone();
+        assert_eq!(m.remind_from, None);
+
+        // Clicking the item itself still opens the student.
+        session(&mut h).selected = None;
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        h.get_by_label_contains("Ana Souza – Qualifying exam due").click();
+        h.run_steps(2);
+        assert_eq!(session(&mut h).selected, Some(id));
+    }
+
+    #[test]
+    fn placement_dates_extensions_and_the_poster_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        h.set_size(egui::vec2(1360.0, 1300.0));
+        let today = widgets::today();
+        let s = session(&mut h);
+        s.db.settings.modules.push(Module {
+            code: "EEE501".into(),
+            name: "Placement".into(),
+            applies_to: vec![PLACEMENT_MODULE.into()],
+            visit_by: [Some(today + Days::days(10)), Some(today + Days::days(150))],
+            visit_mark_by: [Some(today + Days::days(17)), None],
+            ..Default::default()
+        });
+        s.db.settings.msc_mark_by = Some(today + Days::days(20));
+        let pat = Student { name: "Pat Placement".into(), placement: Some(PlacementRecord::default()), ..Default::default() };
+        let mo = Student {
+            name: "Mo Msc".into(),
+            marking: Some(MarkingRecord { kind: MarkingKind::Msc, ..Default::default() }),
+            ..Default::default()
+        };
+        let pj = Student {
+            name: "Jo Project".into(),
+            marking: Some(MarkingRecord { programme: "BEng".into(), poster_number: "4".into(), ..Default::default() }),
+            ..Default::default()
+        };
+        let (pat_id, mo_id, pj_id) = (pat.id, mo.id, pj.id);
+        s.db.students.extend([pat, mo, pj]);
+        h.key_press(egui::Key::F20);
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("Pat Placement – visit 1 to be done by").is_some(), "on the dashboard");
+
+        // The placement student: when each visit is due, and the modules card.
+        session(&mut h).selected = Some(pat_id);
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("Modules").is_some(), "placement students have their modules followed");
+        h.get_by_label(&format!("{} Placement", icons::BUILDINGS)).click();
+        h.run_steps(6);
+        assert!(h.query_all_by_label_contains("to be done by").count() >= 2, "the visit and the dashboard");
+        shot(&mut h, "43_placement_visit_dates");
+
+        // An MSc dissertation given two more weeks.
+        session(&mut h).selected = Some(mo_id);
+        h.run_steps(3);
+        h.get_by_label_contains("The student was given more time").click();
+        h.run_steps(3);
+        assert_eq!(session(&mut h).db.student(mo_id).unwrap().marking.as_ref().unwrap().extension_days, 7);
+        assert!(h.query_by_label_contains("Your mark is now due").is_some());
+        shot(&mut h, "44_marking_extension");
+
+        // A project: a new deadline per coursework.
+        session(&mut h).selected = Some(pj_id);
+        h.run_steps(3);
+        shot(&mut h, "45_marking_project_deadlines");
+        assert!(h.query_by_label(&format!("{} DEADLINES", icons::CARET_DOWN)).is_some());
+        assert!(h.query_by_label("Extension").is_some());
+
+        // The list of posters has its PDF button.
+        session(&mut h).selected = None;
+        session(&mut h).view = View::List(Category::Marking(MarkingKind::Project));
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("Poster list (PDF)").is_some());
+        shot(&mut h, "46_poster_list_button");
+
+        // Settings: the visit dates of the placement module.
+        session(&mut h).view = View::Settings;
+        h.run_steps(3);
+        h.get_by_label_contains("EEE501 – Placement").click();
+        h.run_steps(3);
+        h.get_by_label("To be done by").scroll_to_me();
+        h.run_steps(6);
+        shot(&mut h, "47_settings_placement_dates");
+        h.get_by_label("EXTERNAL PROGRAMMES").scroll_to_me();
+        h.run_steps(6);
+        shot(&mut h, "48_settings_external_programmes");
+    }
+
+    #[test]
+    fn names_can_be_hidden_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.svt");
+        let mut h = create_and_unlock(&path, false);
+        assert!(!session(&mut h).private);
+        session(&mut h).view = View::Settings;
+        h.run_steps(2);
+        h.get_by_label("Hide names when Supervisor opens").scroll_to_me();
+        // Scrolling there takes a few frames.
+        h.run_steps(6);
+        shot(&mut h, "42_privacy_setting");
+        h.get_by_label("Hide names when Supervisor opens").click();
+        h.run_steps(2);
+        assert!(session(&mut h).db.settings.start_private);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::L);
+        wait_until(&mut h, "locked", locked);
+        h.run_steps(2);
+        unlock(&mut h);
+        assert!(session(&mut h).private, "opens with names hidden");
+        assert!(h.query_by_label(&format!("{}  Show names", icons::EYE)).is_some());
+    }
+
+    #[test]
     fn placement_students_record_enrolment_and_marks_show_when_due() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.svt");
@@ -2760,6 +2933,9 @@ mod ui_tests {
         shot(&mut h, "30_placement_module_and_marking_reminders");
 
         assert!(h.query_by_label("EEE501 – Placement").is_some());
+        // The placement section is below the Modules card: go to it.
+        h.get_by_label(&format!("{} Placement", icons::BUILDINGS)).click();
+        h.run_steps(3);
         h.get_all_by_label("Yes").next().unwrap().click(); // The first: enrolment, above the visits.
         h.run_steps(3);
         let placement = session(&mut h).db.student(pat_id).unwrap().placement.clone().unwrap();
@@ -3660,8 +3836,9 @@ mod ui_tests {
         };
         h.key_press(egui::Key::F20);
         h.run_steps(3);
-        assert!(all_text(&h).contains("Bob Jones (B00999111) – no initial contact yet"));
-        assert!(all_text(&h).contains("BEng project meeting – Bob Jones (B00999111)"), "upcoming meeting");
+        assert!(all_text(&h).contains("Bob Jones – no initial contact yet"));
+        assert!(all_text(&h).contains("BEng project meeting – Bob Jones"), "upcoming meeting");
+        assert!(!all_text(&h).contains("B00999111"), "names only on the dashboard");
 
         // Privacy mode: nobody is named on the dashboard.
         h.get_by_label(&format!("{}  Hide names", icons::EYE_SLASH)).click();
@@ -3845,12 +4022,12 @@ mod ui_tests {
         assert!(h.query_by_label("Registration #").is_some());
         assert!(h.query_by_label("B NUMBER").is_none() && h.query_by_label("B Number").is_none());
 
-        h.get_by_label("On a Brazilian programme").click();
+        h.get_by_label("Follow its stages, grant and defence").click();
         h.run_steps(3);
         let p = phd(&mut h);
         assert!(p.brazilian_programme() && !p.skip_standard);
         assert_eq!(p.brazil.level, BrLevel::AcademicDoctorate);
-        for label in [heading("GRANT"), "Standard stages of the Brazilian programme".into(), heading("DEFENCE & AWARD"), "Deadline extension".into()] {
+        for label in [heading("GRANT"), "Standard stages of the programme".into(), heading("DEFENCE & AWARD"), "Deadline extension".into()] {
             assert!(h.query_by_label(&label).is_some(), "{label}");
         }
         assert!(h.query_by_label("Standard assessments of this university").is_none());
@@ -3895,7 +4072,7 @@ mod ui_tests {
         // Settings: the deadlines of each Brazilian level.
         session(&mut h).view = View::Settings;
         h.run_steps(3);
-        assert!(h.query_by_label("BRAZILIAN PROGRAMMES").is_some());
+        assert!(h.query_by_label("EXTERNAL PROGRAMMES").is_some());
         assert!(h.query_by_label("Professional doctorate").is_some());
 
         // Not external any more: back to the B number.

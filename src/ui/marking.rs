@@ -9,6 +9,47 @@ use crate::ui::fyp::{self, Cols};
 use crate::ui::student_form::Shown;
 use crate::ui::{icons, theme, widgets};
 
+/// A project's deadlines, with a new deadline for any extension: the marks
+/// are then due as many days later.
+fn extensions(ui: &mut Ui, m: &mut MarkingRecord, settings: &Settings) {
+    let items = settings.second_marked(&m.programme);
+    if items.is_empty() {
+        return;
+    }
+    ui.add_space(10.0);
+    theme::section(ui, "Deadlines", |ui| {
+        egui::Grid::new("marking-deadlines")
+            .num_columns(3)
+            .striped(true)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                for h in ["Item", "Deadline", "Extension"] {
+                    ui.label(RichText::new(h).small().color(theme::muted(ui)));
+                }
+                ui.end_row();
+                for (module, cw) in items {
+                    ui.horizontal(|ui| {
+                        ui.label(&cw.title);
+                        ui.label(RichText::new(&module.code).small().color(theme::muted(ui)));
+                    });
+                    match settings.template_deadline(module, cw) {
+                        Some(due) => ui.label(widgets::fmt_date(Some(due))),
+                        None => ui.label(RichText::new("TBC").color(theme::muted(ui))),
+                    };
+                    fyp::edit_status(&mut m.coursework, cw.id, |status| {
+                        widgets::opt_date(ui, ("marking-ext", cw.id), &mut status.deadline_override);
+                    });
+                    ui.end_row();
+                }
+            });
+        ui.label(
+            RichText::new("A student given more time to submit: set their new deadline, and your mark is due as many days later.")
+                .small()
+                .color(theme::muted(ui)),
+        );
+    });
+}
+
 pub fn show(ui: &mut Ui, m: &mut MarkingRecord, settings: &Settings, shown: &mut Shown) {
     widgets::form_grid(ui, "marking-grid", |ui| {
         ui.label("Marking");
@@ -67,8 +108,35 @@ pub fn show(ui: &mut Ui, m: &mut MarkingRecord, settings: &Settings, shown: &mut
                 }
             });
             ui.end_row();
+            ui.label("Extension");
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    let mut on = m.extension_days > 0;
+                    if ui.checkbox(&mut on, "").on_hover_text("The student was given more time to submit").changed() {
+                        m.extension_days = if on { 7 } else { 0 };
+                    }
+                    if on {
+                        ui.add(egui::DragValue::new(&mut m.extension_days).range(1..=365).suffix(" days"))
+                            .on_hover_text("How much longer the student has to submit");
+                    }
+                });
+                if m.extension_days > 0
+                    && let Some(by) = m.report_mark_by(settings)
+                {
+                    ui.label(
+                        RichText::new(format!("Your mark is now due {}", widgets::fmt_date(Some(by))))
+                            .small()
+                            .color(theme::muted(ui)),
+                    );
+                }
+            });
+            ui.end_row();
         }
     });
+
+    if m.kind == MarkingKind::Project {
+        extensions(ui, m, settings);
+    }
 
     ui.add_space(10.0);
     let marks_shown = shown.marks;

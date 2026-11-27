@@ -55,6 +55,7 @@ pub fn show(
 ) -> Option<widgets::Share> {
     let mut invite = None;
     let mut switch_marks = false;
+    let module = p.placement_module(settings).cloned();
     widgets::form_grid(ui, "placement-grid", |ui| {
         ui.label("Company");
         widgets::text_field(ui, &mut p.company, "Placement company");
@@ -90,6 +91,11 @@ pub fn show(
                         ui.label(theme::semibold(format!("Visit {}", i + 1)));
                         if v.completed {
                             theme::chip(ui, "completed", theme::GREEN);
+                        } else if let Some(by) = module.as_ref().and_then(|m| m.visit_by[i]) {
+                            let late = by < widgets::today() || v.date.is_some_and(|d| d > by);
+                            let color = if late { theme::fg(ui, theme::RED) } else { theme::muted(ui) };
+                            ui.label(RichText::new(format!("to be done by {}", widgets::fmt_short(by))).small().color(color))
+                                .on_hover_text(format!("Set with the placement module in Settings: {}", widgets::fmt_date(Some(by))));
                         }
                         if let Some(share) = widgets::share_buttons(ui, v.date.is_some(), || visit_uid(student_id, i)) {
                             invite = Some(share);
@@ -138,6 +144,8 @@ pub fn show(
                             if ui.small_button(text).clicked() {
                                 switch_marks = true;
                             }
+                            let by = module.as_ref().and_then(|m| m.visit_mark_by[i]);
+                            fyp::mark_by_note(ui, by, !v.mark.trim().is_empty());
                         });
                         ui.end_row();
                     });

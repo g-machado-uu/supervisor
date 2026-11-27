@@ -1,5 +1,5 @@
 //! Settings: academic calendar, courses, module/coursework templates,
-//! deadlines of Brazilian programmes, invitations, privacy, security, key
+//! deadlines of external programmes, invitations, privacy, security, key
 //! file and about.
 
 use std::collections::HashMap;
@@ -8,7 +8,8 @@ use egui::{RichText, Ui};
 use zeroize::Zeroizing;
 
 use crate::model::{
-    BrLevel, BrRule, CourseworkTemplate, Markers, Module, PLACEMENT_MODULE, Programme, Semester, Settings, default_br_rules,
+    BrLevel, BrRule, CourseworkTemplate, Markers, Module, PLACEMENT_MODULE, Programme, Semester, Settings, VISIT_REMINDER_DAYS,
+    default_br_rules,
 };
 use crate::storage;
 use crate::ui::{icons, theme, widgets};
@@ -248,7 +249,7 @@ pub fn show(
         });
 
         ui.add_space(8.0);
-        theme::card(ui, "Brazilian programmes", |ui| {
+        theme::card(ui, "External programmes", |ui| {
             br_rules_editor(ui, &mut settings.br_rules);
         });
 
@@ -309,6 +310,8 @@ pub fn show(
 
         ui.add_space(8.0);
         theme::card(ui, "Privacy", |ui| {
+            ui.checkbox(&mut settings.start_private, "Hide names when Supervisor opens")
+                .on_hover_text("Start in privacy mode, as if “Hide names” on the dashboard had been clicked. “Show names” shows them.");
             ui.checkbox(&mut settings.hide_external_ids, "Hide the registration numbers of external students");
             ui.add_enabled_ui(settings.hide_external_ids, |ui| {
                 ui.checkbox(&mut settings.reveal_needs_password, "Ask for the password to reveal a registration number");
@@ -633,6 +636,35 @@ fn module_editor(
                 .small()
                 .color(theme::muted(ui)),
         );
+        ui.add_space(4.0);
+        ui.label(RichText::new("Visits").strong());
+        egui::Grid::new("placement-dates-grid")
+            .num_columns(3)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                for h in ["", "To be done by", "Mark entered by"] {
+                    ui.label(RichText::new(h).small().color(theme::muted(ui)));
+                }
+                ui.end_row();
+                for i in 0..2 {
+                    ui.label(format!("Visit {}", i + 1));
+                    widgets::opt_date(ui, (module.id, "visit-by", i), &mut module.visit_by[i]);
+                    widgets::opt_date(ui, (module.id, "visit-mark-by", i), &mut module.visit_mark_by[i]);
+                    ui.end_row();
+                }
+            });
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "The dashboard reminds you of a visit that isn't booked from {VISIT_REMINDER_DAYS} days before it is to be done, \
+                     and of a visit mark not entered as for other marks (Marking deadlines below)."
+                ))
+                .small()
+                .color(theme::muted(ui)),
+            )
+            .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+        ui.add_space(4.0);
     }
 
     ui.label(RichText::new("Courseworks").strong());
@@ -811,7 +843,8 @@ fn courses_editor(ui: &mut Ui, programmes: &mut Vec<Programme>, in_use: &HashMap
     }
 }
 
-/// Months from enrolment to each stage, per Brazilian level; 0 = doesn't apply.
+/// Months from enrolment to each stage, per level of an external programme
+/// (defaults from Brazilian practice); 0 = doesn't apply.
 fn br_rules_editor(ui: &mut Ui, rules: &mut Vec<BrRule>) {
     // A level missing from the file: fill in its defaults.
     for level in BrLevel::ALL {
@@ -827,9 +860,10 @@ fn br_rules_editor(ui: &mut Ui, rules: &mut Vec<BrRule>) {
     };
     note(
         ui,
-        "For external students on a Brazilian programme: months from enrolment to each stage (0 = doesn't apply), \
-         used by “Fill in suggested deadlines”. Each programme sets its own in its regulations (regimento); \
-         these defaults are only a common starting point.",
+        "For external students whose programme is followed (“Their programme” in the student's research details): \
+         months from enrolment to each stage (0 = doesn't apply), used by “Fill in suggested deadlines”. The defaults \
+         are those common in Brazil (CAPES, CNPq); change them to suit other programmes. Each programme sets its own \
+         in its regulations, so these are only a starting point.",
     );
     egui::ScrollArea::horizontal().id_salt("br-rules-scroll").show(ui, |ui| {
         egui::Grid::new("br-rules")
@@ -843,7 +877,7 @@ fn br_rules_editor(ui: &mut Ui, rules: &mut Vec<BrRule>) {
                 ui.end_row();
                 for level in BrLevel::ALL {
                     let Some(r) = rules.iter_mut().find(|r| r.level == level) else { continue };
-                    ui.label(level.label()).on_hover_text(level.portuguese());
+                    ui.label(level.label()).on_hover_text(format!("In Brazil: {}", level.portuguese()));
                     for (i, value) in [
                         &mut r.credits_months,
                         &mut r.proficiency_months,
@@ -866,7 +900,7 @@ fn br_rules_editor(ui: &mut Ui, rules: &mut Vec<BrRule>) {
     }
     note(
         ui,
-        "Grants: master's up to 24 months and doctorate up to 48 (CAPES Portaria 76/2010, art. 10; CNPq and \
-         most FAPs). Extensions: up to 180 days for childbirth, adoption or guardianship (Law 14,925/2024).",
+        "Brazilian grants: master's up to 24 months and doctorate up to 48 (CAPES Portaria 76/2010, art. 10; CNPq \
+         and most FAPs). Extensions: up to 180 days for childbirth, adoption or guardianship (Law 14,925/2024).",
     );
 }

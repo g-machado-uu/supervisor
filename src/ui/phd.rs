@@ -1,7 +1,7 @@
 //! Research section of the student detail panel: project details, the dates
 //! from the university system (or added by hand) with their reminders, the
-//! viva and meetings. External students on a Brazilian programme get its
-//! grant, stages and defence instead (see `brazil`).
+//! viva and meetings. External students whose programme is followed (such
+//! as one in Brazil) get its grant, stages and defence instead (see `brazil`).
 
 use chrono::{Months, NaiveDate};
 use egui::{RichText, Ui};
@@ -225,7 +225,7 @@ fn defence(ui: &mut Ui, p: &mut PhdRecord, steps: &[PhdStep], today: NaiveDate, 
         widgets::text_field(ui, &mut p.viva_location, "Room, auditorium or link");
         ui.end_row();
         ui.label("Committee");
-        widgets::text_field(ui, &mut p.brazil.committee, "Members of the examining committee (banca)");
+        widgets::text_field(ui, &mut p.brazil.committee, "Members of the examining committee");
         ui.end_row();
         ui.label("Outcome");
         combo(ui, "br-outcome", &mut p.brazil.outcome, &DefenceOutcome::ALL, |o| o.label());
@@ -272,11 +272,14 @@ fn details(ui: &mut Ui, p: &mut PhdRecord) {
             widgets::text_field(ui, &mut p.university, "Where the student is registered");
             ui.end_row();
 
-            ui.label("Brazil");
+            ui.label("Their programme");
             let mut brazilian = p.brazilian;
             if ui
-                .checkbox(&mut brazilian, "On a Brazilian programme")
-                .on_hover_text("A mestrado or doutorado in Brazil: its levels, grants, stages and defence")
+                .checkbox(&mut brazilian, "Follow its stages, grant and defence")
+                .on_hover_text(
+                    "For a programme with its own stages, such as a mestrado or doutorado in Brazil: its level, \
+                     grant, course credits, qualifying exam and defence, with suggested deadlines",
+                )
                 .changed()
             {
                 p.set_brazilian(brazilian);
@@ -287,7 +290,7 @@ fn details(ui: &mut Ui, p: &mut PhdRecord) {
 
         if br {
             ui.label("Programme");
-            widgets::text_field(ui, &mut p.brazil.programme, "Postgraduate programme (PPG)");
+            widgets::text_field(ui, &mut p.brazil.programme, "Postgraduate programme");
             ui.end_row();
         }
 
@@ -311,7 +314,7 @@ fn details(ui: &mut Ui, p: &mut PhdRecord) {
         widgets::text_field(ui, &mut p.supervisors, "Other members of the team");
         ui.end_row();
 
-        // A Brazilian programme has its grant card instead.
+        // A programme followed this way has its grant card instead.
         if br {
             return;
         }
@@ -390,9 +393,10 @@ fn state_color(ui: &Ui, m: &Milestone, lead: Lead, today: NaiveDate) -> egui::Co
 /// Kept on one line: wrapped inside a grid row, it ran into the next row.
 fn reminder_note(ui: &mut Ui, m: &Milestone, lead: Lead) {
     if let Some(r) = m.reminder(lead).filter(|_| !m.done) {
+        let later = if m.reminder(lead) != m.deadline.and_then(|d| lead.before(d)) { " (put off)" } else { "" };
         ui.add(
             egui::Label::new(
-                RichText::new(format!("{} reminder {}", icons::BELL, r.format("%d %b %Y")))
+                RichText::new(format!("{} reminder {}{later}", icons::BELL, r.format("%d %b %Y")))
                     .small()
                     .color(theme::muted(ui)),
             )
@@ -498,6 +502,14 @@ fn milestone_cells(ui: &mut Ui, key: &str, m: &mut Milestone, today: NaiveDate) 
         }
         if m.done {
             widgets::opt_date(ui, (key, "done-on"), &mut m.done_on);
+        } else if m.remind_from.is_some()
+            && ui
+                .push_id((key, "usual-reminder"), |ui| ui.small_button(format!("{} Usual reminder", icons::BELL)))
+                .inner
+                .on_hover_text("The reminder was put off from the dashboard. Click to be reminded at the usual time again.")
+                .clicked()
+        {
+            m.remind_from = None;
         }
     });
 }

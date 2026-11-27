@@ -79,6 +79,8 @@ pub enum ListAction {
     Import,
     /// Copy the emails of these students, ticked and shown, in list order.
     CopyEmails(Vec<Uuid>),
+    /// Save the list of posters to mark as a PDF.
+    PosterPdf,
 }
 
 /// The emails of `students` as one line to paste into the To field of
@@ -137,6 +139,18 @@ pub fn show(ui: &mut Ui, db: &Database, cat: &Category, st: ListState<'_>) -> Li
                 .clicked()
         {
             add = ListAction::Import;
+        }
+        if *cat == Category::Marking(MarkingKind::Project)
+            && count > 0
+            && ui
+                .add(egui::Button::new(format!("{}  Poster list (PDF)…", icons::EXPORT)).min_size(egui::vec2(0.0, 34.0)))
+                .on_hover_text(
+                    "A table of the posters you mark, by poster number: B number, name, supervisor and course, \
+                     to print for the poster session. The PDF is not encrypted.",
+                )
+                .clicked()
+        {
+            add = ListAction::PosterPdf;
         }
     });
     ui.horizontal(|ui| {

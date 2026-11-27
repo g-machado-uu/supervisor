@@ -1,6 +1,8 @@
-//! Brazilian programmes, for external research students: the level, the
-//! grant (bolsa) from a federal agency or state foundation, the extension of
-//! the deadlines, and the standard stages with their suggested dates.
+//! The programme of an external research student, when it has stages of
+//! its own: the level, the grant (with the Brazilian federal agencies and
+//! state foundations to choose from), the extension of the deadlines, and
+//! the standard stages with their suggested dates (by default, those common
+//! in Brazil under CAPES and CNPq).
 
 use chrono::NaiveDate;
 use egui::{RichText, Ui};
@@ -21,11 +23,11 @@ pub fn level_combo(ui: &mut Ui, p: &mut PhdRecord) {
         .show_ui(ui, |ui| {
             for option in BrLevel::ALL {
                 ui.selectable_value(&mut level, option, option.label())
-                    .on_hover_text(option.portuguese());
+                    .on_hover_text(format!("In Brazil: {}", option.portuguese()));
             }
         })
         .response
-        .on_hover_text(level.portuguese());
+        .on_hover_text(format!("In Brazil: {}", level.portuguese()));
     if level != p.brazil.level {
         p.set_br_level(level);
     }
@@ -48,7 +50,7 @@ pub fn extension_row(ui: &mut Ui, p: &mut PhdRecord) {
                     .range(0..=24)
                     .suffix(" months"),
             )
-            .on_hover_text("Months added to the course deadlines (prorrogação)");
+            .on_hover_text("Months added to the course deadlines");
             combo(ui, "br-ext-reason", &mut p.brazil.extension_reason, &ExtensionReason::ALL, |r| r.label());
         });
         let hint = p.brazil.extension_reason.hint();
@@ -65,7 +67,7 @@ pub fn stages_header(ui: &mut Ui, p: &mut PhdRecord, rule: &BrRule) {
     let mut standard = !p.skip_standard;
     ui.horizontal_wrapped(|ui| {
         if ui
-            .checkbox(&mut standard, "Standard stages of the Brazilian programme")
+            .checkbox(&mut standard, "Standard stages of the programme")
             .on_hover_text(
                 "Course credits, language proficiency, qualifying exam, annual reports, \
                  sending the work to the committee and the defence",
@@ -82,7 +84,7 @@ pub fn stages_header(ui: &mut Ui, p: &mut PhdRecord, rule: &BrRule) {
                 )
                 .on_hover_text(
                     "Works out the empty deadlines from the start date, with the rules of the level in \
-                     Settings › Brazilian programmes. Dates already set are kept.",
+                     Settings › External programmes. Dates already set are kept.",
                 )
                 .on_disabled_hover_text("Set the project start (enrolment) first")
                 .clicked()
@@ -95,8 +97,8 @@ pub fn stages_header(ui: &mut Ui, p: &mut PhdRecord, rule: &BrRule) {
         if p.skip_standard {
             "Add the deadlines from the student's programme and choose when to be reminded."
         } else {
-            "Suggested deadlines follow the rules of the level; check the programme's regulations \
-             (regimento) and adjust as needed."
+            "Suggested deadlines follow the rules of the level in Settings; check the programme's \
+             regulations and adjust as needed."
         },
     );
 
@@ -147,8 +149,8 @@ pub fn grant_editor(ui: &mut Ui, g: &mut Grant, level: BrLevel, project_start: O
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut g.agency, String::new(), "No grant");
                     for (kind, title) in [
-                        (AgencyKind::Federal, "FEDERAL"),
-                        (AgencyKind::State, "STATE FOUNDATIONS (FAPs)"),
+                        (AgencyKind::Federal, "BRAZIL · FEDERAL"),
+                        (AgencyKind::State, "BRAZIL · STATE FOUNDATIONS (FAPs)"),
                         (AgencyKind::Other, "OTHER"),
                     ] {
                         ui.add_space(4.0);
@@ -176,7 +178,7 @@ pub fn grant_editor(ui: &mut Ui, g: &mut Grant, level: BrLevel, project_start: O
             ui.end_row();
         }
         ui.label("Modality");
-        widgets::text_field(ui, &mut g.modality, "e.g. Demanda Social, PROEX, GM, GD");
+        widgets::text_field(ui, &mut g.modality, "Scheme, e.g. Demanda Social, PROEX");
         ui.end_row();
         ui.label("Process number");
         widgets::text_field(ui, &mut g.process, "Optional");
@@ -210,7 +212,7 @@ pub fn grant_editor(ui: &mut Ui, g: &mut Grant, level: BrLevel, project_start: O
                     .small_button(format!("Usual: {typical} months"))
                     .on_hover_text(
                         "Master's: up to 24 months; doctorate: up to 48 \
-                         (CAPES Portaria 76/2010, CNPq and most FAPs).",
+                         (in Brazil: CAPES Portaria 76/2010, CNPq and most FAPs).",
                     )
                     .clicked()
             {

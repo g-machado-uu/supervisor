@@ -143,10 +143,10 @@ pub fn show(ui: &mut Ui, s: &mut Student, settings: &Settings, duplicate_b: bool
             role_chip(ui, Role::Fyp, settings.programme_short(&f.programme));
         }
         if let Some(p) = &s.phd {
-            let ext = match (p.external, p.brazilian_programme()) {
-                (true, true) => " External · Brazil",
-                (true, false) => " External",
-                (false, _) => "",
+            let ext = match (p.external, p.brazilian_programme(), p.brazil.programme.trim()) {
+                (true, true, programme) if !programme.is_empty() => format!(" External · {programme}"),
+                (true, _, _) => " External".to_string(),
+                (false, _, _) => String::new(),
             };
             role_chip(ui, Role::Phd, format!("{}{ext}", p.degree_label()));
         }

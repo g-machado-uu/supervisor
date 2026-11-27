@@ -270,6 +270,10 @@ pub struct Module {
     /// `Programme::id`s this module applies to.
     pub applies_to: Vec<String>,
     pub courseworks: Vec<CourseworkTemplate>,
+    /// Placement modules: the day each visit (1 and 2) is to be done by.
+    pub visit_by: [Option<NaiveDate>; 2],
+    /// Placement modules: the day the mark of each visit is to be entered by.
+    pub visit_mark_by: [Option<NaiveDate>; 2],
 }
 
 impl Default for Module {
@@ -281,6 +285,8 @@ impl Default for Module {
             semester: Semester::S1,
             applies_to: Vec::new(),
             courseworks: Vec::new(),
+            visit_by: [None; 2],
+            visit_mark_by: [None; 2],
         }
     }
 }
@@ -349,6 +355,10 @@ pub const PLACEMENT_MODULE: &str = "Placement";
 /// Days before marks are due that the dashboard starts to remind.
 pub const MARKING_REMINDER_DAYS: u32 = 3;
 
+/// Days before a placement visit is to be done by that the dashboard
+/// reminds you, while it isn't booked.
+pub const VISIT_REMINDER_DAYS: i64 = 28;
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -377,6 +387,8 @@ pub struct Settings {
     /// ID such as the CPF or National Insurance number) as dots until revealed.
     pub hide_external_ids: bool,
     pub reveal_needs_password: bool,
+    /// Open in privacy mode, with names hidden until "Show names".
+    pub start_private: bool,
     /// Calendar weeks start on Sunday rather than Monday.
     pub week_starts_sunday: bool,
     /// From this many pending modules, the student talks to the course director.
@@ -416,6 +428,7 @@ impl Default for Settings {
             br_rules: default_br_rules(),
             hide_external_ids: true,
             reveal_needs_password: false,
+            start_private: false,
             week_starts_sunday: false,
             course_director_from: 2,
             head_of_school_from: 3,
@@ -1446,12 +1459,18 @@ pub struct MarkingRecord {
     /// When marks for the MSc dissertation or placement report are due,
     /// when it differs from the date in Settings.
     pub mark_by: Option<NaiveDate>,
+    /// MSc dissertation or placement report: the student was given this
+    /// many more days to submit, which moves the marks on by as many.
+    /// (A project's extensions are the new deadlines of its courseworks.)
+    pub extension_days: u32,
 }
 
 impl MarkingRecord {
-    /// When marks for the MSc dissertation or placement report are due.
+    /// When marks for the MSc dissertation or placement report are due,
+    /// moved on by any extension.
     pub fn report_mark_by(&self, settings: &Settings) -> Option<NaiveDate> {
-        self.mark_by.or_else(|| settings.report_mark_by(self.kind))
+        let by = self.mark_by.or_else(|| settings.report_mark_by(self.kind))?;
+        by.checked_add_signed(Duration::days(i64::from(self.extension_days)))
     }
 
     /// What there is to mark, and whether it is done: (done, all).
@@ -1913,13 +1932,42 @@ pub struct Milestone {
     pub deadline: Option<NaiveDate>,
     pub done: bool,
     pub done_on: Option<NaiveDate>,
+    /// The reminder was put off until this day ("Remind me later").
+    pub remind_from: Option<NaiveDate>,
 }
 
 impl Milestone {
-    /// The reminder date, `lead` before the deadline.
+    /// The reminder date: `lead` before the deadline, or later if the
+    /// reminder was put off.
     pub fn reminder(&self, lead: Lead) -> Option<NaiveDate> {
-        lead.before(self.deadline?)
+        let usual = lead.before(self.deadline?)?;
+        Some(self.remind_from.map_or(usual, |later| later.max(usual)))
     }
+}
+
+/// When a reminder that is up (`today`) for a deadline `due` can be put off
+/// to: a while from now, or a few weeks before the deadline. Only days
+/// after today and before the deadline, earliest first.
+pub fn later_choices(today: NaiveDate, due: NaiveDate) -> Vec<(String, NaiveDate)> {
+    let mut out: Vec<(String, NaiveDate)> = Vec::new();
+    let mut add = |label: String, date: Option<NaiveDate>| {
+        if let Some(date) = date.filter(|d| *d > today && *d < due)
+            && !out.iter().any(|(_, d)| *d == date)
+        {
+            out.push((label, date));
+        }
+    };
+    add("In 1 week".into(), today.checked_add_signed(Duration::weeks(1)));
+    add("In 2 weeks".into(), today.checked_add_signed(Duration::weeks(2)));
+    add("In 1 month".into(), today.checked_add_months(Months::new(1)));
+    add("In 2 months".into(), today.checked_add_months(Months::new(2)));
+    add("In 3 months".into(), today.checked_add_months(Months::new(3)));
+    for weeks in [6, 4, 3, 2, 1] {
+        let label = if weeks == 1 { "1 week before the deadline".to_string() } else { format!("{weeks} weeks before the deadline") };
+        add(label, due.checked_sub_signed(Duration::weeks(weeks)));
+    }
+    out.sort_by_key(|(_, d)| *d);
+    out
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -2247,7 +2295,7 @@ impl ExtensionReason {
     pub fn label(self) -> &'static str {
         match self {
             ExtensionReason::None => "—",
-            ExtensionReason::Parental => "Parental leave (Law 14,925/2024)",
+            ExtensionReason::Parental => "Parental leave",
             ExtensionReason::Health => "Health",
             ExtensionReason::Board => "Programme board decision",
             ExtensionReason::Other => "Other reason",
@@ -2258,10 +2306,10 @@ impl ExtensionReason {
     pub fn hint(self) -> &'static str {
         match self {
             ExtensionReason::Parental => {
-                "Law 14,925/2024 allows grants to be extended by up to 180 days (6 months) for childbirth, adoption or guardianship."
+                "In Brazil, Law 14,925/2024 allows grants to be extended by up to 180 days (6 months) for childbirth, adoption or guardianship."
             }
             ExtensionReason::Health => {
-                "At CAPES (Portaria 76/2010), a suspension for serious illness, childbirth or breastfeeding lasts up to 6 months and doesn't count towards the grant period."
+                "In Brazil, at CAPES (Portaria 76/2010), a suspension for serious illness, childbirth or breastfeeding lasts up to 6 months and doesn't count towards the grant period."
             }
             _ => "",
         }
@@ -2786,9 +2834,9 @@ impl Student {
         !self.external() && !self.fyp.as_ref().is_some_and(|f| settings.is_sust(&f.programme))
     }
 
-    /// Local advisees and project students have their modules followed up.
+    /// Local advisees, project and placement students have their modules followed up.
     pub fn follows_modules(&self, settings: &Settings) -> bool {
-        self.local(settings) && (self.advisee.is_some() || self.fyp.is_some())
+        self.local(settings) && (self.advisee.is_some() || self.fyp.is_some() || self.placement.is_some())
     }
 
     /// The registration number is shown as dots until revealed.
@@ -2836,6 +2884,15 @@ impl Student {
             (false, true) => self.name.clone(),
             (true, false) => number.into(),
             (true, true) => "(unnamed student)".into(),
+        }
+    }
+
+    /// The name alone, for event titles, invites and the dashboard; the
+    /// number only when there is no name.
+    pub fn title_name(&self) -> String {
+        match self.name.trim() {
+            "" => self.display_name(),
+            name => name.to_string(),
         }
     }
 
@@ -3031,6 +3088,14 @@ impl Database {
                     out.push(FixedDate { label: format!("{name}: marks due"), date });
                 }
             }
+            for i in 0..2 {
+                if let Some(date) = m.visit_by[i] {
+                    out.push(FixedDate { label: format!("{} visit {}: to be done by", m.code, i + 1), date });
+                }
+                if let Some(date) = m.visit_mark_by[i] {
+                    out.push(FixedDate { label: format!("{} visit {}: mark due", m.code, i + 1), date });
+                }
+            }
         }
         if let Some(date) = s.msc_mark_by {
             out.push(FixedDate { label: "MSc dissertations: marks due".into(), date });
@@ -3072,9 +3137,14 @@ impl Database {
             FixedDates::Clear => *date = None,
             FixedDates::Keep => {}
         };
-        for cw in s.modules.iter_mut().flat_map(|m| &mut m.courseworks) {
-            change(&mut cw.deadline);
-            change(&mut cw.mark_by);
+        for m in &mut s.modules {
+            for cw in &mut m.courseworks {
+                change(&mut cw.deadline);
+                change(&mut cw.mark_by);
+            }
+            for date in m.visit_by.iter_mut().chain(&mut m.visit_mark_by) {
+                change(date);
+            }
         }
         change(&mut s.msc_mark_by);
         change(&mut s.placement_report_mark_by);
@@ -3358,6 +3428,9 @@ pub struct Attention {
     pub message: String,
     /// The message without the student's name.
     pub detail: String,
+    /// A research deadline whose reminder is up and can be put off: the
+    /// `PhdStep::key` and the deadline.
+    pub later: Option<(String, NaiveDate)>,
 }
 
 /// One event per week of `m` (only the meeting itself if it doesn't repeat).
@@ -3857,7 +3930,7 @@ impl Database {
 
     fn student_events(&self, s: &Student, out: &mut Vec<Event>) {
         let settings = &self.settings;
-        let name = s.display_name();
+        let name = s.title_name();
         if let Some(fyp) = &s.fyp {
             let short = settings.programme_short(&fyp.programme);
             for m in &fyp.meetings {
@@ -3894,7 +3967,25 @@ impl Database {
             }
         }
         if let Some(p) = &s.placement {
+            let module = p.placement_module(settings);
             for (i, v) in p.visits.iter().enumerate() {
+                if let Some(by) = module.and_then(|m| m.visit_by[i]) {
+                    out.push(Event {
+                        uid: format!("visit-by{}-{}", i + 1, s.id),
+                        student_id: s.id,
+                        date: by,
+                        time: None,
+                        kind: EventKind::Deadline,
+                        title: format!("Placement visit {} to be done – {name}", i + 1),
+                        done: v.completed,
+                        online: false,
+                        platform: Platform::Teams,
+                        link: String::new(),
+                        location: String::new(),
+                        series: None,
+                        cancelled: false,
+                    });
+                }
                 if let Some(date) = v.date {
                     out.push(Event {
                         uid: visit_uid(s.id, i),
@@ -4161,13 +4252,15 @@ impl Database {
 
     /// Things that need chasing, most urgent first.
     pub fn attention(&self, today: NaiveDate) -> Vec<Attention> {
-        let mut out = Vec::new();
-        let mut push = |student: &Student, severity, message: String| {
-            out.push(Attention {
+        // Shared with `push`, so the item just added can be given more.
+        let out = std::cell::RefCell::new(Vec::new());
+        let push = |student: &Student, severity, message: String| {
+            out.borrow_mut().push(Attention {
                 student_id: student.id,
                 severity,
-                message: format!("{} – {message}", student.display_name()),
+                message: format!("{} – {message}", student.title_name()),
                 detail: message,
+                later: None,
             })
         };
         for s in self.students.iter().filter(|s| !s.archived) {
@@ -4243,9 +4336,25 @@ impl Database {
                         TriState::Yes => {}
                     }
                 }
+                let module = p.placement_module(&self.settings);
                 for (i, v) in p.visits.iter().enumerate() {
+                    if let Some(by) = module.and_then(|m| m.visit_mark_by[i])
+                        && v.mark.trim().is_empty()
+                        && let Some(severity) = self.settings.marking_alert(by, today)
+                    {
+                        push(s, severity, marking_message(&format!("Visit {}", i + 1), severity, by));
+                    }
                     if v.completed {
                         continue;
+                    }
+                    if let Some(by) = module.and_then(|m| m.visit_by[i]) {
+                        if by < today {
+                            push(s, Severity::Overdue, format!("visit {} not done (due by {by})", i + 1));
+                        } else if v.date.is_some_and(|d| d > by) {
+                            push(s, Severity::Pending, format!("visit {} booked after it is due (by {by})", i + 1));
+                        } else if v.date.is_none() && by <= today + Duration::days(VISIT_REMINDER_DAYS) {
+                            push(s, Severity::Pending, format!("visit {} to be done by {by}, not booked yet", i + 1));
+                        }
                     }
                     if v.request_sent.is_some() && v.response != ReplyStatus::Replied {
                         let severity = if v.response == ReplyStatus::NoReply {
@@ -4270,6 +4379,9 @@ impl Database {
                         push(s, Severity::Overdue, format!("{} overdue (due {due})", step.label));
                     } else if m.reminder(step.lead).is_some_and(|r| r <= today) {
                         push(s, Severity::Pending, format!("{} due {due}", step.label));
+                        if let Some(item) = out.borrow_mut().last_mut() {
+                            item.later = Some((step.key.clone(), due));
+                        }
                     }
                 }
                 if let Some(end) = p.visa_end.filter(|_| !p.external) {
@@ -4303,8 +4415,70 @@ impl Database {
                 }
             }
         }
+        let mut out = out.into_inner();
         out.sort_by_key(|a| a.severity);
         out
+    }
+
+    /// The projects I mark as second marker, as a table for the poster
+    /// session: poster number, B number, name, supervisor and course, in
+    /// poster order (those without a number last, by name).
+    pub fn poster_table(&self, today: NaiveDate) -> crate::pdf::Table {
+        let mut students: Vec<(&Student, &MarkingRecord)> = self
+            .students
+            .iter()
+            .filter(|s| !s.archived)
+            .filter_map(|s| Some((s, s.marking.as_ref().filter(|m| m.kind == MarkingKind::Project)?)))
+            .collect();
+        students.sort_by_cached_key(|(s, m)| (m.poster_order().unwrap_or(u32::MAX), s.name.to_lowercase()));
+        let column = |heading: &str, centred| crate::pdf::Column { heading: heading.into(), centred };
+        let mut subtitle = vec!["Second marker".to_string()];
+        if !self.settings.my_name.trim().is_empty() {
+            subtitle[0] = format!("Second marker: {}", self.settings.my_name.trim());
+        }
+        subtitle.push(self.settings.academic_year.clone());
+        let count = match students.len() {
+            1 => "1 poster".to_string(),
+            n => format!("{n} posters"),
+        };
+        subtitle.push(count);
+        crate::pdf::Table {
+            title: "Posters to mark".into(),
+            subtitle: subtitle.join(" · "),
+            columns: vec![
+                column("Poster", true),
+                column("B number", false),
+                column("Student", false),
+                column("Supervisor", false),
+                column("Course", false),
+            ],
+            rows: students
+                .iter()
+                .map(|(s, m)| {
+                    let course = match s.course.trim() {
+                        "" => self.settings.programme(&m.programme).map_or_else(|| m.programme.clone(), |p| p.name.clone()),
+                        course => course.to_string(),
+                    };
+                    vec![
+                        m.poster_number.trim().trim_start_matches('#').trim().to_string(),
+                        s.b_number.trim().to_string(),
+                        s.name.trim().to_string(),
+                        m.supervisor_name.trim().to_string(),
+                        course,
+                    ]
+                })
+                .collect(),
+            footer: format!("Made with Supervisor on {}", today.format("%d %B %Y")),
+        }
+    }
+
+    /// Put off the reminder of research deadline `key` of a student until `until`.
+    pub fn remind_later(&mut self, student_id: Uuid, key: &str, until: NaiveDate) -> bool {
+        let Some(m) = self.student_mut(student_id).and_then(|s| s.phd.as_mut()).and_then(|p| p.milestone_mut(key)) else {
+            return false;
+        };
+        m.remind_from = Some(until);
+        true
     }
 }
 
@@ -5956,5 +6130,220 @@ mod tests {
 
         let posters = ["12", "#3", " 7 ", "", "B"].map(|n| MarkingRecord { poster_number: n.into(), ..Default::default() }.poster_order());
         assert_eq!(posters, [Some(12), Some(3), Some(7), None, None]);
+    }
+
+    #[test]
+    fn a_reminder_that_is_up_can_be_put_off() {
+        let mut db = Database::default();
+        let mut p = ResearchGroup::PhdExternal.new_record();
+        p.set_brazilian(true);
+        p.brazil.qualification.deadline = Some(d(2027, 9, 1));
+        db.students.push(Student { name: "Ana".into(), phd: Some(p), ..Default::default() });
+        let id = db.students[0].id;
+        // The qualifying exam reminds 3 months before: from 1 Jun 2027.
+        let items = |db: &Database, today| -> Vec<(String, Option<(String, NaiveDate)>)> {
+            db.attention(today).into_iter().map(|a| (a.message, a.later)).collect()
+        };
+        assert!(items(&db, d(2027, 5, 31)).is_empty());
+        assert_eq!(
+            items(&db, d(2027, 6, 1)),
+            vec![("Ana – Qualifying exam due 2027-09-01".into(), Some(("qualification".into(), d(2027, 9, 1))))]
+        );
+
+        // Put off until 4 weeks before the deadline.
+        let choices = later_choices(d(2027, 6, 1), d(2027, 9, 1));
+        let (label, until) = choices.iter().find(|(label, _)| label.starts_with("4 weeks")).unwrap().clone();
+        assert_eq!((label.as_str(), until), ("4 weeks before the deadline", d(2027, 8, 4)));
+        assert!(db.remind_later(id, "qualification", until));
+        assert!(items(&db, d(2027, 6, 2)).is_empty(), "quiet until then");
+        assert_eq!(items(&db, d(2027, 8, 4)).len(), 1, "back on the day");
+        // The calendar's reminder moves with it.
+        let reminder = db.events().into_iter().find(|e| e.kind == EventKind::Reminder).unwrap();
+        assert_eq!(reminder.date, d(2027, 8, 4));
+        // Overdue items can't be put off.
+        let overdue = db.attention(d(2027, 9, 2));
+        assert_eq!((overdue[0].severity, overdue[0].later.is_some()), (Severity::Overdue, false));
+        assert!(!db.remind_later(id, "nothing-like-this", until));
+    }
+
+    #[test]
+    fn later_choices_fall_between_today_and_the_deadline() {
+        let choices = later_choices(d(2027, 6, 1), d(2027, 6, 20));
+        let dates: Vec<NaiveDate> = choices.iter().map(|(_, d)| *d).collect();
+        assert_eq!(dates, vec![d(2027, 6, 6), d(2027, 6, 8), d(2027, 6, 13), d(2027, 6, 15)]);
+        assert_eq!(choices[0].0, "2 weeks before the deadline");
+        assert!(dates.windows(2).all(|w| w[0] < w[1]), "in order, each once");
+        assert!(later_choices(d(2027, 6, 1), d(2027, 6, 2)).is_empty(), "no room left");
+    }
+
+    #[test]
+    fn titles_and_dashboard_items_name_the_student_without_their_number() {
+        let mut db = Database::default();
+        let fyp = FypRecord { meetings: vec![Meeting { date: Some(d(2026, 10, 5)), ..Default::default() }], ..Default::default() };
+        db.students.push(Student { name: "Bob Jones".into(), b_number: "B00999111".into(), fyp: Some(fyp), ..Default::default() });
+        let events = db.events();
+        assert!(events.iter().all(|e| !e.title.contains("B00999111")), "{events:?}");
+        assert!(events.iter().any(|e| e.title == "BEng project meeting – Bob Jones"));
+        assert!(db.cal_items(|_| true, false).iter().all(|i| !i.event.title.contains("B00999111")), "invite files too");
+        assert_eq!(db.attention(d(2026, 10, 1))[0].message, "Bob Jones – no initial contact yet");
+        // Without a name, the number is all there is.
+        db.students[0].name.clear();
+        assert_eq!(db.students[0].title_name(), "B00999111");
+    }
+
+    #[test]
+    fn placement_students_follow_their_modules() {
+        let settings = Settings::default();
+        let placement = Student { placement: Some(PlacementRecord::default()), ..Default::default() };
+        assert!(placement.follows_modules(&settings));
+    }
+
+    #[test]
+    fn placement_visits_and_their_marks_have_deadlines() {
+        let mut db = Database::default();
+        db.settings.modules.push(Module {
+            code: "EEE501".into(),
+            applies_to: vec![PLACEMENT_MODULE.into()],
+            visit_by: [Some(d(2026, 12, 4)), Some(d(2027, 4, 30))],
+            visit_mark_by: [Some(d(2026, 12, 11)), None],
+            ..Default::default()
+        });
+        let mut placement = PlacementRecord { enrolled: TriState::Yes, ..Default::default() };
+        placement.visits[0].line_manager_attending = TriState::Yes;
+        db.students.push(Student { name: "Pat".into(), placement: Some(placement), ..Default::default() });
+        let items = |db: &Database, today| -> Vec<(Severity, String)> {
+            db.attention(today).into_iter().map(|a| (a.severity, a.detail)).collect()
+        };
+        assert!(items(&db, d(2026, 11, 5)).is_empty(), "more than 4 weeks before");
+        assert_eq!(items(&db, d(2026, 11, 6)), vec![(Severity::Pending, "visit 1 to be done by 2026-12-04, not booked yet".into())]);
+        // Booked after the date it is due by.
+        db.students[0].placement.as_mut().unwrap().visits[0].date = Some(d(2026, 12, 7));
+        assert_eq!(items(&db, d(2026, 11, 6)), vec![(Severity::Pending, "visit 1 booked after it is due (by 2026-12-04)".into())]);
+        db.students[0].placement.as_mut().unwrap().visits[0].date = Some(d(2026, 12, 1));
+        assert!(items(&db, d(2026, 11, 6)).is_empty(), "booked in time");
+        assert_eq!(items(&db, d(2026, 12, 5)), vec![(Severity::Overdue, "visit 1 not done (due by 2026-12-04)".into())]);
+        // Done: its mark is due a week later, reminded 3 days before.
+        db.students[0].placement.as_mut().unwrap().visits[0].completed = true;
+        assert!(items(&db, d(2026, 12, 7)).is_empty());
+        assert_eq!(items(&db, d(2026, 12, 8)), vec![(Severity::Pending, "Visit 1 to mark by 2026-12-11".into())]);
+        assert_eq!(items(&db, d(2026, 12, 12)), vec![(Severity::Overdue, "Visit 1 not marked (due 2026-12-11)".into())]);
+        db.students[0].placement.as_mut().unwrap().visits[0].mark = "65".into();
+        assert!(items(&db, d(2026, 12, 12)).is_empty());
+
+        // The dates are in the calendar, done once the visit is.
+        let deadlines: Vec<(NaiveDate, bool)> =
+            db.events().into_iter().filter(|e| e.kind == EventKind::Deadline).map(|e| (e.date, e.done)).collect();
+        assert_eq!(deadlines, vec![(d(2026, 12, 4), true), (d(2027, 4, 30), false)]);
+
+        // A new year moves them on with the other fixed dates.
+        let labels: Vec<String> = db.fixed_dates().into_iter().map(|f| f.label).collect();
+        assert!(labels.contains(&"EEE501 visit 1: to be done by".to_string()) && labels.contains(&"EEE501 visit 1: mark due".to_string()));
+        let mut plan = db.new_year_plan();
+        plan.fixed_dates = FixedDates::MoveOn;
+        db.start_year(&plan);
+        let m = db.settings.placement_modules().next().unwrap();
+        assert_eq!(m.visit_by, [Some(d(2026, 12, 4) + YEAR_ON), Some(d(2027, 4, 30) + YEAR_ON)]);
+        assert_eq!(m.visit_mark_by, [Some(d(2026, 12, 11) + YEAR_ON), None]);
+    }
+
+    #[test]
+    fn an_extension_moves_the_marking_of_students_i_dont_supervise() {
+        let mut db = Database::default();
+        db.settings.msc_mark_by = Some(d(2027, 9, 10));
+        db.students.push(Student {
+            name: "Mo".into(),
+            marking: Some(MarkingRecord { kind: MarkingKind::Msc, ..Default::default() }),
+            ..Default::default()
+        });
+        let m = db.students[0].marking.as_mut().unwrap();
+        m.extension_days = 14;
+        assert_eq!(m.report_mark_by(&db.settings), Some(d(2027, 9, 24)));
+        assert!(db.attention(d(2027, 9, 11)).is_empty(), "not due yet with the extension");
+
+        // A project: a new deadline for a coursework moves its marks too.
+        let mut settings = teaching();
+        let dissertation = settings.modules_for("BEng").find(|m| m.code == "MEC528").unwrap().courseworks[1].id;
+        for m in settings.modules.iter_mut().filter(|m| m.code == "MEC528" && m.applies_to.contains(&"BEng".to_string())) {
+            m.courseworks[1].deadline = Some(d(2027, 5, 7));
+            m.courseworks[1].mark_weeks = Some(2);
+        }
+        let mut record = MarkingRecord { programme: "BEng".into(), ..Default::default() };
+        let (module, cw) = settings.second_marked("BEng").into_iter().find(|(_, cw)| cw.id == dissertation).unwrap();
+        assert_eq!(settings.marking_deadline(module, cw, record.coursework.get(&cw.id)), Some(d(2027, 5, 21)));
+        record.coursework.insert(dissertation, CwStatus { deadline_override: Some(d(2027, 5, 21)), ..Default::default() });
+        assert_eq!(settings.marking_deadline(module, cw, record.coursework.get(&cw.id)), Some(d(2027, 6, 4)));
+    }
+
+    #[test]
+    fn the_poster_list_is_in_poster_order() {
+        let mut db = Database::default();
+        db.settings.my_name = "Gabriel Machado".into();
+        let marked = |name: &str, number: &str, poster: &str, course: &str| Student {
+            name: name.into(),
+            b_number: number.into(),
+            course: course.into(),
+            marking: Some(MarkingRecord {
+                kind: MarkingKind::Project,
+                programme: "MEng".into(),
+                poster_number: poster.into(),
+                supervisor_name: "Dr Smith".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        db.students.extend([
+            marked("Zoe", "B003", "12", "BEng Mechanical Engineering"),
+            marked("Amy", "B001", "", ""),
+            marked("Raj", "B002", "#3", "BEng Mechanical Engineering"),
+            Student { name: "Not marked".into(), ..Default::default() },
+            Student { archived: true, ..marked("Old", "B000", "1", "") },
+        ]);
+        let t = db.poster_table(d(2027, 4, 20));
+        assert_eq!(t.columns.iter().map(|c| c.heading.as_str()).collect::<Vec<_>>(), ["Poster", "B number", "Student", "Supervisor", "Course"]);
+        let rows: Vec<[&str; 5]> = t.rows.iter().map(|r| [&*r[0], &*r[1], &*r[2], &*r[3], &*r[4]]).collect();
+        assert_eq!(
+            rows,
+            [
+                ["3", "B002", "Raj", "Dr Smith", "BEng Mechanical Engineering"],
+                ["12", "B003", "Zoe", "Dr Smith", "BEng Mechanical Engineering"],
+                ["", "B001", "Amy", "Dr Smith", "MEng (EEE840)"],
+            ]
+        );
+        assert_eq!(t.subtitle, "Second marker: Gabriel Machado · 2026/27 · 3 posters");
+
+        // A full list of six, as at a poster session. Set SUPERVISOR_PDF_OUT
+        // to a file to look at it.
+        db.students.retain(|s| s.name == "Not marked");
+        for (name, number, poster, supervisor, course) in [
+            ("Siobhán O'Neill", "B00912345", "14", "Dr Aoife McCann", "BEng Hons Mechanical Engineering"),
+            ("Ciarán Doherty", "B00923456", "3", "Prof Mark Reid", "BEng Hons Mechanical Engineering"),
+            ("Priya Raghunathan", "B00934567", "27", "Dr Aoife McCann", "MEng Mechanical Engineering"),
+            ("Tomás Ferreira", "B00945678", "8", "Dr Laura Quinn", "BEng Hons Biomedical Engineering"),
+            ("Hannah McAllister", "B00956789", "19", "Dr Stephen Kerr", "BEng Hons Mechanical Engineering"),
+            ("Oluwaseun Adeyemi", "B00967890", "31", "Prof Mark Reid", "MEng Mechanical Engineering"),
+        ] {
+            let mut s = marked(name, number, poster, course);
+            s.marking.as_mut().unwrap().supervisor_name = supervisor.into();
+            db.students.push(s);
+        }
+        let t = db.poster_table(d(2027, 4, 20));
+        assert_eq!(t.rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(), ["3", "8", "14", "19", "27", "31"]);
+        let pdf = crate::pdf::table(&t);
+        assert!(String::from_utf8_lossy(&pdf).contains("/Count 1"), "one page");
+        if let Some(path) = std::env::var_os("SUPERVISOR_PDF_OUT") {
+            std::fs::write(path, &pdf).unwrap();
+        }
+    }
+
+    #[test]
+    fn files_from_before_load_the_new_fields_empty() {
+        let m: Milestone = serde_json::from_str(r#"{"deadline":"2027-09-01","done":false}"#).unwrap();
+        assert_eq!(m.remind_from, None);
+        let module: Module = serde_json::from_str(r#"{"code":"EEE501","applies_to":["Placement"]}"#).unwrap();
+        assert_eq!((module.visit_by, module.visit_mark_by), ([None; 2], [None; 2]));
+        let record: MarkingRecord = serde_json::from_str(r#"{"kind":"Msc"}"#).unwrap();
+        assert_eq!(record.extension_days, 0);
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.start_private);
     }
 }

@@ -20,6 +20,8 @@ pub enum DashAction {
     Month(NaiveDate),
     /// Switch privacy mode.
     Privacy,
+    /// Put off the reminder of a student's research deadline (its step key) until a day.
+    Later(Uuid, String, NaiveDate),
 }
 
 const GAP: f32 = 16.0;
@@ -89,7 +91,7 @@ pub fn show(ui: &mut Ui, db: &Database, events: &[Event], attention: &[Attention
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = GAP;
                     upcoming(ui, db, events, today, private, &mut action);
-                    needs_attention(ui, attention, private, &mut action);
+                    needs_attention(ui, attention, private, today, &mut action);
                     if side == 0.0 {
                         side_column(ui, db, events, today, &mut action);
                     }
@@ -308,7 +310,7 @@ fn empty(ui: &mut Ui, icon: &str, text: &str) {
     });
 }
 
-fn needs_attention(ui: &mut Ui, items: &[Attention], private: bool, action: &mut DashAction) {
+fn needs_attention(ui: &mut Ui, items: &[Attention], private: bool, today: NaiveDate, action: &mut DashAction) {
     theme::card(ui, "Needs attention", |ui| {
         if items.is_empty() {
             ui.vertical_centered(|ui| {
@@ -323,31 +325,61 @@ fn needs_attention(ui: &mut Ui, items: &[Attention], private: bool, action: &mut
                 Severity::Overdue => (icons::WARNING_CIRCLE, theme::RED, "overdue"),
                 Severity::Pending => (icons::HOURGLASS, theme::AMBER, "pending"),
             };
-            let row = egui::Frame::new()
-                .fill(ui.visuals().faint_bg_color)
-                .corner_radius(CornerRadius::same(10))
-                .inner_margin(egui::Margin::symmetric(10, 6))
-                .show(ui, |ui| {
+            // The row senses clicks beneath what is in it, so its Later
+            // button still gets its own.
+            let row = ui
+                .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
+                    // Selectable text would take the click from the row.
+                    ui.style_mut().interaction.selectable_labels = false;
+                    egui::Frame::new()
+                        .fill(ui.visuals().faint_bg_color)
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(icon).size(17.0).color(theme::fg(ui, color)));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             theme::chip(ui, tag, color);
+                            if let Some((key, due)) = &a.later {
+                                remind_later(ui, a.student_id, key, *due, today, action);
+                            }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 let message = if private { &a.detail } else { &a.message };
                                 ui.add(egui::Label::new(message).truncate());
                             });
                         });
                     });
+                        });
                 })
                 .response
-                .interact(Sense::click())
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             if row.clicked() {
                 *action = DashAction::Open(a.student_id);
             }
         }
     });
+}
+
+/// "Later" beside a reminder that is up: a menu of days to be reminded
+/// again, such as a few weeks before the deadline.
+fn remind_later(ui: &mut Ui, student: Uuid, key: &str, due: NaiveDate, today: NaiveDate, action: &mut DashAction) {
+    let choices = model::later_choices(today, due);
+    if choices.is_empty() {
+        return;
+    }
+    ui.menu_button(RichText::new(format!("{} Later", icons::CLOCK)).small(), |ui| {
+        ui.label(RichText::new(format!("Due {}. Remind me again:", widgets::fmt_date(Some(due)))).small().color(theme::muted(ui)));
+        for (label, date) in choices {
+            let text = format!("{label} · {}", date.format("%a %d %b"));
+            if ui.button(text).clicked() {
+                *action = DashAction::Later(student, key.to_string(), date);
+                ui.close();
+            }
+        }
+    })
+    .response
+    .on_hover_text("Remind me about this later; it shows as overdue once the deadline has passed");
 }
 
 /// This month, with a dot per kind of item on each day.

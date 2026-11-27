@@ -5,6 +5,7 @@ mod app;
 mod ics;
 mod ics_import;
 mod model;
+mod pdf;
 #[cfg(test)]
 mod perf_tests;
 mod sheet_import;
